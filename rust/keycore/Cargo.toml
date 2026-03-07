@@ -1,0 +1,41 @@
+[package]
+name = "localcloud-keycore"
+version = "0.1.0"
+edition = "2021"
+description = "Secure key management for LocalCloud — mlock, zeroize, key generation, wrapping"
+
+[lib]
+name = "keycore"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+# Cryptographic primitives
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
+blake2 = "0.10"
+
+# Secure memory
+zeroize = { version = "1", features = ["derive"] }
+
+# Randomness
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Serialization
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+# System
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
