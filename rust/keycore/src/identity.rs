@@ -24,8 +24,15 @@ use crate::secure_memory;
 
 // ──────────────────────────── Constants ────────────────────────────
 
-/// Protocol version for the encrypted key store format
-const KEY_STORE_VERSION: u8 = 1;
+/// Protocol version for the encrypted key store format.
+///
+/// v2 changes the inner key bundle layout: private/public key bytes are
+/// now serialized from inline `[u8; 32]` arrays instead of `Vec<u8>`.
+/// This eliminates heap reallocation paths that could leave un-zeroized
+/// copies of private key bytes in freed pages (see K2 in security audit).
+/// v1 keystores cannot be decrypted by this build — users must
+/// regenerate via `keycore init`.
+const KEY_STORE_VERSION: u8 = 2;
 
 /// Argon2id parameters for client-side key derivation
 /// Memory: 512 MiB, Time: 3 iterations, Parallelism: 1
@@ -61,27 +68,39 @@ pub struct EncryptedKeyStore {
     pub ciphertext: Vec<u8>,
 }
 
-/// Plaintext key bundle for serialization before encryption
+/// Plaintext key bundle for serialization before encryption.
+///
+/// Private/public keys are inline `[u8; 32]` rather than `Vec<u8>` so
+/// the bytes live in-place inside the struct (no heap reallocation can
+/// leave un-zeroized copies). `#[zeroize(drop)]` wipes the entire struct
+/// when it drops.
 #[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 struct KeyBundle {
     /// X25519 private key (32 bytes)
-    x25519_private: Vec<u8>,
+    x25519_private: [u8; 32],
     /// X25519 public key (32 bytes)
-    x25519_public: Vec<u8>,
+    x25519_public: [u8; 32],
     /// Ed25519 private key (32 bytes, seed)
-    ed25519_private: Vec<u8>,
+    ed25519_private: [u8; 32],
     /// Ed25519 public key (32 bytes)
-    ed25519_public: Vec<u8>,
+    ed25519_public: [u8; 32],
 }
 
 /// In-memory identity keypair with all key material in locked, zeroizing memory.
 ///
 /// When dropped, private keys are guaranteed to be zeroized and memory unlocked.
+///
+/// Private keys are stored behind `Box<Zeroizing<[u8; 32]>>` so the
+/// heap address of the secret is stable from allocation onward
+/// (irrespective of subsequent moves of the outer struct). `mlock` is
+/// applied to that heap address and `munlock` in `Drop` operates on the
+/// same address — addressing the K1 finding where mlock previously
+/// targeted a stack address abandoned by the struct move.
 pub struct IdentityKeyPair {
-    // Private keys — zeroized on drop
-    x25519_private: Zeroizing<[u8; 32]>,
-    ed25519_private: Zeroizing<[u8; 32]>,
+    // Private keys — zeroized on drop, heap-stable for mlock correctness
+    x25519_private: Box<Zeroizing<[u8; 32]>>,
+    ed25519_private: Box<Zeroizing<[u8; 32]>>,
     // Public keys — not secret but kept alongside for convenience
     x25519_public: [u8; 32],
     ed25519_public: [u8; 32],
@@ -91,11 +110,13 @@ pub struct IdentityKeyPair {
 
 impl Drop for IdentityKeyPair {
     fn drop(&mut self) {
-        // Zeroizing<> handles zeroization automatically via its own Drop
-        // We just need to munlock the memory if it was locked
+        // Zeroizing<> handles zeroization automatically via its own Drop.
+        // We just need to munlock the memory if it was locked — note we
+        // do this BEFORE the inner Box drops, so munlock operates on the
+        // still-valid heap address.
         if self.is_locked {
-            secure_memory::munlock_slice(self.x25519_private.as_ref());
-            secure_memory::munlock_slice(self.ed25519_private.as_ref());
+            secure_memory::munlock_slice(&self.x25519_private[..]);
+            secure_memory::munlock_slice(&self.ed25519_private[..]);
             self.is_locked = false;
         }
     }
@@ -104,30 +125,47 @@ impl Drop for IdentityKeyPair {
 impl IdentityKeyPair {
     /// Generate a new identity keypair from OS CSPRNG.
     ///
-    /// Private keys are immediately mlock'd to prevent swapping.
-    /// Core dumps are disabled via prctl.
+    /// Private keys are placed on the heap (stable address) and
+    /// immediately mlock'd to prevent swapping. Core dumps are disabled
+    /// via prctl.
     pub fn generate() -> Result<Self, String> {
         // Prevent core dumps
         secure_memory::disable_core_dumps()
             .map_err(|e| format!("Failed to disable core dumps: {}", e))?;
 
-        // Generate X25519 keypair
+        // Allocate the private-key storage on the heap up front so the
+        // address is stable for the lifetime of the returned struct.
+        // mlock will be applied to this heap address — moving the outer
+        // struct does not invalidate the lock (K1 fix).
+        let mut x25519_private: Box<Zeroizing<[u8; 32]>> =
+            Box::new(Zeroizing::new([0u8; 32]));
+        let mut ed25519_private: Box<Zeroizing<[u8; 32]>> =
+            Box::new(Zeroizing::new([0u8; 32]));
+
+        // Generate X25519 keypair. `to_bytes()` returns an owned [u8; 32]
+        // on the stack — wrap it in Zeroizing so that the temporary is
+        // wiped after we copy into the heap storage.
         let x25519_secret = StaticSecret::random_from_rng(OsRng);
         let x25519_pub = X25519PublicKey::from(&x25519_secret);
 
-        let mut x25519_priv_bytes = Zeroizing::new([0u8; 32]);
-        x25519_priv_bytes.copy_from_slice(&x25519_secret.to_bytes());
+        {
+            let tmp = Zeroizing::new(x25519_secret.to_bytes());
+            x25519_private.copy_from_slice(tmp.as_ref());
+        }
 
-        // Generate Ed25519 keypair
+        // Generate Ed25519 keypair — same treatment for the seed bytes.
         let ed25519_signing = Ed25519SigningKey::generate(&mut OsRng);
         let ed25519_verifying = ed25519_signing.verifying_key();
 
-        let mut ed25519_priv_bytes = Zeroizing::new([0u8; 32]);
-        ed25519_priv_bytes.copy_from_slice(&ed25519_signing.to_bytes());
+        {
+            let tmp = Zeroizing::new(ed25519_signing.to_bytes());
+            ed25519_private.copy_from_slice(tmp.as_ref());
+        }
 
-        // mlock private key memory — warn loudly on failure (#15)
-        let x25519_locked = secure_memory::mlock_slice(x25519_priv_bytes.as_ref());
-        let ed25519_locked = secure_memory::mlock_slice(ed25519_priv_bytes.as_ref());
+        // mlock the heap allocations — addresses remain valid across
+        // the upcoming move of the outer IdentityKeyPair struct.
+        let x25519_locked = secure_memory::mlock_slice(&x25519_private[..]);
+        let ed25519_locked = secure_memory::mlock_slice(&ed25519_private[..]);
         let lock_ok = x25519_locked && ed25519_locked;
         if !lock_ok {
             eprintln!(
@@ -138,8 +176,8 @@ impl IdentityKeyPair {
         }
 
         Ok(IdentityKeyPair {
-            x25519_private: x25519_priv_bytes,
-            ed25519_private: ed25519_priv_bytes,
+            x25519_private,
+            ed25519_private,
             x25519_public: x25519_pub.to_bytes(),
             ed25519_public: ed25519_verifying.to_bytes(),
             is_locked: lock_ok,
@@ -160,17 +198,23 @@ impl IdentityKeyPair {
         // Derive encryption key from password via Argon2id
         let master_key = Self::derive_master_key(password, &salt)?;
 
-        // Serialize the key bundle
+        // Serialize the key bundle. Private-key fields are inline
+        // `[u8; 32]` arrays so the bytes live in-place inside the bundle
+        // and are zeroized when the bundle drops — no `Vec` allocation
+        // path that could leave un-zeroized copies on reallocation.
         let bundle = KeyBundle {
-            x25519_private: self.x25519_private.to_vec(),
-            x25519_public: self.x25519_public.to_vec(),
-            ed25519_private: self.ed25519_private.to_vec(),
-            ed25519_public: self.ed25519_public.to_vec(),
+            x25519_private: *self.x25519_private_key(),
+            x25519_public: self.x25519_public,
+            ed25519_private: *self.ed25519_private_key(),
+            ed25519_public: self.ed25519_public,
         };
 
-        let mut plaintext = Zeroizing::new(Vec::new());
+        // Pre-allocate generously so the CBOR sink does not grow via
+        // doubling-reallocation (which would leave un-zeroized CBOR-
+        // encoded private-key bytes in freed heap pages — K2 fix).
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(512));
         ciborium::into_writer(&bundle, &mut *plaintext)
-            .map_err(|e| format!("CBOR serialization failed: {}", e))?;
+            .map_err(|_| "Key bundle serialization failed".to_string())?;
 
         // Encrypt with XChaCha20-Poly1305
         let cipher = XChaCha20Poly1305::new_from_slice(master_key.as_ref())
@@ -203,6 +247,19 @@ impl IdentityKeyPair {
     ///
     /// Uses the stored Argon2id params to derive the encryption key,
     /// then decrypts and reconstructs the identity keypair with mlock.
+    ///
+    /// # Security
+    ///
+    /// This function performs cheap structural checks (CBOR parse,
+    /// version, nonce length, key-bundle field shape) BEFORE running
+    /// the expensive Argon2id KDF. The timing difference between a
+    /// "structural error" path (sub-millisecond) and a "wrong password"
+    /// path (Argon2-bounded latency) is observable.
+    ///
+    /// Callers MUST NOT expose this function across a network or other
+    /// remote trust boundary, as an adversary submitting blobs to such
+    /// an oracle could distinguish error classes via timing. Local use
+    /// (CLI unlock against a file on disk) is unaffected.
     pub fn decrypt_from_store(data: &[u8], password: &[u8]) -> Result<Self, String> {
         // Prevent core dumps
         secure_memory::disable_core_dumps()
@@ -210,7 +267,7 @@ impl IdentityKeyPair {
 
         // Deserialize the store
         let store: EncryptedKeyStore = ciborium::from_reader(data)
-            .map_err(|e| format!("Store deserialization failed: {}", e))?;
+            .map_err(|_| "Store deserialization failed".to_string())?;
 
         if store.version != KEY_STORE_VERSION {
             return Err(format!(
@@ -230,7 +287,7 @@ impl IdentityKeyPair {
 
         // Decrypt the key bundle
         let cipher = XChaCha20Poly1305::new_from_slice(master_key.as_ref())
-            .map_err(|e| format!("Cipher init failed: {}", e))?;
+            .map_err(|_| "Cipher init failed".to_string())?;
 
         if store.nonce.len() != NONCE_LEN {
             return Err("Invalid nonce length".to_string());
@@ -243,48 +300,44 @@ impl IdentityKeyPair {
                 .map_err(|_| "Decryption failed — wrong password or corrupted data".to_string())?,
         );
 
-        // Deserialize the key bundle
+        // Deserialize the key bundle. Inline `[u8; 32]` fields mean
+        // the bytes land in-place; no `Vec` reallocation path.
         let bundle: KeyBundle = ciborium::from_reader(plaintext_bytes.as_slice())
-            .map_err(|e| format!("Key bundle deserialization failed: {}", e))?;
+            .map_err(|_| "Key bundle deserialization failed".to_string())?;
 
-        // Validate key lengths
-        if bundle.x25519_private.len() != 32
-            || bundle.x25519_public.len() != 32
-            || bundle.ed25519_private.len() != 32
-            || bundle.ed25519_public.len() != 32
-        {
-            return Err("Invalid key lengths in key bundle".to_string());
-        }
+        let x25519_pub = bundle.x25519_public;
+        let ed25519_pub = bundle.ed25519_public;
 
-        // Reconstruct the keypair with mlock
-        let mut x25519_priv = Zeroizing::new([0u8; 32]);
+        // Allocate heap-stable storage for private keys up front so the
+        // mlock address remains valid after the outer struct move (K1).
+        let mut x25519_priv: Box<Zeroizing<[u8; 32]>> =
+            Box::new(Zeroizing::new([0u8; 32]));
         x25519_priv.copy_from_slice(&bundle.x25519_private);
 
-        let mut ed25519_priv = Zeroizing::new([0u8; 32]);
+        let mut ed25519_priv: Box<Zeroizing<[u8; 32]>> =
+            Box::new(Zeroizing::new([0u8; 32]));
         ed25519_priv.copy_from_slice(&bundle.ed25519_private);
 
-        let mut x25519_pub = [0u8; 32];
-        x25519_pub.copy_from_slice(&bundle.x25519_public);
-
-        let mut ed25519_pub = [0u8; 32];
-        ed25519_pub.copy_from_slice(&bundle.ed25519_public);
-
-        // Verify that public keys match private keys
-        let derived_x25519_pub =
-            X25519PublicKey::from(&StaticSecret::from(*x25519_priv));
-        if derived_x25519_pub.as_bytes() != &x25519_pub {
+        // Verify that public keys match private keys (constant-time
+        // byte comparison so a mismatched byte position is not leaked).
+        // The dereferenced array copy is wrapped in Zeroizing so the
+        // transient stack slot consumed by StaticSecret::from is wiped.
+        let x25519_tmp = Zeroizing::new(**x25519_priv);
+        let derived_x25519_pub = X25519PublicKey::from(&StaticSecret::from(*x25519_tmp));
+        if !secure_memory::ct_eq_32(derived_x25519_pub.as_bytes(), &x25519_pub) {
             return Err("X25519 public key does not match private key".to_string());
         }
 
+        // Ed25519SigningKey::from_bytes takes a &[u8;32] — no extra copy needed.
         let derived_ed25519_pub = Ed25519SigningKey::from_bytes(&ed25519_priv)
             .verifying_key();
-        if derived_ed25519_pub.to_bytes() != ed25519_pub {
+        if !secure_memory::ct_eq_32(&derived_ed25519_pub.to_bytes(), &ed25519_pub) {
             return Err("Ed25519 public key does not match private key".to_string());
         }
 
-        // mlock private key memory — warn loudly on failure (#15)
-        let x25519_locked = secure_memory::mlock_slice(x25519_priv.as_ref());
-        let ed25519_locked = secure_memory::mlock_slice(ed25519_priv.as_ref());
+        // mlock the heap-stable allocations.
+        let x25519_locked = secure_memory::mlock_slice(&x25519_priv[..]);
+        let ed25519_locked = secure_memory::mlock_slice(&ed25519_priv[..]);
         let lock_ok = x25519_locked && ed25519_locked;
         if !lock_ok {
             eprintln!(
@@ -314,12 +367,13 @@ impl IdentityKeyPair {
         &self.ed25519_public
     }
 
-    /// Get a reference to the X25519 private key (for internal crypto ops only)
+    /// Get a reference to the X25519 private key (for internal crypto ops only).
+    /// Auto-deref coerces &Box<Zeroizing<[u8;32]>> → &[u8;32].
     pub(crate) fn x25519_private_key(&self) -> &[u8; 32] {
         &self.x25519_private
     }
 
-    /// Get a reference to the Ed25519 private key (for internal crypto ops only)
+    /// Get a reference to the Ed25519 private key (for internal crypto ops only).
     pub(crate) fn ed25519_private_key(&self) -> &[u8; 32] {
         &self.ed25519_private
     }

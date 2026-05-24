@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from typing import Optional
@@ -35,16 +36,52 @@ from shared.exceptions import (
 
 logger = logging.getLogger("localcloud.storage")
 
+
+class ConfigurationError(StorageError):
+    """Static deployment misconfiguration detected at startup (H15)."""
+
+
 # ──────────────────────────── Constants ────────────────────────────
 
 # Strict pattern for file_id and upload_id: lowercase hex UUID (no hyphens) or UUID4
 _SAFE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _SAFE_HEX_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
+# Disallow C0 control characters and DEL in filenames at upload_init.
+# Newlines, tabs, embedded NULs and similar are never meaningful in a
+# user-visible filename and have caused trouble in log scrapers, shells,
+# and downstream consumers.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 # Maximum sane values
 _MAX_CHUNKS = 100_000  # Max ~400 GiB per file at 4 MiB chunks
 _MAX_FILENAME_LEN = 255
 _MAX_VISIBILITY = 2
+
+# Per-user staging caps (K3): bound the disk that any one user can hold
+# in the staging area before finalize, and the number of concurrent
+# upload sessions they may open.
+MAX_STAGING_BYTES_PER_USER = 4 * 1024 * 1024 * 1024  # 4 GiB
+MAX_OPEN_UPLOADS_PER_USER = 16
+
+# Minimum chunk size (except for the last chunk in a file). Prevents an
+# attacker from forcing many tiny-chunk syscalls and DB rows per byte.
+MIN_CHUNK_SIZE = 1024  # 1 KiB
+
+# Username constraints used when validating a share target. Server's
+# /api/auth/login enforces 255 here, but for sharing we keep it tighter
+# since the value is also rendered server-side.
+MAX_USERNAME_LEN = 64
+
+# Wrapped-keys hex blob bounds for share_file (H17). 16 bytes is below
+# any conceivable wrapping output; 2 KiB ciphertext caps it well above
+# real recipients. We bound the hex string length, i.e. 2 × byte bounds.
+MIN_WRAPPED_KEYS_BYTES = 32
+MAX_WRAPPED_KEYS_BYTES = 4096
+
+# Pagination defaults / caps for list_files (medium fix).
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 200
 
 # ──────────────────────────── Blueprint ────────────────────────────
 
@@ -63,12 +100,31 @@ def init_storage(
     staging_dir: str,
     staging_expiry: int = 3600,
 ) -> None:
-    """Initialize storage module with dependencies."""
+    """Initialize storage module with dependencies.
+
+    H15: Asserts that ``blob_dir`` and ``staging_dir`` live on the same
+    filesystem so that finalize can rename chunks atomically with
+    ``os.replace``. If they are not, the deployment is rejected here at
+    startup rather than crashing on the first finalize.
+    """
     global _db, _blob_dir, _staging_dir, _staging_expiry
     _db = db
     _blob_dir = os.path.realpath(blob_dir)
     _staging_dir = os.path.realpath(staging_dir)
     _staging_expiry = staging_expiry
+
+    try:
+        blob_dev = os.stat(_blob_dir).st_dev
+        staging_dev = os.stat(_staging_dir).st_dev
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Failed to stat blob_dir or staging_dir: {exc}"
+        ) from exc
+    if blob_dev != staging_dev:
+        raise ConfigurationError(
+            "blob_dir and staging_dir must be on the same filesystem "
+            "(required for atomic os.replace at finalize)"
+        )
 
 
 # ──────────────────────────── Validation Helpers ────────────────────────────
@@ -117,6 +173,9 @@ async def upload_init():
     filename = str(data["filename"])
     if not filename or len(filename) > _MAX_FILENAME_LEN:
         return jsonify({"error": "Invalid request"}), 400
+    # Reject control characters in filenames (medium fix).
+    if _CONTROL_CHAR_RE.search(filename):
+        return jsonify({"error": "Invalid request"}), 400
 
     # Validate expected_chunks if provided
     expected_chunks = data.get("expected_chunks")
@@ -127,6 +186,14 @@ async def upload_init():
                 return jsonify({"error": "Invalid request"}), 400
         except (ValueError, TypeError):
             return jsonify({"error": "Invalid request"}), 400
+
+    # K3: Cap concurrent staging sessions per user to bound parallel
+    # disk-fill attacks. Counted against non-expired, non-finalizing rows.
+    open_count = await asyncio.to_thread(
+        _db.count_open_uploads, request.user_id  # type: ignore
+    )
+    if open_count >= MAX_OPEN_UPLOADS_PER_USER:
+        return jsonify({"error": "Too many open uploads"}), 429
 
     # Generate upload ID (server-generated, always safe)
     upload_id = str(uuid.uuid4())
@@ -187,6 +254,38 @@ async def upload_chunk(upload_id: str, chunk_index: int):
 
     if len(chunk_data) > _max_chunk_size:
         return jsonify({"error": "Chunk too large"}), 413
+
+    # Medium: minimum chunk size for all but the last chunk. The last
+    # chunk's size is determined by file length so it may be smaller.
+    expected_chunks = upload.get("expected_chunks")
+    if expected_chunks is not None and chunk_index < expected_chunks - 1:
+        if len(chunk_data) < MIN_CHUNK_SIZE:
+            return jsonify({"error": "Chunk too small"}), 400
+
+    # K3: enforce per-user staging quota BEFORE writing to disk.
+    #
+    # Compute cumulative committed + staging usage and reject if writing
+    # this chunk would exceed either:
+    #   (a) the user's hard ciphertext quota, or
+    #   (b) the per-user staging cap.
+    #
+    # We read used_bytes and current staging total inside the same call
+    # site; a concurrent peer upload could still slip a chunk past this
+    # check, but the cap is a coarse DoS bound — finalize is the
+    # authoritative quota gate.
+    new_chunk_size = len(chunk_data)
+    used_bytes, quota_bytes = await asyncio.to_thread(
+        _db.get_user_usage, request.user_id  # type: ignore
+    )
+    staging_bytes = await asyncio.to_thread(
+        _db.get_total_staging_bytes, request.user_id  # type: ignore
+    )
+    cumulative = used_bytes + staging_bytes + new_chunk_size
+    quota_ceiling = min(quota_bytes, used_bytes + MAX_STAGING_BYTES_PER_USER)
+    if cumulative > quota_bytes:
+        return jsonify({"error": "Quota exceeded"}), 413
+    if cumulative > quota_ceiling:
+        return jsonify({"error": "Staging quota exceeded"}), 413
 
     # Compute BLAKE2b hash of ciphertext
     chunk_hash = blake2b_hash(chunk_data).hex()

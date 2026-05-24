@@ -68,17 +68,29 @@ class KeyStore:
             kp = keycore.KeyPair.generate()
             encrypted = kp.encrypt_to_store(password.encode())
 
-            # Write atomically
+            # Write atomically with secure mode applied AT creation time —
+            # `os.open` with O_EXCL|O_NOFOLLOW + explicit mode 0o600 avoids
+            # the chmod-after-write race window where the file is briefly
+            # world-readable.
             self.key_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             tmp_path = self.key_file.with_suffix(".tmp")
             try:
-                with open(tmp_path, "wb") as f:
+                fd = os.open(
+                    str(tmp_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "wb") as f:
                     f.write(encrypted)
-                os.chmod(str(tmp_path), 0o600)
-                os.rename(str(tmp_path), str(self.key_file))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(str(tmp_path), str(self.key_file))
             except Exception:
                 if tmp_path.exists():
-                    tmp_path.unlink()
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
                 raise
 
             self._keypair = kp
@@ -152,7 +164,8 @@ class KeyStore:
     ) -> bytes:
         """Wrap file keys for a recipient.
 
-        Performs X25519 ECDH → HKDF → AEAD in Rust.
+        Performs ephemeral-static X25519 ECDH → HKDF → AEAD in Rust.
+        `recipient_pubkey` is the recipient's X25519 public key.
         """
         self._require_unlocked()
         self._touch_activity()
@@ -169,6 +182,10 @@ class KeyStore:
         sender_pubkey: bytes,
     ) -> tuple[bytes, bytes]:
         """Unwrap file keys from a wrapped bundle.
+
+        `sender_pubkey` is the sender's long-term Ed25519 identity public key
+        (used as a domain binding, not for ECDH). The ephemeral X25519 public
+        key used for ECDH is read from the bundle itself.
 
         Returns (file_key, meta_key).
         """

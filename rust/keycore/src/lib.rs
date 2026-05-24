@@ -33,8 +33,11 @@ impl KeyPair {
     /// Core dumps are disabled for this process.
     #[staticmethod]
     fn generate() -> PyResult<Self> {
+        // Inner error strings are not propagated across the FFI boundary
+        // — they could echo serializer/cipher internals. Return a
+        // deliberately generic Python exception instead.
         let inner = identity::IdentityKeyPair::generate()
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(|_| PyValueError::new_err("Key generation failed"))?;
         Ok(KeyPair { inner })
     }
 
@@ -44,7 +47,7 @@ impl KeyPair {
     /// then XChaCha20-Poly1305 to encrypt the key bundle.
     fn encrypt_to_store<'py>(&self, py: Python<'py>, password: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
         let data = self.inner.encrypt_to_store(password)
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(|_| PyValueError::new_err("Key store encryption failed"))?;
         Ok(PyBytes::new_bound(py, &data))
     }
 
@@ -75,16 +78,19 @@ impl KeyPair {
     /// Returns the 64-byte signature. The private key never leaves Rust memory.
     fn sign<'py>(&self, py: Python<'py>, message: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
         let sig = signing::sign(self.inner.ed25519_private_key(), message)
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(|_| PyValueError::new_err("Signing failed"))?;
         Ok(PyBytes::new_bound(py, &sig))
     }
 
-    /// Wrap file_key + meta_key for a specific recipient.
+    /// Wrap file_key + meta_key for a specific recipient using
+    /// ephemeral-static ECDH for forward secrecy.
     ///
-    /// Performs X25519 ECDH → HKDF (domain separated by file_id) →
-    /// XChaCha20-Poly1305 AEAD encryption of the key payload.
+    /// The sender's long-term X25519 key is NOT used; instead we
+    /// generate a fresh ephemeral pair per call. The sender's Ed25519
+    /// identity public key is bound into the KDF and AEAD AAD so the
+    /// bundle is cryptographically tied to the claimed sender.
     ///
-    /// Returns the wrapped bundle bytes (nonce || ciphertext).
+    /// Returns: ephemeral_pubkey || nonce || ciphertext+tag.
     fn wrap_file_keys<'py>(
         &self,
         py: Python<'py>,
@@ -108,14 +114,18 @@ impl KeyPair {
             mk,
             file_id,
             rpk,
-            self.inner.x25519_private_key(),
+            self.inner.ed25519_public_key(),
         )
-        .map_err(|e| PyValueError::new_err(e))?;
+        .map_err(|_| PyValueError::new_err("Key wrapping failed"))?;
 
         Ok(PyBytes::new_bound(py, &wrapped))
     }
 
     /// Unwrap file_key + meta_key from a wrapped bundle.
+    ///
+    /// `sender_pubkey` is the sender's long-term Ed25519 identity
+    /// public key (used as a domain binding, not for ECDH). The
+    /// ephemeral X25519 public key is read from the bundle itself.
     ///
     /// Returns (file_key: bytes, meta_key: bytes).
     fn unwrap_file_keys<'py>(
@@ -139,7 +149,7 @@ impl KeyPair {
             spk,
             self.inner.x25519_private_key(),
         )
-        .map_err(|e| PyValueError::new_err(e))?;
+        .map_err(|_| PyValueError::new_err("Key unwrapping failed"))?;
 
         Ok((
             PyBytes::new_bound(py, file_key.as_ref()),
@@ -161,7 +171,7 @@ fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> PyRe
     let pk: &[u8; 32] = public_key.try_into().unwrap();
 
     signing::verify(pk, message, signature)
-        .map_err(|e| PyValueError::new_err(e))
+        .map_err(|_| PyValueError::new_err("Signature verification failed"))
 }
 
 // ──────────────────────────── Module Registration ────────────────────────────

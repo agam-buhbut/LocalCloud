@@ -12,13 +12,15 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 
 # Cryptographic primitives
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+# `zeroize` features are pinned explicitly so that key material carried
+# inside library types (StaticSecret, SigningKey) is always zeroized on
+# drop, even if upstream ever changes its default-features set.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 argon2 = "0.5"
-blake2 = "0.10"
 
 # Secure memory
 zeroize = { version = "1", features = ["derive"] }

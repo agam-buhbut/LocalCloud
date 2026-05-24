@@ -17,7 +17,7 @@ from typing import Any, Generator, Optional
 
 # ──────────────────────────── Schema Version ────────────────────────────
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 -- Schema version tracking
@@ -33,6 +33,14 @@ CREATE TABLE IF NOT EXISTS users (
     quota_bytes INTEGER NOT NULL DEFAULT 1073741824,  -- 1 GiB default
     used_bytes INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
+    -- Monotonic counter used to revoke all outstanding session tokens
+    -- for this user. Tokens embed the value at issue time; any bump
+    -- invalidates every previously-issued token immediately.
+    session_version INTEGER NOT NULL DEFAULT 1,
+    -- Long-term Ed25519 identity public key (32 bytes). Empty until the
+    -- user registers a key; clients use this for pinned signature
+    -- verification of files owned by this user (H17).
+    ed25519_pubkey BLOB NOT NULL DEFAULT x'',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -80,6 +88,9 @@ CREATE TABLE IF NOT EXISTS staging_uploads (
     owner_id TEXT NOT NULL REFERENCES users(user_id),
     filename TEXT NOT NULL,
     expected_chunks INTEGER,
+    -- Set to 1 by the finalize handler inside its transaction so the
+    -- background cleanup task will skip this row mid-finalize (H19).
+    finalizing INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
@@ -103,6 +114,34 @@ CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
 CREATE INDEX IF NOT EXISTS idx_login_attempts_time
     ON login_attempts(attempt_time);
 """
+
+# Migration from schema v2 to v3: add session_version column for token revocation
+MIGRATION_V2_TO_V3 = """
+ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1;
+"""
+
+# Migration from schema v3 to v4:
+#   * `finalizing` flag on staging_uploads — set during the finalize
+#     transaction so the periodic cleanup task does not race finalize
+#     (H19).
+#   * `ed25519_pubkey` BLOB on users — owner identity key returned with
+#     file metadata for pinned signature verification (H17).
+MIGRATION_V3_TO_V4 = """
+ALTER TABLE staging_uploads
+    ADD COLUMN finalizing INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users
+    ADD COLUMN ed25519_pubkey BLOB NOT NULL DEFAULT x'';
+"""
+
+
+def _is_duplicate_column_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True iff SQLite reported 'duplicate column name'.
+
+    Migration scripts are idempotent only for this specific failure —
+    any other OperationalError (locked DB, syntax, etc.) must propagate.
+    """
+    message = str(exc).lower()
+    return "duplicate column name" in message
 
 
 # ──────────────────────────── Database Class ────────────────────────────
@@ -184,12 +223,32 @@ class Database:
                 (SCHEMA_VERSION,),
             )
         elif row["version"] < SCHEMA_VERSION:
-            # Run migrations
-            if row["version"] == 1:
+            # Run migrations in order. Each ALTER TABLE migration is
+            # idempotent ONLY for the specific "duplicate column name"
+            # error — every other OperationalError is re-raised so we
+            # never silently swallow a locked DB or syntax error.
+            current = row["version"]
+            if current < 2:
                 try:
                     self._conn.executescript(MIGRATION_V1_TO_V2)
-                except sqlite3.OperationalError:
-                    pass  # Column may already exist
+                except sqlite3.OperationalError as exc:
+                    if not _is_duplicate_column_error(exc):
+                        raise
+                current = 2
+            if current < 3:
+                try:
+                    self._conn.executescript(MIGRATION_V2_TO_V3)
+                except sqlite3.OperationalError as exc:
+                    if not _is_duplicate_column_error(exc):
+                        raise
+                current = 3
+            if current < 4:
+                try:
+                    self._conn.executescript(MIGRATION_V3_TO_V4)
+                except sqlite3.OperationalError as exc:
+                    if not _is_duplicate_column_error(exc):
+                        raise
+                current = 4
             self._conn.execute(
                 "UPDATE schema_version SET version = ?",
                 (SCHEMA_VERSION,),
@@ -207,17 +266,33 @@ class Database:
         username: str,
         password_hash: str,
         quota_bytes: int,
+        ed25519_pubkey: bytes = b"",
     ) -> str:
-        """Create a new user. Returns user_id."""
+        """Create a new user. Returns user_id.
+
+        Args:
+            ed25519_pubkey: Optional long-term Ed25519 identity public
+                key (32 bytes). Defaults to empty; clients may register
+                it later through a separate flow.
+        """
         user_id = str(uuid.uuid4())
         now = time.time()
         with self.transaction() as conn:
             conn.execute(
                 """INSERT INTO users
                    (user_id, username, password_hash, quota_bytes,
-                    used_bytes, is_active, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 0, 1, ?, ?)""",
-                (user_id, username, password_hash, quota_bytes, now, now),
+                    used_bytes, is_active, ed25519_pubkey,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 0, 1, ?, ?, ?)""",
+                (
+                    user_id,
+                    username,
+                    password_hash,
+                    quota_bytes,
+                    ed25519_pubkey,
+                    now,
+                    now,
+                ),
             )
         return user_id
 
@@ -242,6 +317,25 @@ class Database:
         with self.transaction() as conn:
             cursor = conn.execute(
                 "UPDATE users SET is_active = 0, updated_at = ? WHERE username = ?",
+                (time.time(), username),
+            )
+            return cursor.rowcount > 0
+
+    def get_session_version(self, user_id: str) -> Optional[int]:
+        """Return the user's current session_version, or None if missing."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT session_version FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row["session_version"] if row else None
+
+    def bump_session_version(self, username: str) -> bool:
+        """Invalidate all outstanding tokens for a user. Returns True if user existed."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE users SET session_version = session_version + 1, "
+                "updated_at = ? WHERE username = ?",
                 (time.time(), username),
             )
             return cursor.rowcount > 0
@@ -347,6 +441,26 @@ class Database:
                 "SELECT * FROM files WHERE file_id = ?", (file_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def get_owner_ed25519_pubkey(self, file_id: str) -> Optional[bytes]:
+        """Return the file owner's Ed25519 identity public key (H17).
+
+        Returns the raw bytes (possibly empty if the owner has not
+        registered a key), or None if the file does not exist.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT u.ed25519_pubkey "
+                "FROM files f JOIN users u ON u.user_id = f.owner_id "
+                "WHERE f.file_id = ?",
+                (file_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            pubkey = row["ed25519_pubkey"]
+            # Older rows may surface as None even with the NOT NULL
+            # default — normalise to empty bytes.
+            return bytes(pubkey) if pubkey is not None else b""
 
     def list_user_files(self, user_id: str) -> list[dict]:
         """List all files owned by or shared with a user."""
@@ -494,20 +608,77 @@ class Database:
             )
 
     def cleanup_expired_staging(self) -> list[str]:
-        """Delete expired staging uploads. Returns list of deleted upload_ids."""
+        """Delete expired staging uploads. Returns list of deleted upload_ids.
+
+        H19: Skips rows with finalizing = 1 so the periodic cleanup task
+        cannot CASCADE-delete chunks out from under an in-flight finalize
+        transaction.
+        """
         now = time.time()
         with self._lock:
             rows = self.conn.execute(
-                "SELECT upload_id FROM staging_uploads WHERE expires_at < ?",
+                "SELECT upload_id FROM staging_uploads "
+                "WHERE expires_at < ? AND finalizing = 0",
                 (now,),
             ).fetchall()
             upload_ids = [row["upload_id"] for row in rows]
             if upload_ids:
+                # Use the same predicate on DELETE so a row that flipped
+                # to finalizing=1 between SELECT and DELETE is preserved.
                 self.conn.execute(
-                    "DELETE FROM staging_uploads WHERE expires_at < ?",
+                    "DELETE FROM staging_uploads "
+                    "WHERE expires_at < ? AND finalizing = 0",
                     (now,),
                 )
             return upload_ids
+
+    def mark_upload_finalizing(self, upload_id: str) -> bool:
+        """Atomically claim a staging upload for finalization (H19).
+
+        Must be called inside a write transaction. Sets finalizing = 1
+        and returns True iff the row existed and was not already claimed.
+        The transaction's BEGIN IMMEDIATE plus this flag together
+        guarantee exclusive ownership of the staging row against the
+        background cleanup task.
+        """
+        cursor = self.conn.execute(
+            "UPDATE staging_uploads SET finalizing = 1 "
+            "WHERE upload_id = ? AND finalizing = 0",
+            (upload_id,),
+        )
+        return cursor.rowcount > 0
+
+    def get_total_staging_bytes(self, owner_id: str) -> int:
+        """Return the sum of chunk_size across all open (non-expired,
+        non-finalizing) staging uploads owned by the user (K3).
+        """
+        now = time.time()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(c.chunk_size), 0) AS total "
+                "FROM staging_chunks c "
+                "JOIN staging_uploads u ON u.upload_id = c.upload_id "
+                "WHERE u.owner_id = ? "
+                "AND u.expires_at >= ? "
+                "AND u.finalizing = 0",
+                (owner_id, now),
+            ).fetchone()
+            return int(row["total"]) if row else 0
+
+    def count_open_uploads(self, owner_id: str) -> int:
+        """Count non-expired, non-finalizing staging uploads for a user
+        (K3). Used to cap parallel upload sessions per user.
+        """
+        now = time.time()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS cnt FROM staging_uploads "
+                "WHERE owner_id = ? "
+                "AND expires_at >= ? "
+                "AND finalizing = 0",
+                (owner_id, now),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
 
     # ──────────────────────────── Quota ────────────────────────────
 

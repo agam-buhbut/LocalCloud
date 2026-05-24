@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import io
 import os
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import Any, Optional
 
 import cbor2
 
@@ -42,6 +43,87 @@ KEY_LEN: int = 32
 
 # BLAKE2b digest length
 BLAKE2B_DIGEST_LEN: int = 32
+
+# Ed25519 signature length
+ED25519_SIG_LEN: int = 64
+
+# ──────────────────────────── Safety Bounds ────────────────────────────
+# Hard caps that gate any deserialization of attacker-controlled bytes.
+# Anything larger than these is rejected before parsing, preventing
+# resource-exhaustion attacks via crafted CBOR or padded blobs.
+
+# Maximum size of a CBOR-encoded FileHeader (bytes)
+MAX_HEADER_BYTES: int = 4096
+
+# Maximum size of a plaintext CBOR-encoded MetadataBlob (bytes)
+MAX_METADATA_BYTES: int = 65536
+
+# Maximum chunk size accepted in a FileHeader (16 MiB — design uses 4 MiB,
+# margin left for future formats)
+MAX_CHUNK_SIZE: int = 16 * 1024 * 1024
+
+# Maximum number of chunks in any single file (~1M => up to 16 TiB at 16 MiB)
+MAX_CHUNKS: int = 1 << 20
+
+# Maximum size for a padded metadata blob (1 MiB). Anything larger is
+# unreasonable for metadata and likely indicates abuse or a bug.
+MAX_PADDED_SIZE: int = 1 << 20
+
+# Per-string length bound used for metadata fields (owner, shared_with
+# entries, blob_ids).
+_MAX_META_STR_LEN: int = 256
+
+# Domain separation tag for Merkle-root signatures. Prevents an Ed25519
+# signature produced for one protocol context from being replayed into
+# another that uses the same identity key.
+MERKLE_SIG_CONTEXT: bytes = b"localcloud-merkle-v1"
+
+
+def build_merkle_signing_input(file_id: bytes, merkle_root: bytes) -> bytes:
+    """Build the message that is actually signed for a file's Merkle root.
+
+    Format: MERKLE_SIG_CONTEXT || file_id || merkle_root, with file_id
+    and merkle_root each at their fixed lengths, so the encoding is
+    unambiguous and collision-free across fields.
+    """
+    if len(file_id) != FILE_ID_LEN:
+        raise ValueError("file_id must be 16 bytes")
+    if len(merkle_root) != BLAKE2B_DIGEST_LEN:
+        raise ValueError("merkle_root must be 32 bytes")
+    return MERKLE_SIG_CONTEXT + file_id + merkle_root
+
+
+# ──────────────────────────── Safe CBOR Decode ────────────────────────────
+
+
+def _reject_tag(decoder: Any, tag: Any, shareable_index: Any = None) -> None:
+    """Tag hook that refuses any CBOR tagged value.
+
+    Tagged CBOR can carry semantic types (datetime, bignums, decimals,
+    URLs, custom objects). None of LocalCloud's wire formats use tags, so
+    any tag in attacker-controlled bytes is treated as malformed input.
+    """
+    from shared.exceptions import MalformedRequestError
+
+    raise MalformedRequestError("Unexpected CBOR tag in serialized payload")
+
+
+def _safe_cbor_loads(data: bytes) -> Any:
+    """Decode CBOR with tagged values rejected.
+
+    All decode failures (truncation, unsupported types, custom-tag content,
+    type errors raised by ``_reject_tag``) are surfaced as
+    ``MalformedRequestError`` so callers handle them uniformly.
+    """
+    from shared.exceptions import MalformedRequestError
+
+    try:
+        decoder = cbor2.CBORDecoder(io.BytesIO(data), tag_hook=_reject_tag)
+        return decoder.decode()
+    except MalformedRequestError:
+        raise
+    except (cbor2.CBORDecodeError, KeyError, TypeError, ValueError) as e:
+        raise MalformedRequestError("Malformed CBOR payload") from e
 
 
 # ──────────────────────────── Enums ────────────────────────────
@@ -85,17 +167,66 @@ class FileHeader:
 
     @classmethod
     def deserialize(cls, data: bytes) -> "FileHeader":
-        """Deserialize from CBOR."""
-        obj = cbor2.loads(data)
-        return cls(
-            magic=obj["magic"],
-            version=obj["version"],
-            file_id=obj["file_id"],
-            chunk_size=obj["chunk_size"],
-            total_chunks=obj["total_chunks"],
-            merkle_root=obj["merkle_root"],
-            signature=obj["signature"],
+        """Deserialize from CBOR, with strict bounds and type checks.
+
+        Refuses input larger than ``MAX_HEADER_BYTES``, any tagged CBOR
+        value, missing fields, or fields of unexpected types. The
+        constructed header is then ``validate()``-ed before returning.
+
+        Raises:
+            MalformedRequestError: input is over-sized, malformed,
+                contains unexpected CBOR tags, or fails type/structural
+                validation.
+        """
+        from shared.exceptions import MalformedRequestError
+
+        if len(data) > MAX_HEADER_BYTES:
+            raise MalformedRequestError("FileHeader payload exceeds size cap")
+
+        obj = _safe_cbor_loads(data)
+        if not isinstance(obj, dict):
+            raise MalformedRequestError("FileHeader payload is not a map")
+
+        try:
+            magic = obj["magic"]
+            version = obj["version"]
+            file_id = obj["file_id"]
+            chunk_size = obj["chunk_size"]
+            total_chunks = obj["total_chunks"]
+            merkle_root = obj["merkle_root"]
+            signature = obj["signature"]
+        except KeyError as e:
+            raise MalformedRequestError("FileHeader missing field") from e
+
+        if not isinstance(magic, (bytes, bytearray)):
+            raise MalformedRequestError("FileHeader.magic must be bytes")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise MalformedRequestError("FileHeader.version must be int")
+        if not isinstance(file_id, (bytes, bytearray)):
+            raise MalformedRequestError("FileHeader.file_id must be bytes")
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool):
+            raise MalformedRequestError("FileHeader.chunk_size must be int")
+        if not isinstance(total_chunks, int) or isinstance(total_chunks, bool):
+            raise MalformedRequestError("FileHeader.total_chunks must be int")
+        if not isinstance(merkle_root, (bytes, bytearray)):
+            raise MalformedRequestError("FileHeader.merkle_root must be bytes")
+        if not isinstance(signature, (bytes, bytearray)):
+            raise MalformedRequestError("FileHeader.signature must be bytes")
+
+        header = cls(
+            magic=bytes(magic),
+            version=version,
+            file_id=bytes(file_id),
+            chunk_size=chunk_size,
+            total_chunks=total_chunks,
+            merkle_root=bytes(merkle_root),
+            signature=bytes(signature),
         )
+        try:
+            header.validate()
+        except Exception as e:
+            raise MalformedRequestError("FileHeader failed validation") from e
+        return header
 
     def validate(self) -> None:
         """Validate header fields. Raises ProtocolError on failure."""
@@ -108,10 +239,16 @@ class FileHeader:
             )
         if len(self.file_id) != FILE_ID_LEN:
             raise ProtocolError("Invalid file_id length")
-        if self.chunk_size <= 0:
+        if self.chunk_size <= 0 or self.chunk_size > MAX_CHUNK_SIZE:
             raise ProtocolError("Invalid chunk_size")
-        if self.total_chunks < 0:
+        if self.total_chunks < 0 or self.total_chunks > MAX_CHUNKS:
             raise ProtocolError("Invalid total_chunks")
+        if len(self.merkle_root) != BLAKE2B_DIGEST_LEN:
+            raise ProtocolError("Invalid merkle_root length")
+        # signature may be empty (unsigned placeholder during construction)
+        # or exactly Ed25519's 64 bytes; anything else is malformed.
+        if len(self.signature) not in (0, ED25519_SIG_LEN):
+            raise ProtocolError("Invalid signature length")
 
 
 @dataclass
@@ -134,7 +271,17 @@ class ChunkAAD:
         - chunk_index: 4 bytes (uint32 big-endian)
         - protocol_version: 2 bytes (uint16 big-endian)
         - total_chunks: 4 bytes (uint32 big-endian)
+
+        Refuses to pack a ``file_id`` whose length is not exactly
+        ``FILE_ID_LEN``: ``struct.pack("16s", ...)`` silently NUL-pads or
+        truncates, which would let unequal IDs collapse to the same AAD.
         """
+        from shared.exceptions import CryptoError
+
+        if len(self.file_id) != FILE_ID_LEN:
+            raise CryptoError(
+                f"file_id must be exactly {FILE_ID_LEN} bytes"
+            )
         return struct.pack(
             ">16sIHI",
             self.file_id,
@@ -175,17 +322,101 @@ class MetadataBlob:
 
     @classmethod
     def deserialize(cls, data: bytes) -> "MetadataBlob":
-        """Deserialize from CBOR."""
-        obj = cbor2.loads(data)
+        """Deserialize from CBOR, with strict bounds and type checks.
+
+        Refuses input larger than ``MAX_METADATA_BYTES``, any tagged CBOR
+        value, fields of unexpected types, and over-long strings or list
+        entries that could be used for memory amplification.
+
+        Raises:
+            MalformedRequestError: input is over-sized, malformed, contains
+                unexpected CBOR tags, or fails type/structural validation.
+        """
+        from shared.exceptions import MalformedRequestError
+
+        if len(data) > MAX_METADATA_BYTES:
+            raise MalformedRequestError("MetadataBlob payload exceeds size cap")
+
+        obj = _safe_cbor_loads(data)
+        if not isinstance(obj, dict):
+            raise MalformedRequestError("MetadataBlob payload is not a map")
+
+        try:
+            owner = obj["owner"]
+            visibility_raw = obj["visibility"]
+        except KeyError as e:
+            raise MalformedRequestError("MetadataBlob missing field") from e
+
+        shared_with = obj.get("shared_with", [])
+        created_at = obj.get("created_at", 0.0)
+        modified_at = obj.get("modified_at", 0.0)
+        original_size = obj.get("original_size", 0)
+        blob_ids = obj.get("blob_ids", [])
+        version_number = obj.get("version_number", 1)
+
+        if not isinstance(owner, str):
+            raise MalformedRequestError("MetadataBlob.owner must be str")
+        if len(owner) > _MAX_META_STR_LEN:
+            raise MalformedRequestError("MetadataBlob.owner too long")
+        if not isinstance(visibility_raw, int) or isinstance(visibility_raw, bool):
+            raise MalformedRequestError(
+                "MetadataBlob.visibility must be int"
+            )
+        if not isinstance(shared_with, list):
+            raise MalformedRequestError("MetadataBlob.shared_with must be list")
+        for item in shared_with:
+            if not isinstance(item, str) or len(item) > _MAX_META_STR_LEN:
+                raise MalformedRequestError(
+                    "MetadataBlob.shared_with entries must be short strings"
+                )
+        if not isinstance(created_at, (int, float)) or isinstance(
+            created_at, bool
+        ):
+            raise MalformedRequestError(
+                "MetadataBlob.created_at must be a number"
+            )
+        if not isinstance(modified_at, (int, float)) or isinstance(
+            modified_at, bool
+        ):
+            raise MalformedRequestError(
+                "MetadataBlob.modified_at must be a number"
+            )
+        if not isinstance(original_size, int) or isinstance(
+            original_size, bool
+        ):
+            raise MalformedRequestError(
+                "MetadataBlob.original_size must be int"
+            )
+        if not isinstance(blob_ids, list):
+            raise MalformedRequestError("MetadataBlob.blob_ids must be list")
+        for item in blob_ids:
+            if not isinstance(item, str) or len(item) > _MAX_META_STR_LEN:
+                raise MalformedRequestError(
+                    "MetadataBlob.blob_ids entries must be short strings"
+                )
+        if not isinstance(version_number, int) or isinstance(
+            version_number, bool
+        ):
+            raise MalformedRequestError(
+                "MetadataBlob.version_number must be int"
+            )
+
+        try:
+            visibility = Visibility(visibility_raw)
+        except ValueError as e:
+            raise MalformedRequestError(
+                "MetadataBlob.visibility is not a known Visibility value"
+            ) from e
+
         return cls(
-            owner=obj["owner"],
-            visibility=Visibility(obj["visibility"]),
-            shared_with=obj.get("shared_with", []),
-            created_at=obj.get("created_at", 0.0),
-            modified_at=obj.get("modified_at", 0.0),
-            original_size=obj.get("original_size", 0),
-            blob_ids=obj.get("blob_ids", []),
-            version_number=obj.get("version_number", 1),
+            owner=owner,
+            visibility=visibility,
+            shared_with=list(shared_with),
+            created_at=float(created_at),
+            modified_at=float(modified_at),
+            original_size=original_size,
+            blob_ids=list(blob_ids),
+            version_number=version_number,
         )
 
 

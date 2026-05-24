@@ -22,6 +22,35 @@ pub fn munlock_slice(data: &[u8]) {
     }
 }
 
+/// Constant-time equality for 32-byte arrays.
+///
+/// Hand-rolled to avoid adding a `subtle` dependency. The XOR-OR
+/// accumulation has a constant data-flow path; the final `acc == 0`
+/// compiles to a single non-data-dependent comparison on mainstream
+/// targets (x86_64, aarch64).
+#[inline(never)]
+pub fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Constant-time check whether a 32-byte array is all zero.
+///
+/// Used to reject contributory-to-zero ECDH outputs per RFC 7748 §6.1
+/// (low-order recipient public key on Curve25519 produces a
+/// shared secret with attacker-known value).
+#[inline(never)]
+pub fn is_zero_32(a: &[u8; 32]) -> bool {
+    let mut acc: u8 = 0;
+    for &b in a {
+        acc |= b;
+    }
+    acc == 0
+}
+
 /// Disable core dumps for this process using prctl(PR_SET_DUMPABLE, 0).
 ///
 /// This prevents key material from appearing in core dump files.

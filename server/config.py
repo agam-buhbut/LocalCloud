@@ -72,9 +72,17 @@ class ServerConfig:
             "LOCALCLOUD_DB_PATH",
             os.path.join(config.data_dir, "meta.db"),
         )
-        config.session_secret = os.environ.get(
-            "LOCALCLOUD_SESSION_SECRET", config.session_secret
-        )
+        # Session secret: prefer a root-owned file over an environment
+        # variable, since env vars are exposed to subprocesses via
+        # /proc/<pid>/environ. The file path can also come from
+        # systemd's LoadCredential=.
+        secret_file = os.environ.get("LOCALCLOUD_SESSION_SECRET_FILE")
+        if secret_file:
+            config.session_secret = _read_secret_file(secret_file)
+        else:
+            config.session_secret = os.environ.get(
+                "LOCALCLOUD_SESSION_SECRET", config.session_secret
+            )
         config.session_lifetime = int(
             os.environ.get(
                 "LOCALCLOUD_SESSION_LIFETIME", config.session_lifetime
@@ -116,9 +124,16 @@ class ServerConfig:
                 "LOCALCLOUD_SESSION_SECRET must be set. "
                 "Generate with: python -c 'import os; print(os.urandom(32).hex())'"
             )
-        if len(self.session_secret) < 32:
+        # Require at least 64 characters of *encoded* secret. 64 hex
+        # chars and 44 base64 chars both encode 256 bits of entropy;
+        # since we can't reliably tell the encoding here, demand 64
+        # characters across the board. This guarantees ≥256 bits of
+        # entropy even in the worst-case (base64 → 6 bits/char → 384
+        # bits, hex → 4 bits/char → 256 bits).
+        if len(self.session_secret) < 64:
             raise ValueError(
-                "LOCALCLOUD_SESSION_SECRET must be at least 32 characters"
+                "LOCALCLOUD_SESSION_SECRET must be at least 64 characters "
+                "(256 bits of entropy)"
             )
         if self.bind_port < 1 or self.bind_port > 65535:
             raise ValueError("Invalid bind port")
@@ -127,3 +142,44 @@ class ServerConfig:
         """Create required directories if they don't exist."""
         for d in [self.data_dir, self.blob_dir, self.staging_dir]:
             os.makedirs(d, mode=0o700, exist_ok=True)
+
+
+def _read_secret_file(path: str) -> str:
+    """Read a secret from a file, refusing world/group-readable permissions.
+
+    The file should be 0400/0600 and owned by the service user. We
+    reject anything group- or world-readable so that a lax umask
+    doesn't silently expose the HMAC signing key. We also refuse to
+    follow symlinks (O_NOFOLLOW) — an attacker who can plant a symlink
+    in a writable directory shouldn't be able to redirect us to an
+    arbitrary file. fstat is performed on the already-opened fd to
+    avoid a TOCTOU window between stat and open.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ValueError(
+            f"Could not open session secret file {path}"
+        ) from e
+    try:
+        st = os.fstat(fd)
+        if st.st_mode & 0o077:
+            raise ValueError(
+                f"Session secret file {path} is group/world-readable "
+                f"(mode={oct(st.st_mode & 0o777)}); require 0400 or 0600"
+            )
+        # Ownership check: must be root or the current effective user.
+        # Anything else means an unrelated user wrote this file, which
+        # would let them rotate the HMAC key out from under us.
+        if st.st_uid not in (0, os.geteuid()):
+            raise ValueError(
+                f"Session secret file {path} owned by uid {st.st_uid}; "
+                f"require root or current user ({os.geteuid()})"
+            )
+        with os.fdopen(fd, "rb") as f:
+            # fdopen takes ownership of fd; don't double-close.
+            fd = -1
+            return f.read().decode("utf-8").strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
