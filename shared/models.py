@@ -11,7 +11,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Any
 
 import cbor2
 
@@ -62,8 +62,18 @@ MAX_METADATA_BYTES: int = 65536
 # margin left for future formats)
 MAX_CHUNK_SIZE: int = 16 * 1024 * 1024
 
-# Maximum number of chunks in any single file (~1M => up to 16 TiB at 16 MiB)
+# Wire-format ceiling on the number of chunks the parser will accept
+# in a single FileHeader (~1M => up to 16 TiB at 16 MiB).
 MAX_CHUNKS: int = 1 << 20
+
+# Operational ceiling on the chunks per file that producers / accepters
+# in this build are willing to handle (~400 GiB at 4 MiB). The wire
+# format permits more (MAX_CHUNKS above) for forward compatibility,
+# but the actual encryptor + server reject above this value to bound
+# memory / disk syscall pressure. Keeping the two consts distinct
+# (MAX_CHUNKS vs MAX_CHUNKS_PER_FILE) was the source of the mismatch
+# noted in Round-2 LOW-1. (Round-3 fix)
+MAX_CHUNKS_PER_FILE: int = 100_000
 
 # Maximum size for a padded metadata blob (1 MiB). Anything larger is
 # unreasonable for metadata and likely indicates abuse or a bug.
@@ -73,69 +83,150 @@ MAX_PADDED_SIZE: int = 1 << 20
 # entries, blob_ids).
 _MAX_META_STR_LEN: int = 256
 
-# Domain separation tag for Merkle-root signatures. Prevents an Ed25519
-# signature produced for one protocol context from being replayed into
-# another that uses the same identity key.
-MERKLE_SIG_CONTEXT: bytes = b"localcloud-merkle-v1"
+# Domain separation tag for Merkle-root signatures. Bumped to v2 when
+# the signing input was expanded to cover the full FileHeader (not just
+# merkle_root) so v1 signatures cannot replay against v2 verifiers.
+MERKLE_SIG_CONTEXT: bytes = b"localcloud-merkle-v2"
 
 
-def build_merkle_signing_input(file_id: bytes, merkle_root: bytes) -> bytes:
-    """Build the message that is actually signed for a file's Merkle root.
+def build_merkle_signing_input(
+    file_id: bytes,
+    merkle_root: bytes,
+    chunk_size: int = 0,
+    total_chunks: int = 0,
+    protocol_version: int = 0,
+) -> bytes:
+    """Build the message signed for a file's Merkle root.
 
-    Format: MERKLE_SIG_CONTEXT || file_id || merkle_root, with file_id
-    and merkle_root each at their fixed lengths, so the encoding is
-    unambiguous and collision-free across fields.
+    Format::
+
+        MERKLE_SIG_CONTEXT
+            || file_id (16 bytes)
+            || merkle_root (32 bytes)
+            || chunk_size (8 bytes, big-endian u64)
+            || total_chunks (8 bytes, big-endian u64)
+            || protocol_version (2 bytes, big-endian u16)
+
+    Each field is fixed-length, so the encoding is unambiguous and
+    collision-free across fields. The chunk_size / total_chunks /
+    protocol_version bindings ensure a hostile server cannot present a
+    header with mutated fields under a stale signature — earlier versions
+    covered only merkle_root, which caught most attacks indirectly via
+    per-chunk AAD but left a gap for new header fields. (Round-2 H3/H12)
     """
     if len(file_id) != FILE_ID_LEN:
         raise ValueError("file_id must be 16 bytes")
     if len(merkle_root) != BLAKE2B_DIGEST_LEN:
         raise ValueError("merkle_root must be 32 bytes")
-    return MERKLE_SIG_CONTEXT + file_id + merkle_root
+    if chunk_size < 0 or chunk_size > 0xFFFF_FFFF_FFFF_FFFF:
+        raise ValueError("chunk_size out of range")
+    if total_chunks < 0 or total_chunks > 0xFFFF_FFFF_FFFF_FFFF:
+        raise ValueError("total_chunks out of range")
+    if protocol_version < 0 or protocol_version > 0xFFFF:
+        raise ValueError("protocol_version out of range")
+    return (
+        MERKLE_SIG_CONTEXT
+        + file_id
+        + merkle_root
+        + struct.pack(">QQH", chunk_size, total_chunks, protocol_version)
+    )
 
 
 # ──────────────────────────── Safe CBOR Decode ────────────────────────────
 
 
 def _reject_tag(decoder: Any, tag: Any, shareable_index: Any = None) -> None:
-    """Tag hook that refuses any CBOR tagged value.
+    """Tag hook that refuses any CBOR tagged value the decoder hands us.
 
-    Tagged CBOR can carry semantic types (datetime, bignums, decimals,
-    URLs, custom objects). None of LocalCloud's wire formats use tags, so
-    any tag in attacker-controlled bytes is treated as malformed input.
+    This catches unknown tags only — cbor2 transparently decodes a set
+    of well-known tags (datetime, Decimal, Fraction, UUID, …) into
+    semantic Python objects before this hook fires. The post-decode
+    type whitelist in ``_safe_cbor_loads`` rejects those too.
     """
     from shared.exceptions import MalformedRequestError
 
     raise MalformedRequestError("Unexpected CBOR tag in serialized payload")
 
 
+# Types we accept from a CBOR decode. Anything else (datetime, Decimal,
+# Fraction, UUID, set, frozenset, CBORTag, …) means a tag was present in
+# the input — none of LocalCloud's wire formats use them, so they
+# indicate attacker-controlled data and must be rejected.
+_ALLOWED_CBOR_TYPES = (bool, int, float, str, bytes, bytearray, list, dict, type(None))
+
+
+# Max recursion depth when type-checking decoded CBOR. Each nesting
+# level costs at least one CBOR byte, so for the 64-KiB metadata cap
+# and 4-KiB header cap, 64 is comfortably above any legitimate depth
+# while still catching an attacker who hand-crafts a deeply nested
+# payload to blow Python's recursion limit (Round-3 LOW-2).
+_MAX_CBOR_WALK_DEPTH: int = 64
+
+
+def _walk_safe(obj: Any, depth: int = 0) -> None:
+    """Recursively assert that ``obj`` contains only whitelisted types.
+
+    Raises ``MalformedRequestError`` on any type outside the whitelist
+    or if recursion exceeds ``_MAX_CBOR_WALK_DEPTH``. Walks dict keys +
+    values and list items.
+    """
+    from shared.exceptions import MalformedRequestError
+
+    if depth > _MAX_CBOR_WALK_DEPTH:
+        raise MalformedRequestError("CBOR payload nesting exceeds depth limit")
+    if not isinstance(obj, _ALLOWED_CBOR_TYPES):
+        raise MalformedRequestError(
+            f"Unexpected CBOR type in payload: {type(obj).__name__}"
+        )
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _walk_safe(k, depth + 1)
+            _walk_safe(v, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_safe(item, depth + 1)
+
+
 def _safe_cbor_loads(data: bytes) -> Any:
     """Decode CBOR with tagged values rejected.
 
-    All decode failures (truncation, unsupported types, custom-tag content,
-    type errors raised by ``_reject_tag``) are surfaced as
-    ``MalformedRequestError`` so callers handle them uniformly.
+    Strategy:
+    1. tag_hook rejects any unknown tag at decode time.
+    2. The decoded value is recursively type-checked against an explicit
+       whitelist to reject *known* tags that cbor2 transparently turns
+       into rich Python objects (datetime, Decimal, UUID, etc.).
+
+    All decode failures (truncation, unsupported types, tag-bearing
+    content) surface as ``MalformedRequestError`` so callers handle them
+    uniformly.
     """
     from shared.exceptions import MalformedRequestError
 
     try:
         decoder = cbor2.CBORDecoder(io.BytesIO(data), tag_hook=_reject_tag)
-        return decoder.decode()
+        value = decoder.decode()
     except MalformedRequestError:
         raise
     except (cbor2.CBORDecodeError, KeyError, TypeError, ValueError) as e:
         raise MalformedRequestError("Malformed CBOR payload") from e
 
+    _walk_safe(value)
+    return value
+
 
 # ──────────────────────────── Enums ────────────────────────────
 
+
 class Visibility(IntEnum):
     """File visibility modes for access control."""
+
     PRIVATE = 0
     SHARED = 1
     PUBLIC = 2
 
 
 # ──────────────────────────── Data Structures ────────────────────────────
+
 
 @dataclass
 class FileHeader:
@@ -145,6 +236,7 @@ class FileHeader:
     Authenticated via inclusion in the first chunk's AAD or via
     the signed Merkle root.
     """
+
     magic: bytes = MAGIC
     version: int = PROTOCOL_VERSION
     file_id: bytes = field(default_factory=lambda: os.urandom(FILE_ID_LEN))
@@ -155,18 +247,21 @@ class FileHeader:
 
     def serialize(self) -> bytes:
         """Serialize to canonical CBOR."""
-        return cbor2.dumps({
-            "magic": self.magic,
-            "version": self.version,
-            "file_id": self.file_id,
-            "chunk_size": self.chunk_size,
-            "total_chunks": self.total_chunks,
-            "merkle_root": self.merkle_root,
-            "signature": self.signature,
-        }, canonical=True)
+        return cbor2.dumps(
+            {
+                "magic": self.magic,
+                "version": self.version,
+                "file_id": self.file_id,
+                "chunk_size": self.chunk_size,
+                "total_chunks": self.total_chunks,
+                "merkle_root": self.merkle_root,
+                "signature": self.signature,
+            },
+            canonical=True,
+        )
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "FileHeader":
+    def deserialize(cls, data: bytes) -> FileHeader:
         """Deserialize from CBOR, with strict bounds and type checks.
 
         Refuses input larger than ``MAX_HEADER_BYTES``, any tagged CBOR
@@ -231,17 +326,20 @@ class FileHeader:
     def validate(self) -> None:
         """Validate header fields. Raises ProtocolError on failure."""
         from shared.exceptions import ProtocolError
+
         if self.magic != MAGIC:
             raise ProtocolError("Invalid magic bytes")
         if self.version != PROTOCOL_VERSION:
-            raise ProtocolError(
-                f"Unsupported protocol version: {self.version}"
-            )
+            raise ProtocolError(f"Unsupported protocol version: {self.version}")
         if len(self.file_id) != FILE_ID_LEN:
             raise ProtocolError("Invalid file_id length")
         if self.chunk_size <= 0 or self.chunk_size > MAX_CHUNK_SIZE:
             raise ProtocolError("Invalid chunk_size")
-        if self.total_chunks < 0 or self.total_chunks > MAX_CHUNKS:
+        # total_chunks must be >= 1 — a zero-chunk file is meaningless
+        # and would let a hostile owner-signer ship a header that the
+        # client's loop body never executes (no AEAD verification),
+        # leaving Merkle compute with an empty list. (Round-9 I2)
+        if self.total_chunks < 1 or self.total_chunks > MAX_CHUNKS:
             raise ProtocolError("Invalid total_chunks")
         if len(self.merkle_root) != BLAKE2B_DIGEST_LEN:
             raise ProtocolError("Invalid merkle_root length")
@@ -258,6 +356,7 @@ class ChunkAAD:
     Binds each chunk to its file, position, and protocol version to
     prevent cross-file substitution and chunk reordering.
     """
+
     file_id: bytes
     chunk_index: int
     protocol_version: int = PROTOCOL_VERSION
@@ -279,9 +378,7 @@ class ChunkAAD:
         from shared.exceptions import CryptoError
 
         if len(self.file_id) != FILE_ID_LEN:
-            raise CryptoError(
-                f"file_id must be exactly {FILE_ID_LEN} bytes"
-            )
+            raise CryptoError(f"file_id must be exactly {FILE_ID_LEN} bytes")
         return struct.pack(
             ">16sIHI",
             self.file_id,
@@ -298,6 +395,7 @@ class MetadataBlob:
     After encryption, only the encrypted form is sent to the server.
     Server never sees this content.
     """
+
     owner: str
     visibility: Visibility = Visibility.PRIVATE
     shared_with: list[str] = field(default_factory=list)
@@ -309,19 +407,22 @@ class MetadataBlob:
 
     def serialize(self) -> bytes:
         """Serialize to canonical CBOR."""
-        return cbor2.dumps({
-            "owner": self.owner,
-            "visibility": int(self.visibility),
-            "shared_with": self.shared_with,
-            "created_at": self.created_at,
-            "modified_at": self.modified_at,
-            "original_size": self.original_size,
-            "blob_ids": self.blob_ids,
-            "version_number": self.version_number,
-        }, canonical=True)
+        return cbor2.dumps(
+            {
+                "owner": self.owner,
+                "visibility": int(self.visibility),
+                "shared_with": self.shared_with,
+                "created_at": self.created_at,
+                "modified_at": self.modified_at,
+                "original_size": self.original_size,
+                "blob_ids": self.blob_ids,
+                "version_number": self.version_number,
+            },
+            canonical=True,
+        )
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "MetadataBlob":
+    def deserialize(cls, data: bytes) -> MetadataBlob:
         """Deserialize from CBOR, with strict bounds and type checks.
 
         Refuses input larger than ``MAX_METADATA_BYTES``, any tagged CBOR
@@ -359,9 +460,7 @@ class MetadataBlob:
         if len(owner) > _MAX_META_STR_LEN:
             raise MalformedRequestError("MetadataBlob.owner too long")
         if not isinstance(visibility_raw, int) or isinstance(visibility_raw, bool):
-            raise MalformedRequestError(
-                "MetadataBlob.visibility must be int"
-            )
+            raise MalformedRequestError("MetadataBlob.visibility must be int")
         if not isinstance(shared_with, list):
             raise MalformedRequestError("MetadataBlob.shared_with must be list")
         for item in shared_with:
@@ -369,24 +468,12 @@ class MetadataBlob:
                 raise MalformedRequestError(
                     "MetadataBlob.shared_with entries must be short strings"
                 )
-        if not isinstance(created_at, (int, float)) or isinstance(
-            created_at, bool
-        ):
-            raise MalformedRequestError(
-                "MetadataBlob.created_at must be a number"
-            )
-        if not isinstance(modified_at, (int, float)) or isinstance(
-            modified_at, bool
-        ):
-            raise MalformedRequestError(
-                "MetadataBlob.modified_at must be a number"
-            )
-        if not isinstance(original_size, int) or isinstance(
-            original_size, bool
-        ):
-            raise MalformedRequestError(
-                "MetadataBlob.original_size must be int"
-            )
+        if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+            raise MalformedRequestError("MetadataBlob.created_at must be a number")
+        if not isinstance(modified_at, (int, float)) or isinstance(modified_at, bool):
+            raise MalformedRequestError("MetadataBlob.modified_at must be a number")
+        if not isinstance(original_size, int) or isinstance(original_size, bool):
+            raise MalformedRequestError("MetadataBlob.original_size must be int")
         if not isinstance(blob_ids, list):
             raise MalformedRequestError("MetadataBlob.blob_ids must be list")
         for item in blob_ids:
@@ -394,12 +481,8 @@ class MetadataBlob:
                 raise MalformedRequestError(
                     "MetadataBlob.blob_ids entries must be short strings"
                 )
-        if not isinstance(version_number, int) or isinstance(
-            version_number, bool
-        ):
-            raise MalformedRequestError(
-                "MetadataBlob.version_number must be int"
-            )
+        if not isinstance(version_number, int) or isinstance(version_number, bool):
+            raise MalformedRequestError("MetadataBlob.version_number must be int")
 
         try:
             visibility = Visibility(visibility_raw)

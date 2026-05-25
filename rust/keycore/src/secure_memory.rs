@@ -24,31 +24,28 @@ pub fn munlock_slice(data: &[u8]) {
 
 /// Constant-time equality for 32-byte arrays.
 ///
-/// Hand-rolled to avoid adding a `subtle` dependency. The XOR-OR
-/// accumulation has a constant data-flow path; the final `acc == 0`
-/// compiles to a single non-data-dependent comparison on mainstream
-/// targets (x86_64, aarch64).
+/// Delegates to `subtle::ConstantTimeEq` which uses `black_box` reads
+/// to keep the comparison data-flow constant across compiler versions
+/// (the previous hand-rolled XOR-OR loop was sound but offered no
+/// formal guarantee against future LLVM passes). `#[inline(never)]`
+/// is preserved as belt-and-braces defense in case the call site is
+/// inlined into a function that would otherwise expose timing.
 #[inline(never)]
 pub fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff: u8 = 0;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    bool::from(a.ct_eq(b))
 }
 
 /// Constant-time check whether a 32-byte array is all zero.
 ///
 /// Used to reject contributory-to-zero ECDH outputs per RFC 7748 §6.1
-/// (low-order recipient public key on Curve25519 produces a
-/// shared secret with attacker-known value).
+/// (low-order recipient public key on Curve25519 produces a shared
+/// secret with attacker-known value). Same subtle-crate guarantee
+/// as `ct_eq_32`.
 #[inline(never)]
 pub fn is_zero_32(a: &[u8; 32]) -> bool {
-    let mut acc: u8 = 0;
-    for &b in a {
-        acc |= b;
-    }
-    acc == 0
+    use subtle::ConstantTimeEq;
+    bool::from(a.ct_eq(&[0u8; 32]))
 }
 
 /// Disable core dumps for this process using prctl(PR_SET_DUMPABLE, 0).

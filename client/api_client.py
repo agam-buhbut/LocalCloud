@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import json
+from collections.abc import Iterator
 
 import httpx
 
-from shared.exceptions import AuthError, StorageError, UploadError
+from shared.exceptions import AuthError, StorageError
 
 
 class CloudClient:
@@ -22,8 +23,16 @@ class CloudClient:
     ):
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
-        self._token: Optional[str] = None
-        self._client = httpx.Client(timeout=timeout)
+        self._token: str | None = None
+        # Bound the connection pool so chunk uploads share keepalive
+        # connections instead of opening a fresh TCP socket per chunk.
+        self._client = httpx.Client(
+            timeout=timeout,
+            limits=httpx.Limits(
+                max_keepalive_connections=8,
+                max_connections=16,
+            ),
+        )
 
     def close(self) -> None:
         """Close the HTTP client."""
@@ -43,7 +52,8 @@ class CloudClient:
     def _check_response(self, resp: httpx.Response) -> dict:
         """Check response status and return JSON body.
 
-        #14: Safely handles non-JSON responses.
+        Narrow exception handlers; full chain of cause via ``raise from``
+        so the original transport failure isn't lost.
         """
         if resp.status_code == 401:
             raise AuthError("Authentication required")
@@ -52,13 +62,34 @@ class CloudClient:
         if resp.status_code >= 400:
             try:
                 body = resp.json()
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 body = {"error": resp.text or "Request failed"}
             raise StorageError(body.get("error", "Request failed"))
         try:
             return resp.json()
-        except Exception:
-            raise StorageError("Invalid server response")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise StorageError("Invalid server response") from e
+
+    def _check_binary_response(self, resp: httpx.Response) -> bytes:
+        """Like _check_response but for endpoints returning raw bytes.
+
+        Maps 4xx/5xx to typed exceptions; on success, returns the body
+        without forcing a JSON decode.
+        """
+        if resp.status_code == 401:
+            raise AuthError("Authentication required")
+        if resp.status_code == 429:
+            raise AuthError("Rate limited")
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+                msg = body.get("error", "Request failed")
+            except (json.JSONDecodeError, ValueError):
+                msg = resp.text or f"HTTP {resp.status_code}"
+            raise StorageError(msg)
+        if resp.status_code != 200:
+            raise StorageError(f"Unexpected status {resp.status_code}")
+        return resp.content
 
     # ──────────────────────────── Auth ────────────────────────────
 
@@ -73,8 +104,11 @@ class CloudClient:
             headers={"Content-Type": "application/json"},
         )
         data = self._check_response(resp)
-        self._token = data["token"]
-        return self._token
+        token = data.get("token")
+        if not isinstance(token, str) or not token:
+            raise AuthError("Server returned no session token")
+        self._token = token
+        return token
 
     # ──────────────────────────── Upload ────────────────────────────
 
@@ -91,9 +125,7 @@ class CloudClient:
         data = self._check_response(resp)
         return data["upload_id"]
 
-    def upload_chunk(
-        self, upload_id: str, chunk_index: int, chunk_data: bytes
-    ) -> str:
+    def upload_chunk(self, upload_id: str, chunk_index: int, chunk_data: bytes) -> str:
         """Upload a single encrypted chunk. Returns chunk hash."""
         resp = self._client.post(
             f"{self.server_url}/api/files/upload/{upload_id}/chunk/{chunk_index}",
@@ -139,33 +171,6 @@ class CloudClient:
         """Set the session token (e.g. loaded from file)."""
         self._token = token
 
-    def upload_file(
-        self,
-        filename: str,
-        chunks: list[bytes],
-        file_id: str,
-        file_header: bytes,
-        encrypted_metadata: bytes,
-        visibility: int = 0,
-    ) -> str:
-        """Complete upload flow: init → chunks → finalize."""
-        upload_id = self.upload_init(filename, len(chunks))
-
-        hash_strings = []
-        for i, chunk in enumerate(chunks):
-            server_hash = self.upload_chunk(upload_id, i, chunk)
-            hash_strings.append(server_hash)
-
-        return self.upload_finalize(
-            upload_id=upload_id,
-            file_id=file_id,
-            total_chunks=len(chunks),
-            file_header=file_header,
-            encrypted_metadata=encrypted_metadata,
-            visibility=visibility,
-            expected_hashes=hash_strings,
-        )
-
     # ──────────────────────────── Download ────────────────────────────
 
     def get_file_metadata(self, file_id: str) -> dict:
@@ -176,39 +181,56 @@ class CloudClient:
         )
         return self._check_response(resp)
 
+    def get_owner_pubkey(self, file_id: str) -> bytes | None:
+        """Fetch the file owner's Ed25519 identity public key.
+
+        Returns the raw 32-byte pubkey, or None if the server has no
+        registered key for the owner. Raises StorageError on 4xx/5xx.
+        """
+        resp = self._client.get(
+            f"{self.server_url}/api/files/{file_id}/owner_pubkey",
+            headers=self._headers(),
+        )
+        data = self._check_response(resp)
+        pk = data.get("pubkey")
+        if not isinstance(pk, str) or not pk:
+            return None
+        try:
+            return bytes.fromhex(pk)
+        except ValueError as e:
+            raise StorageError("Invalid owner_pubkey response") from e
+
     def download_chunk(self, file_id: str, chunk_index: int) -> bytes:
-        """Download a single encrypted chunk."""
+        """Download a single encrypted chunk.
+
+        Surfaces 4xx/5xx as typed errors with the server's message
+        when available, rather than swallowing them as a generic
+        "Download failed".
+        """
         resp = self._client.get(
             f"{self.server_url}/api/files/{file_id}/chunk/{chunk_index}",
             headers={
                 "Authorization": f"Bearer {self._token}",
             },
         )
-        if resp.status_code != 200:
-            raise StorageError("Download failed")
-        return resp.content
+        return self._check_binary_response(resp)
 
-    def download_file(self, file_id: str) -> tuple[dict, list[bytes]]:
-        """Download a complete file (metadata + all chunks).
+    def iter_chunks(self, file_id: str, total_chunks: int) -> Iterator[bytes]:
+        """Yield each encrypted chunk in order.
 
-        Returns (metadata_dict, list_of_chunk_bytes).
+        Generator-shaped so callers can pipe directly into a streaming
+        decrypter without ever materializing the full file in RAM.
         """
-        metadata = self.get_file_metadata(file_id)
-        total_chunks = metadata["total_chunks"]
-
-        chunks = []
         for i in range(total_chunks):
-            chunk = self.download_chunk(file_id, i)
-            chunks.append(chunk)
-
-        return metadata, chunks
+            yield self.download_chunk(file_id, i)
 
     # ──────────────────────────── File Management ────────────────────────────
 
-    def list_files(self) -> list[dict]:
-        """List all accessible files."""
+    def list_files(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        """List accessible files with pagination."""
         resp = self._client.get(
             f"{self.server_url}/api/files",
+            params={"limit": limit, "offset": offset},
             headers=self._headers(),
         )
         data = self._check_response(resp)
@@ -232,9 +254,7 @@ class CloudClient:
 
     # ──────────────────────────── Sharing ────────────────────────────
 
-    def share_file(
-        self, file_id: str, username: str, wrapped_keys: bytes
-    ) -> None:
+    def share_file(self, file_id: str, username: str, wrapped_keys: bytes) -> None:
         """Share a file with another user."""
         resp = self._client.post(
             f"{self.server_url}/api/files/{file_id}/share",
@@ -246,7 +266,20 @@ class CloudClient:
         )
         self._check_response(resp)
 
-    def get_wrapped_keys(self, file_id: str) -> Optional[bytes]:
+    def unshare_file(self, file_id: str, username: str) -> None:
+        """Revoke a previously-granted share for a recipient.
+
+        Server-side revocation only — recipients who already downloaded
+        the wrapped keys still have them offline. To fully revoke the
+        owner must re-encrypt under a new file_key. (Round-3 M9)
+        """
+        resp = self._client.delete(
+            f"{self.server_url}/api/files/{file_id}/share/{username}",
+            headers=self._headers(),
+        )
+        self._check_response(resp)
+
+    def get_wrapped_keys(self, file_id: str) -> bytes | None:
         """Get wrapped keys for a shared file."""
         resp = self._client.get(
             f"{self.server_url}/api/files/{file_id}/wrapped_keys",

@@ -9,7 +9,10 @@ name = "keycore"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# pyo3 0.24+ addresses RUSTSEC-2025-0020 (buffer overflow in
+# PyString::from_object). 0.24 is API-compatible with our usage:
+# PyBytes::new_bound, Bound<'py>, #[pyclass], #[pyfunction].
+pyo3 = { version = "0.24", features = ["extension-module"] }
 
 # Cryptographic primitives
 # `zeroize` features are pinned explicitly so that key material carried
@@ -24,6 +27,13 @@ argon2 = "0.5"
 
 # Secure memory
 zeroize = { version = "1", features = ["derive"] }
+
+# Vetted constant-time primitives. Replaces the hand-rolled
+# ct_eq_32 / is_zero_32 loops which, while data-flow constant on
+# x86_64/aarch64 today, give LLVM under -O3+LTO room to introduce a
+# branch in future versions. subtle uses black_box reads and is
+# specifically maintained for crypto use.
+subtle = "2"
 
 # Randomness
 rand = "0.8"

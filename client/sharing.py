@@ -35,9 +35,7 @@ def wrap_keys_for_recipient(
     Returns:
         Wrapped key bundle bytes: ephemeral_pubkey || nonce || AEAD ciphertext
     """
-    return keystore.wrap_file_keys(
-        file_key, meta_key, file_id, recipient_pubkey
-    )
+    return keystore.wrap_file_keys(file_key, meta_key, file_id, recipient_pubkey)
 
 
 def unwrap_keys(
@@ -62,6 +60,4 @@ def unwrap_keys(
     Returns:
         (file_key, meta_key) tuple
     """
-    return keystore.unwrap_file_keys(
-        wrapped_bundle, file_id, sender_pubkey
-    )
+    return keystore.unwrap_file_keys(wrapped_bundle, file_id, sender_pubkey)

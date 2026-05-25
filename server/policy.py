@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from server.database import Database
 from shared.exceptions import AuthError
 from shared.models import Visibility
@@ -39,10 +37,10 @@ def check_file_access(
     if visibility == Visibility.PUBLIC:
         return file_record
 
-    # Shared files — use indexed existence check (#12)
-    if visibility == Visibility.SHARED:
-        if db.check_share_exists(file_id, user_id):
-            return file_record
+    # Shared files — use indexed existence check (#12). Falls through to
+    # AuthError below if the user is not in the share list.
+    if visibility == Visibility.SHARED and db.check_share_exists(file_id, user_id):
+        return file_record
 
     # Private or not in share list
     raise AuthError()

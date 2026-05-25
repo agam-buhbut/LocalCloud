@@ -9,11 +9,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+
+import keycore
 
 
 class KeyStore:
@@ -21,6 +23,10 @@ class KeyStore:
 
     Wraps the Rust `keycore.KeyPair` class. Private keys are stored
     exclusively in Rust memory (mlock'd, zeroize-on-drop).
+
+    Concurrency: every operation that reads or mutates ``self._keypair``
+    takes ``self._lock``. The lock is reentrant so the auto-lock timer
+    can fire on the same thread mid-operation without deadlocking.
     """
 
     def __init__(self, key_file: str | Path, inactivity_timeout: int = 300):
@@ -33,8 +39,11 @@ class KeyStore:
         self.inactivity_timeout = inactivity_timeout
         self._keypair = None  # keycore.KeyPair or None
         self._last_activity: float = 0.0
-        self._lock = threading.Lock()
-        self._timer: Optional[threading.Timer] = None
+        # Reentrant so a single thread doing sign() → _touch_activity()
+        # → _cancel_timer() doesn't deadlock if anything in that chain
+        # re-acquires the lock.
+        self._lock = threading.RLock()
+        self._timer: threading.Timer | None = None
 
     @property
     def is_unlocked(self) -> bool:
@@ -62,8 +71,6 @@ class KeyStore:
                 "Delete it first if you want to regenerate keys."
             )
 
-        import keycore
-
         with self._lock:
             kp = keycore.KeyPair.generate()
             encrypted = kp.encrypt_to_store(password.encode())
@@ -87,10 +94,8 @@ class KeyStore:
                 os.replace(str(tmp_path), str(self.key_file))
             except Exception:
                 if tmp_path.exists():
-                    try:
+                    with contextlib.suppress(OSError):
                         tmp_path.unlink()
-                    except OSError:
-                        pass
                 raise
 
             self._keypair = kp
@@ -112,16 +117,28 @@ class KeyStore:
                 "Run 'localcloud init' first."
             )
 
-        import keycore
-
         with self._lock:
-            data = self.key_file.read_bytes()
+            # Bound the read size via a single fd-bound syscall —
+            # `stat()` + `read_bytes()` is TOCTOU. Same approach as
+            # shared.io.read_capped used in the CLI. (Round-6 M)
+            from shared.io import read_capped
+
+            _MAX_STORE_BYTES = 16 * 1024
+            try:
+                data = read_capped(self.key_file, _MAX_STORE_BYTES)
+            except (ValueError, OSError) as e:
+                raise ValueError("Failed to read key store") from e
             try:
                 self._keypair = keycore.KeyPair.decrypt_from_store(
                     data, password.encode()
                 )
-            except Exception:
-                raise ValueError("Failed to unlock key store")
+            except Exception as e:
+                # Chain the original exception so a low-level
+                # corruption error survives in __cause__ for debugging
+                # — but the user-visible message stays generic so we
+                # don't leak whether the failure was a wrong password
+                # or a corrupted file. (#F8)
+                raise ValueError("Failed to unlock key store") from e
             self._touch_activity()
 
     def lock(self) -> None:
@@ -136,24 +153,33 @@ class KeyStore:
 
     def x25519_public_key(self) -> bytes:
         """Get the X25519 public key (32 bytes)."""
-        self._require_unlocked()
-        self._touch_activity()
-        return bytes(self._keypair.x25519_public_key())
+        with self._lock:
+            self._require_unlocked()
+            assert self._keypair is not None
+            result = bytes(self._keypair.x25519_public_key())
+            self._touch_activity()
+            return result
 
     def ed25519_public_key(self) -> bytes:
         """Get the Ed25519 public key (32 bytes)."""
-        self._require_unlocked()
-        self._touch_activity()
-        return bytes(self._keypair.ed25519_public_key())
+        with self._lock:
+            self._require_unlocked()
+            assert self._keypair is not None
+            result = bytes(self._keypair.ed25519_public_key())
+            self._touch_activity()
+            return result
 
     def sign(self, message: bytes) -> bytes:
         """Sign a message with the Ed25519 private key.
 
         The private key never leaves Rust memory.
         """
-        self._require_unlocked()
-        self._touch_activity()
-        return bytes(self._keypair.sign(message))
+        with self._lock:
+            self._require_unlocked()
+            assert self._keypair is not None
+            result = bytes(self._keypair.sign(message))
+            self._touch_activity()
+            return result
 
     def wrap_file_keys(
         self,
@@ -167,13 +193,26 @@ class KeyStore:
         Performs ephemeral-static X25519 ECDH → HKDF → AEAD in Rust.
         `recipient_pubkey` is the recipient's X25519 public key.
         """
-        self._require_unlocked()
-        self._touch_activity()
-        return bytes(
-            self._keypair.wrap_file_keys(
-                file_key, meta_key, file_id, recipient_pubkey
+        # Belt-and-braces length check at the Python boundary mirroring
+        # the Rust-side enforcement. A wrong-length value here would
+        # otherwise raise a confusing PyValueError from Rust at call
+        # time. (Round-2 LOW-7)
+        if len(file_id) != 16:
+            raise ValueError("file_id must be 16 bytes")
+        if len(file_key) != 32 or len(meta_key) != 32:
+            raise ValueError("file_key and meta_key must be 32 bytes")
+        if len(recipient_pubkey) != 32:
+            raise ValueError("recipient_pubkey must be 32 bytes")
+        with self._lock:
+            self._require_unlocked()
+            assert self._keypair is not None
+            result = bytes(
+                self._keypair.wrap_file_keys(
+                    file_key, meta_key, file_id, recipient_pubkey
+                )
             )
-        )
+            self._touch_activity()
+            return result
 
     def unwrap_file_keys(
         self,
@@ -189,39 +228,51 @@ class KeyStore:
 
         Returns (file_key, meta_key).
         """
-        self._require_unlocked()
-        self._touch_activity()
-        fk, mk = self._keypair.unwrap_file_keys(
-            wrapped_bundle, file_id, sender_pubkey
-        )
-        return bytes(fk), bytes(mk)
+        if len(file_id) != 16:
+            raise ValueError("file_id must be 16 bytes")
+        if len(sender_pubkey) != 32:
+            raise ValueError("sender_pubkey must be 32 bytes")
+        with self._lock:
+            self._require_unlocked()
+            assert self._keypair is not None
+            fk, mk = self._keypair.unwrap_file_keys(
+                wrapped_bundle, file_id, sender_pubkey
+            )
+            self._touch_activity()
+            return bytes(fk), bytes(mk)
 
     # ──────────── Internal ────────────
 
     def _require_unlocked(self) -> None:
         """Raise if keys are not currently unlocked."""
         if self._keypair is None:
-            raise RuntimeError(
-                "Key store is locked. Call unlock() first."
-            )
+            raise RuntimeError("Key store is locked. Call unlock() first.")
 
     def _touch_activity(self) -> None:
         """Update last activity time and reset auto-lock timer."""
         self._last_activity = time.time()
         self._cancel_timer()
-        self._timer = threading.Timer(
-            self.inactivity_timeout, self._auto_lock
-        )
+        self._timer = threading.Timer(self.inactivity_timeout, self._auto_lock)
         self._timer.daemon = True
         self._timer.start()
 
     def _auto_lock(self) -> None:
-        """Auto-lock keys after inactivity timeout."""
-        if time.time() - self._last_activity >= self.inactivity_timeout:
-            self.lock()
+        """Auto-lock keys after inactivity timeout.
+
+        Re-checks ``_last_activity`` under the lock; otherwise a recent
+        ``_touch_activity`` racing the timer fire could lock keys that
+        the user just used. (#F30)
+        """
+        with self._lock:
+            if (
+                self._keypair is not None
+                and time.time() - self._last_activity >= self.inactivity_timeout
+            ):
+                self._keypair = None  # Rust Drop → zeroize + munlock
+                self._cancel_timer()
 
     def _cancel_timer(self) -> None:
-        """Cancel the auto-lock timer."""
+        """Cancel the auto-lock timer. Caller must hold ``self._lock``."""
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None

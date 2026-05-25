@@ -4,9 +4,7 @@
 // The signing key never leaves Rust memory and is protected by
 // Zeroizing<> and mlock from the identity module.
 
-use ed25519_dalek::{
-    Signature, Signer, SigningKey, Verifier, VerifyingKey,
-};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 // ──────────────────────────── Signing ────────────────────────────
 
@@ -21,28 +19,30 @@ pub fn sign(private_key: &[u8; 32], message: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Verify an Ed25519 signature against a public key and message.
 ///
-/// Returns Ok(true) if valid, Ok(false) if invalid signature,
-/// or Err on malformed key/signature.
+/// Returns Ok(true) if valid, Ok(false) for any other reason — wrong
+/// signature, wrong-length signature, or invalid public key. Callers
+/// distinguishing "malformed" from "invalid" got the same observable
+/// outcome anyway, and surfacing those as Err leaked which gate
+/// rejected attacker-controlled bytes. (Finding #5, #73)
 pub fn verify(
     public_key: &[u8; 32],
     message: &[u8],
     signature_bytes: &[u8],
 ) -> Result<bool, String> {
-    let verifying_key = VerifyingKey::from_bytes(public_key)
-        .map_err(|e| format!("Invalid public key: {}", e))?;
+    let verifying_key = match VerifyingKey::from_bytes(public_key) {
+        Ok(k) => k,
+        Err(_) => return Ok(false),
+    };
 
     if signature_bytes.len() != 64 {
-        return Err("Signature must be exactly 64 bytes".to_string());
+        return Ok(false);
     }
 
     let mut sig_array = [0u8; 64];
     sig_array.copy_from_slice(signature_bytes);
     let signature = Signature::from_bytes(&sig_array);
 
-    match verifying_key.verify(message, &signature) {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    Ok(verifying_key.verify(message, &signature).is_ok())
 }
 
 #[cfg(test)]
@@ -95,8 +95,11 @@ mod tests {
     #[test]
     fn test_invalid_signature_length() {
         let (_priv_key, pub_key) = generate_ed25519_keypair();
-        let result = verify(&pub_key, b"msg", &[0u8; 63]); // Wrong length
-        assert!(result.is_err());
+        // Wrong-length signature should NOT be returned as Err — it
+        // should be a normal "this does not verify" Ok(false), so
+        // callers can't distinguish "malformed" from "invalid". (#73)
+        let result = verify(&pub_key, b"msg", &[0u8; 63]).unwrap();
+        assert!(!result);
     }
 
     #[test]

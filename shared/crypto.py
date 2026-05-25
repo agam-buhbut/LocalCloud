@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import math
 import os
 
 import argon2
 import nacl.exceptions
-from nacl.aead import XCHACHA20POLY1305_NONCEBYTES
 from nacl.bindings import (
     crypto_aead_xchacha20poly1305_ietf_decrypt,
     crypto_aead_xchacha20poly1305_ietf_encrypt,
@@ -52,9 +50,7 @@ def generate_file_id() -> bytes:
 # ──────────────────────────── AEAD Encryption ────────────────────────────
 
 
-def encrypt_chunk(
-    key: bytes, nonce: bytes, plaintext: bytes, aad: bytes
-) -> bytes:
+def encrypt_chunk(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> bytes:
     """Encrypt a chunk using XChaCha20-Poly1305 AEAD.
 
     Args:
@@ -75,16 +71,12 @@ def encrypt_chunk(
         raise CryptoError("Nonce must be 24 bytes")
 
     try:
-        return crypto_aead_xchacha20poly1305_ietf_encrypt(
-            plaintext, aad, nonce, key
-        )
+        return crypto_aead_xchacha20poly1305_ietf_encrypt(plaintext, aad, nonce, key)
     except Exception as e:
         raise CryptoError("Encryption failed") from e
 
 
-def decrypt_chunk(
-    key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes
-) -> bytes:
+def decrypt_chunk(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> bytes:
     """Decrypt a chunk using XChaCha20-Poly1305 AEAD.
 
     Args:
@@ -105,9 +97,7 @@ def decrypt_chunk(
         raise DecryptionError("Nonce must be 24 bytes")
 
     try:
-        return crypto_aead_xchacha20poly1305_ietf_decrypt(
-            ciphertext, aad, nonce, key
-        )
+        return crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, aad, nonce, key)
     except nacl.exceptions.CryptoError as e:
         # Deliberately generic message — don't reveal why decryption failed
         raise DecryptionError("Decryption failed") from e

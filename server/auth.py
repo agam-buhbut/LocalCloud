@@ -18,7 +18,6 @@ import unicodedata
 import uuid
 from collections import defaultdict, deque
 from functools import wraps
-from typing import Deque, Dict, Optional, Tuple
 
 from quart import Blueprint, jsonify, request
 
@@ -42,18 +41,58 @@ _LOGIN_MAX_CONTENT_LENGTH = 4096
 # Argon2id verify on commodity hardware.
 _RATE_LIMIT_SLEEP_SECONDS = 0.150
 
-# Dummy Argon2id hash computed once at startup so that the login
-# handler can verify against it when a username is unknown, equalizing
-# timing with the valid-username branch and preventing enumeration.
-_DUMMY_PASSWORD_HASH = hash_password("x" * 32)
+# Dummy Argon2id hash used to equalize timing on unknown-username
+# logins. Computed lazily on first use so that importing this module is
+# cheap and tests that monkey-patch Argon2 parameters do not pay the
+# 128-MiB cost at import time. (#C3)
+#
+# The dummy plaintext is per-process random rather than the previous
+# constant ``"x" * 32`` so it cannot be brute-precomputed or accidentally
+# coincide with a real user's password. (#25)
+_DUMMY_PASSWORD: bytes = b""
+_DUMMY_PASSWORD_HASH: str | None = None
 
 # Cap concurrent Argon2id verifications so that a burst of login
 # attempts can't exhaust memory / CPU. Argon2id is intentionally
 # expensive; without a bound, N concurrent requests means N × the
-# configured memory footprint. Hardcoded conservative value — adjust
-# via redeployment if profiling shows headroom.
+# configured memory footprint.
 _MAX_CONCURRENT_ARGON2 = 4
-_argon2_semaphore: asyncio.Semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ARGON2)
+
+# Semaphore is created lazily inside the running event loop so that an
+# unrelated import (e.g. from a test runner) doesn't bind it to a
+# now-stale loop. (#C4)
+_argon2_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_argon2_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide semaphore, creating it on first use."""
+    global _argon2_semaphore
+    if _argon2_semaphore is None:
+        _argon2_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ARGON2)
+    return _argon2_semaphore
+
+
+def _get_dummy_hash() -> str:
+    """Return a dummy Argon2 hash. Computed once per process.
+
+    The dummy plaintext is discarded after the hash is computed so we
+    don't leave 32 bytes of random-but-real plaintext in process memory
+    for the lifetime of the daemon. (Round-3 M12)
+    """
+    global _DUMMY_PASSWORD, _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        import os as _os
+
+        # Use os.urandom for the dummy plaintext to avoid any chance of
+        # collision with a real password and to prevent precomputation.
+        plaintext = _os.urandom(32).hex()
+        _DUMMY_PASSWORD_HASH = hash_password(plaintext)
+        # Best-effort: shred the local plaintext reference. The Python
+        # str is immutable; we just drop the binding here.
+        _DUMMY_PASSWORD = b""
+        del plaintext
+    return _DUMMY_PASSWORD_HASH
+
 
 # Username canonicalization regex (post-NFKC + casefold + strip).
 # Anchored: full-string match. Charset is intentionally narrow.
@@ -131,9 +170,7 @@ def create_session_token(
     payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
 
     # HMAC-SHA256 signature
-    sig = hmac.new(
-        secret.encode(), payload_bytes, hashlib.sha256
-    ).hexdigest()
+    sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
 
     payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode().rstrip("=")
     return f"{payload_b64}.{sig}"
@@ -227,7 +264,7 @@ _IP_RATE_LIMIT_MULTIPLIER = 5
 # For a single-process WireGuard-fronted deployment this is acceptable;
 # DB-level composite tracking would require a schema change in
 # server/database.py which is out of scope for this fix.
-_composite_attempts: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+_composite_attempts: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 _composite_lock = asyncio.Lock()
 
 
@@ -271,6 +308,47 @@ async def _composite_rate_limit_clear(peer_ip: str, username: str) -> None:
         _composite_attempts.pop(key, None)
 
 
+# Hard cap on how many (peer, username) pairs the composite limiter
+# will track. An attacker who flood-logins distinct (peer, username)
+# tuples is bounded to this many in-memory entries. Beyond the cap,
+# new entries fall back to the DB-level rate limit only. (#H11 #87)
+_COMPOSITE_MAX_KEYS: int = 8192
+
+
+async def sweep_composite_attempts(window_seconds: int) -> int:
+    """Periodically called to remove stale composite-limiter entries.
+
+    Drops every key whose deque is empty after trimming entries older
+    than ``window_seconds``. Also drops oldest-touched entries above the
+    hard cap so a username-flood attacker cannot grow this dict without
+    bound. Returns the number of keys removed (for logging).
+    """
+    now = time.monotonic()
+    cutoff = now - window_seconds
+    removed = 0
+    async with _composite_lock:
+        for key in list(_composite_attempts.keys()):
+            dq = _composite_attempts[key]
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                del _composite_attempts[key]
+                removed += 1
+        if len(_composite_attempts) > _COMPOSITE_MAX_KEYS:
+            # Evict the entries with the OLDEST most-recent attempt.
+            # We can't use ordered dict here because defaultdict isn't
+            # ordered by access; do an O(n) pick.
+            excess = len(_composite_attempts) - _COMPOSITE_MAX_KEYS
+            items = sorted(
+                _composite_attempts.items(),
+                key=lambda kv: kv[1][-1] if kv[1] else 0.0,
+            )
+            for key, _ in items[:excess]:
+                del _composite_attempts[key]
+                removed += 1
+    return removed
+
+
 def check_rate_limit(
     db: Database,
     username: str,
@@ -307,7 +385,7 @@ def check_rate_limit(
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 # These will be set by the app factory
-_db: Optional[Database] = None
+_db: Database | None = None
 _session_secret: str = ""
 _session_lifetime: int = 3600
 _rate_limit_max: int = 5
@@ -321,14 +399,25 @@ def init_auth(
     rate_limit_max: int = 5,
     rate_limit_window: int = 60,
 ) -> None:
-    """Initialize auth module with dependencies."""
+    """Initialize auth module with dependencies.
+
+    Also eagerly creates ``_argon2_semaphore`` to close the lazy-init
+    race (Round-10 M7): two concurrent first-callers of
+    `_get_argon2_semaphore` could otherwise each create their own
+    semaphore (the `if is None: = Semaphore(...)` window is not GIL-
+    protected across `await` boundaries). Creating it here, inside the
+    running event loop at app startup, guarantees one instance.
+    """
     global _db, _session_secret, _session_lifetime
     global _rate_limit_max, _rate_limit_window
+    global _argon2_semaphore
     _db = db
     _session_secret = session_secret
     _session_lifetime = session_lifetime
     _rate_limit_max = rate_limit_max
     _rate_limit_window = rate_limit_window
+    if _argon2_semaphore is None:
+        _argon2_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ARGON2)
 
 
 def _get_peer_identity() -> str:
@@ -371,10 +460,12 @@ async def login():
         await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
         return _auth_failure_response()
 
-    # Require explicit JSON content type. (medium)
+    # Require explicit JSON content type. Return uniform 401 (not 415)
+    # so an attacker can't probe rate-limit state by alternating
+    # content-types. (Round-3 H7)
     if not request.is_json:
         await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
-        return jsonify({"error": "Unsupported Media Type"}), 415
+        return _auth_failure_response()
 
     # Validate peer identity BEFORE doing any expensive work. If we
     # can't bind a session, we won't mint one. (#H9)
@@ -416,8 +507,12 @@ async def login():
     # same generic 401, not 429 (#H12).
     try:
         await asyncio.to_thread(
-            check_rate_limit, _db, username, peer_id,
-            _rate_limit_max, _rate_limit_window
+            check_rate_limit,
+            _db,
+            username,
+            peer_id,
+            _rate_limit_max,
+            _rate_limit_window,
         )
     except RateLimitError:
         await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
@@ -425,16 +520,36 @@ async def login():
 
     # Look up user. To prevent a timing side-channel that enumerates
     # usernames, we always run Argon2id — against the real hash if the
-    # user exists, or against a fixed dummy hash otherwise.
+    # user exists, or against a fresh dummy hash otherwise. The dummy
+    # hash is computed lazily inside _get_dummy_hash so import time
+    # stays cheap.
     user = await asyncio.to_thread(_db.get_user_by_username, username)
-    stored_hash = user["password_hash"] if user is not None else _DUMMY_PASSWORD_HASH
+    stored_hash = user["password_hash"] if user is not None else _get_dummy_hash()
 
     # Bound concurrent Argon2id verifications (medium). Outside this
     # semaphore, requests queue rather than piling up memory load.
-    async with _argon2_semaphore:
-        password_ok = await asyncio.to_thread(
-            verify_password, stored_hash, password
-        )
+    #
+    # Catch ANY exception from verify_password and treat as failure.
+    # In particular, argon2's InvalidHashError (which our shared.crypto
+    # layer re-raises as CryptoError) would otherwise propagate to the
+    # 500 handler and create a hard username-enumeration oracle: real
+    # user with corrupted Argon2 hash returns 500, unknown user returns
+    # 401. (Round-3 CRITICAL fix)
+    async with _get_argon2_semaphore():
+        try:
+            password_ok = await asyncio.to_thread(
+                verify_password, stored_hash, password
+            )
+        except Exception:
+            # Log internally; from the wire it looks like any other
+            # auth failure. We deliberately do not re-raise.
+            import logging as _logging
+
+            _logging.getLogger("localcloud.auth").warning(
+                "verify_password raised; treating as failure",
+                exc_info=True,
+            )
+            password_ok = False
 
     if user is None or not user["is_active"] or not password_ok:
         await _composite_rate_limit_record(peer_id, username)
@@ -496,17 +611,21 @@ def require_auth(f):
         except SessionExpiredError:
             return jsonify({"error": "Authentication required"}), 401
 
-        # Enforce session_version — tokens issued before an operator
-        # bump are rejected even if still within their lifetime.
+        # Enforce session_version AND is_active in one DB read so an
+        # operator's disable_user takes effect immediately (#H1) even if
+        # the user still holds a non-expired token. Previously
+        # require_auth only checked session_version, so a disabled user
+        # remained usable until their token expired.
         assert _db is not None, "Auth module not initialized"
-        current_sv = await asyncio.to_thread(
-            _db.get_session_version, payload["user_id"]
-        )
-        if current_sv is None:
+        user_status = await asyncio.to_thread(_db.get_user_status, payload["user_id"])
+        if user_status is None:
+            return jsonify({"error": "Authentication required"}), 401
+        current_sv, is_active = user_status
+        if not is_active:
             return jsonify({"error": "Authentication required"}), 401
 
-        # Type-check sv AFTER HMAC verifies (#H13). bool is a subclass of
-        # int in Python — explicitly reject so True/False can't sneak
+        # Type-check sv AFTER HMAC verifies. bool is a subclass of int
+        # in Python — explicitly reject so True/False can't sneak
         # through a comparison.
         token_sv = payload.get("sv")
         if not isinstance(token_sv, int) or isinstance(token_sv, bool):

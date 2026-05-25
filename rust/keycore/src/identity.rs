@@ -9,7 +9,7 @@
 // - prctl(PR_SET_DUMPABLE, 0) prevents core dumps
 // - Keys encrypted at rest with Argon2id-derived master key
 
-use argon2::{self, Argon2, Algorithm, Params, Version};
+use argon2::{self, Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
@@ -46,6 +46,27 @@ const SALT_LEN: usize = 32;
 
 /// Nonce length for XChaCha20-Poly1305
 const NONCE_LEN: usize = 24;
+
+/// Hard cap on the size of an EncryptedKeyStore CBOR blob.
+/// A legitimate store is < 1 KiB. 16 KiB tolerates header growth across
+/// versions while preventing OOM from a maliciously planted file
+/// (Findings #9, #59).
+const MAX_STORE_BYTES: usize = 16 * 1024;
+
+/// Bounds on Argon2 parameters that we will accept from an on-disk
+/// store. The params are stored in plaintext (the user needs them to
+/// recompute the KDF), so an attacker with FS access could swap in
+/// e.g. m_cost = 2^31 KiB (2 TiB) and force the legitimate user's
+/// next unlock attempt to OOM (Finding #10).
+///
+/// Half-to-double of the canonical parameters is the widest band we
+/// will accept; legitimate rotations should always sit inside it.
+const MIN_M_COST_KIB: u32 = ARGON2_M_COST_KIB / 2;
+const MAX_M_COST_KIB: u32 = ARGON2_M_COST_KIB * 2;
+const MIN_T_COST: u32 = 1;
+const MAX_T_COST: u32 = 10;
+const MIN_P_COST: u32 = 1;
+const MAX_P_COST: u32 = 16;
 
 // ──────────────────────────── Types ────────────────────────────
 
@@ -137,10 +158,8 @@ impl IdentityKeyPair {
         // address is stable for the lifetime of the returned struct.
         // mlock will be applied to this heap address — moving the outer
         // struct does not invalidate the lock (K1 fix).
-        let mut x25519_private: Box<Zeroizing<[u8; 32]>> =
-            Box::new(Zeroizing::new([0u8; 32]));
-        let mut ed25519_private: Box<Zeroizing<[u8; 32]>> =
-            Box::new(Zeroizing::new([0u8; 32]));
+        let mut x25519_private: Box<Zeroizing<[u8; 32]>> = Box::new(Zeroizing::new([0u8; 32]));
+        let mut ed25519_private: Box<Zeroizing<[u8; 32]>> = Box::new(Zeroizing::new([0u8; 32]));
 
         // Generate X25519 keypair. `to_bytes()` returns an owned [u8; 32]
         // on the stack — wrap it in Zeroizing so that the temporary is
@@ -265,15 +284,37 @@ impl IdentityKeyPair {
         secure_memory::disable_core_dumps()
             .map_err(|e| format!("Failed to disable core dumps: {}", e))?;
 
+        // Cap the input size BEFORE handing it to the CBOR decoder.
+        // A maliciously planted multi-GiB blob would otherwise be
+        // happily parsed and consume memory until OOM. (Finding #9)
+        if data.len() > MAX_STORE_BYTES {
+            return Err("Encrypted key store exceeds size cap".to_string());
+        }
+
         // Deserialize the store
-        let store: EncryptedKeyStore = ciborium::from_reader(data)
-            .map_err(|_| "Store deserialization failed".to_string())?;
+        let store: EncryptedKeyStore =
+            ciborium::from_reader(data).map_err(|_| "Store deserialization failed".to_string())?;
 
         if store.version != KEY_STORE_VERSION {
             return Err(format!(
                 "Unsupported key store version: {} (expected {})",
                 store.version, KEY_STORE_VERSION
             ));
+        }
+
+        // Refuse Argon2 params outside a sane band so a tampered store
+        // can't trigger an OOM during the legitimate user's next
+        // unlock attempt. (Finding #10, #61)
+        if !(MIN_M_COST_KIB..=MAX_M_COST_KIB).contains(&store.m_cost)
+            || !(MIN_T_COST..=MAX_T_COST).contains(&store.t_cost)
+            || !(MIN_P_COST..=MAX_P_COST).contains(&store.p_cost)
+        {
+            return Err("Argon2 parameters out of accepted range".to_string());
+        }
+
+        // Salt length must match what we produce.
+        if store.salt.len() != SALT_LEN {
+            return Err("Invalid salt length".to_string());
         }
 
         // Derive the master key using stored Argon2id parameters
@@ -310,12 +351,10 @@ impl IdentityKeyPair {
 
         // Allocate heap-stable storage for private keys up front so the
         // mlock address remains valid after the outer struct move (K1).
-        let mut x25519_priv: Box<Zeroizing<[u8; 32]>> =
-            Box::new(Zeroizing::new([0u8; 32]));
+        let mut x25519_priv: Box<Zeroizing<[u8; 32]>> = Box::new(Zeroizing::new([0u8; 32]));
         x25519_priv.copy_from_slice(&bundle.x25519_private);
 
-        let mut ed25519_priv: Box<Zeroizing<[u8; 32]>> =
-            Box::new(Zeroizing::new([0u8; 32]));
+        let mut ed25519_priv: Box<Zeroizing<[u8; 32]>> = Box::new(Zeroizing::new([0u8; 32]));
         ed25519_priv.copy_from_slice(&bundle.ed25519_private);
 
         // Verify that public keys match private keys (constant-time
@@ -329,8 +368,7 @@ impl IdentityKeyPair {
         }
 
         // Ed25519SigningKey::from_bytes takes a &[u8;32] — no extra copy needed.
-        let derived_ed25519_pub = Ed25519SigningKey::from_bytes(&ed25519_priv)
-            .verifying_key();
+        let derived_ed25519_pub = Ed25519SigningKey::from_bytes(&ed25519_priv).verifying_key();
         if !secure_memory::ct_eq_32(&derived_ed25519_pub.to_bytes(), &ed25519_pub) {
             return Err("Ed25519 public key does not match private key".to_string());
         }

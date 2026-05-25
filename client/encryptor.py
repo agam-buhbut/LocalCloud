@@ -13,12 +13,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import hmac
 import math
 import os
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+
+import keycore
 
 from client.keystore import KeyStore
 from shared.crypto import (
@@ -32,11 +36,12 @@ from shared.crypto import (
 from shared.exceptions import (
     CryptoError,
     DecryptionError,
-    MerkleVerificationError,
     SignatureError,
 )
 from shared.models import (
     CHUNK_SIZE,
+    MAX_CHUNKS_PER_FILE,
+    MAX_METADATA_BYTES,
     NONCE_LEN,
     TAG_LEN,
     ChunkAAD,
@@ -57,6 +62,7 @@ class EncryptResult:
     via the ``on_chunk`` callback during ``encrypt_file`` to keep memory
     usage bounded.
     """
+
     header: FileHeader
     chunk_hashes: list[bytes]  # BLAKE2b of each ciphertext chunk
     encrypted_metadata: bytes
@@ -64,10 +70,12 @@ class EncryptResult:
     meta_key: bytes  # For key wrapping (owner keeps this)
 
 
-# Bound on the maximum number of chunks per file — matches server side.
-# Each leaf hash is 32 bytes, so the in-RAM Merkle leaf list is bounded by
-# MAX_CHUNKS * 32 bytes (= ~3.2 MiB for the default limit).
-MAX_CHUNKS: int = 100_000
+# Operational chunk-count ceiling. Imported from shared.models so the
+# encryptor, server, and any future consumer share one source of truth
+# (Round-2 LOW-1 / Round-3 fix). Each leaf hash is 32 bytes, so the
+# in-RAM Merkle leaf list is bounded by MAX_CHUNKS_PER_FILE * 32 bytes
+# (= ~3.2 MiB at 100k chunks).
+MAX_CHUNKS: int = MAX_CHUNKS_PER_FILE
 
 
 class FileEncryptor:
@@ -120,9 +128,7 @@ class FileEncryptor:
         else:
             total_chunks = math.ceil(original_size / self.chunk_size)
         if total_chunks > MAX_CHUNKS:
-            raise CryptoError(
-                f"File exceeds maximum chunk count ({MAX_CHUNKS})"
-            )
+            raise CryptoError(f"File exceeds maximum chunk count ({MAX_CHUNKS})")
 
         # Per-file random keys
         file_key = generate_key()
@@ -153,11 +159,20 @@ class FileEncryptor:
                 on_chunk(i, chunk_blob)
 
         # Build Merkle tree and sign a domain-separated input binding the
-        # root to this file_id and protocol context — prevents cross-context
-        # signature replay with the same identity key.
+        # root to this file_id, chunk geometry, and protocol context —
+        # prevents cross-context signature replay AND server-side header
+        # field tampering. (Round-2 H3)
         root = merkle_root(chunk_hashes)
+        from shared.models import PROTOCOL_VERSION
+
         signature = self.keystore.sign(
-            build_merkle_signing_input(file_id, root)
+            build_merkle_signing_input(
+                file_id,
+                root,
+                chunk_size=self.chunk_size,
+                total_chunks=total_chunks,
+                protocol_version=PROTOCOL_VERSION,
+            )
         )
 
         header = FileHeader(
@@ -216,16 +231,30 @@ class FileEncryptor:
         On *any* verification failure the temp file is removed before the
         exception propagates.
 
-        Verification order (preserved from the buffered implementation):
+        Actual verification order:
 
         1. Parse + validate header
-        2. Verify Ed25519 signature on Merkle root
-        3. Per-chunk AEAD (Poly1305) tag verification *before* writing
-           plaintext to disk
-        4. Compute Merkle root incrementally; compare against the signed
-           value after the last chunk
-        5. On mismatch: delete temp file, raise — never expose unverified
-           plaintext at ``output_path``
+        2. Verify Ed25519 signature over the canonical signing input
+           (file_id || merkle_root || chunk_size || total_chunks ||
+            protocol_version) — fails before any chunk is touched
+        3. AEAD-decrypt the metadata blob (under meta_key) — establishes
+           that meta_key is correct and yields original_size for the
+           last-chunk trim
+        4. For each chunk: AEAD (Poly1305) tag verify *before* writing
+           plaintext to the temp file
+        5. After the last chunk: recompute Merkle root and constant-time
+           compare against the signed value
+        6. On ANY failure: delete temp file, raise — never expose
+           unverified plaintext at ``output_path``
+
+        Note: plaintext is written to a temp file as chunks arrive
+        because each chunk's AAD already binds file_id + chunk_index
+        + total_chunks. A hostile server cannot construct alternate
+        valid AEAD chunks without ``file_key``; the Merkle root then
+        catches rollback attacks. For strict "no plaintext until
+        Merkle root verifies" semantics, the temp file lives in
+        ``output_path.parent`` with mode 0o600 and is os.replace'd
+        only after step 5 passes.
 
         Args:
             input_chunks: iterator yielding (nonce || ciphertext) blobs
@@ -237,9 +266,11 @@ class FileEncryptor:
             output_path: destination for decrypted plaintext
 
         Raises:
-            MerkleVerificationError: Merkle root does not match signed value
             SignatureError: Ed25519 signature invalid
-            DecryptionError: AEAD tag verification fails or chunk too short
+            DecryptionError: AEAD tag verification fails, Merkle root
+                mismatch, chunk count mismatch, or any other integrity
+                failure (all integrity failures normalize to this class
+                so a caller cannot distinguish which gate tripped)
             CryptoError: chunk count mismatch or chunk too large
         """
         # 1. Parse and validate header
@@ -249,22 +280,37 @@ class FileEncryptor:
         # 2. Verify Ed25519 signature on the domain-separated Merkle-root
         #    input *before* touching any chunk ciphertext. A bad signature
         #    means we treat the server's chunks as adversarial input.
-        import keycore
         signing_input = build_merkle_signing_input(
-            header.file_id, header.merkle_root
+            header.file_id,
+            header.merkle_root,
+            chunk_size=header.chunk_size,
+            total_chunks=header.total_chunks,
+            protocol_version=header.version,
         )
-        if not keycore.verify_signature(
-            signer_pubkey, signing_input, header.signature
-        ):
+        try:
+            ok = keycore.verify_signature(
+                signer_pubkey, signing_input, header.signature
+            )
+        except ValueError as e:
+            # Rust side raises PyValueError for malformed-length signatures
+            # or pubkeys. Normalize to SignatureError so callers don't
+            # see a different exception type for "bad bytes" vs "valid
+            # bytes that don't verify".
+            raise SignatureError("Invalid Merkle root signature") from e
+        if not ok:
             raise SignatureError("Invalid Merkle root signature")
 
         # Decrypt metadata up front so original_size is known when we hit
         # the last (possibly padded) chunk — also fails fast on a wrong
         # meta_key.
-        metadata = self.decrypt_metadata(
-            encrypted_metadata, meta_key, header.file_id
-        )
-        original_size: int = metadata.original_size or 0
+        metadata = self.decrypt_metadata(encrypted_metadata, meta_key, header.file_id)
+        original_size: int = metadata.original_size
+        # Reject malformed original_size before we use it to slice the
+        # last chunk. A hostile sender (file owner) could put a negative
+        # value and silently truncate the recipient's output; we'd
+        # rather fail loudly than produce wrong bytes.
+        if original_size < 0 or original_size > header.total_chunks * header.chunk_size:
+            raise DecryptionError("Metadata original_size out of range")
 
         # Bound per-chunk ciphertext length — server-supplied data:
         # length leak protection comes from chunk_size being fixed.
@@ -275,9 +321,7 @@ class FileEncryptor:
         # Create a temp file in the same directory so os.replace is atomic
         # (cross-device renames would not be). Use O_EXCL|O_NOFOLLOW with
         # explicit mode 0o600 — no chmod race window.
-        temp_path = output_dir / (
-            f".lc-dl-{header.file_id.hex()}-{os.getpid()}.tmp"
-        )
+        temp_path = output_dir / (f".lc-dl-{header.file_id.hex()}-{os.getpid()}.tmp")
         try:
             fd = os.open(
                 str(temp_path),
@@ -285,9 +329,7 @@ class FileEncryptor:
                 0o600,
             )
         except FileExistsError as e:
-            raise CryptoError(
-                "Temporary download file already exists"
-            ) from e
+            raise CryptoError("Temporary download file already exists") from e
 
         chunk_hashes: list[bytes] = []
         bytes_written = 0
@@ -296,12 +338,18 @@ class FileEncryptor:
                 idx = 0
                 for chunk_blob in input_chunks:
                     if idx >= header.total_chunks:
-                        raise CryptoError("Chunk count mismatch")
+                        # Normalize all integrity-related failures to
+                        # DecryptionError so the caller sees one error
+                        # class regardless of which gate tripped
+                        # (chunk count, AEAD, Merkle). Distinguishing
+                        # them at the API surface would let the server
+                        # observe which internal check rejected.
+                        raise DecryptionError("Chunk count mismatch")
 
                     # Length bound: reject obviously malformed chunks
                     # before performing AEAD work on them.
                     if len(chunk_blob) > max_chunk_blob:
-                        raise CryptoError("Chunk blob exceeds size bound")
+                        raise DecryptionError("Chunk blob exceeds size bound")
                     if len(chunk_blob) < NONCE_LEN + TAG_LEN:
                         raise DecryptionError("Chunk too short")
 
@@ -323,9 +371,7 @@ class FileEncryptor:
                     except DecryptionError:
                         raise
                     except Exception as e:
-                        raise DecryptionError(
-                            "Chunk decryption failed"
-                        ) from e
+                        raise DecryptionError("Chunk decryption failed") from e
 
                     chunk_hashes.append(blake2b_hash(chunk_blob))
 
@@ -345,13 +391,22 @@ class FileEncryptor:
                     idx += 1
 
                 if idx != header.total_chunks:
-                    raise CryptoError("Chunk count mismatch")
+                    raise DecryptionError("Chunk count mismatch")
 
                 # Verify Merkle root *after* all chunks are in but before
-                # the temp file is promoted to its final name.
+                # the temp file is promoted to its final name. Constant-
+                # time compare so an attacker probing root values can't
+                # iteratively learn correct prefix bytes.
+                #
+                # The error is raised as DecryptionError (not
+                # MerkleVerificationError) so all integrity failures
+                # surface as a single class. A caller writing
+                # `except DecryptionError` would previously have missed
+                # the Merkle case despite MerkleVerificationError being a
+                # CryptoError subclass. (Round-2 M1)
                 computed_root = merkle_root(chunk_hashes)
-                if computed_root != header.merkle_root:
-                    raise MerkleVerificationError("Merkle root mismatch")
+                if not hmac.compare_digest(computed_root, header.merkle_root):
+                    raise DecryptionError("Integrity check failed")
 
                 out.flush()
                 os.fsync(out.fileno())
@@ -362,11 +417,10 @@ class FileEncryptor:
         except BaseException:
             # On any failure mid-write: remove the partial plaintext file
             # before propagating. This includes Merkle/signature/AEAD
-            # failures and OS errors.
-            try:
+            # failures and OS errors. FileNotFoundError is swallowed —
+            # if the file never reached disk, there's nothing to clean.
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(str(temp_path))
-            except FileNotFoundError:
-                pass
             raise
 
     def decrypt_metadata(
@@ -385,11 +439,18 @@ class FileEncryptor:
         Returns:
             deserialized MetadataBlob
         """
-        if len(encrypted_metadata) < 24:
+        # Upper-bound the input size so a hostile server can't ship a
+        # multi-GiB "metadata" payload and force the AEAD to allocate
+        # against it. The legitimate maximum is one padded bucket of
+        # MAX_METADATA_BYTES plus the AEAD nonce/tag overhead.
+        max_payload = MAX_METADATA_BYTES + NONCE_LEN + TAG_LEN
+        if len(encrypted_metadata) > max_payload:
+            raise DecryptionError("Metadata payload too large")
+        if len(encrypted_metadata) < NONCE_LEN + TAG_LEN:
             raise DecryptionError("Metadata too short")
 
-        nonce = encrypted_metadata[:24]
-        ciphertext = encrypted_metadata[24:]
+        nonce = encrypted_metadata[:NONCE_LEN]
+        ciphertext = encrypted_metadata[NONCE_LEN:]
 
         aad = ChunkAAD(
             file_id=file_id,

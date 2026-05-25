@@ -11,13 +11,20 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Generator, Optional
-
 
 # ──────────────────────────── Schema Version ────────────────────────────
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+# Grace window for finalizing-flagged rows that have already passed
+# their normal expiry. A finalize handler that crashed mid-commit
+# leaves finalizing=1; without this, cleanup would skip the row
+# forever (cleanup_expired_staging filters finalizing=0). After this
+# many seconds past expiry, cleanup reclaims it. Long enough that no
+# legitimate finalize would still be running. (Round-2 H4)
+_FINALIZING_GRACE_SECONDS = 3600
 
 SCHEMA_SQL = """
 -- Schema version tracking
@@ -72,6 +79,10 @@ CREATE TABLE IF NOT EXISTS files (
     FOREIGN KEY (owner_id) REFERENCES users(user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_id);
+-- Index `visibility` so the public-file branch of list_user_files
+-- doesn't scan the whole files table. (Round-3 perf #2)
+CREATE INDEX IF NOT EXISTS idx_files_visibility
+    ON files(visibility, created_at DESC);
 
 -- File sharing (who can access shared files)
 CREATE TABLE IF NOT EXISTS file_shares (
@@ -81,6 +92,10 @@ CREATE TABLE IF NOT EXISTS file_shares (
     created_at REAL NOT NULL,
     PRIMARY KEY (file_id, shared_with_id)
 );
+-- Index lookups by recipient so list_user_files's shared-with branch
+-- doesn't scan all shares to find this user's rows. (Round-3 perf #2)
+CREATE INDEX IF NOT EXISTS idx_file_shares_user
+    ON file_shares(shared_with_id);
 
 -- Staging uploads (in-progress uploads before finalization)
 CREATE TABLE IF NOT EXISTS staging_uploads (
@@ -94,6 +109,10 @@ CREATE TABLE IF NOT EXISTS staging_uploads (
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+-- Index staging owner_id for get_total_staging_bytes / count_open_uploads.
+-- Without it those two hot-path queries do a full table scan plus join.
+CREATE INDEX IF NOT EXISTS idx_staging_uploads_owner
+    ON staging_uploads(owner_id, finalizing, expires_at);
 
 -- Individual chunks in staging
 CREATE TABLE IF NOT EXISTS staging_chunks (
@@ -133,6 +152,17 @@ ALTER TABLE users
     ADD COLUMN ed25519_pubkey BLOB NOT NULL DEFAULT x'';
 """
 
+# Migration from schema v4 to v5: add indexes for query plans the
+# audit identified as performance hot paths (Round-3 perf #2).
+MIGRATION_V4_TO_V5 = """
+CREATE INDEX IF NOT EXISTS idx_files_visibility
+    ON files(visibility, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_file_shares_user
+    ON file_shares(shared_with_id);
+CREATE INDEX IF NOT EXISTS idx_staging_uploads_owner
+    ON staging_uploads(owner_id, finalizing, expires_at);
+"""
+
 
 def _is_duplicate_column_error(exc: sqlite3.OperationalError) -> bool:
     """Return True iff SQLite reported 'duplicate column name'.
@@ -156,8 +186,14 @@ class Database:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._conn: Optional[sqlite3.Connection] = None
-        self._lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
+        # Reentrant so a read method (e.g. get_user_usage) can be called
+        # from inside a transaction() block without deadlocking. Earlier
+        # code skipped the lock on non-transaction callers, which caused
+        # torn reads under concurrency on the shared connection. With
+        # RLock we can acquire it unconditionally on every read.
+        # (Round-2 C1)
+        self._lock = threading.RLock()
 
     def connect(self) -> None:
         """Open connection and initialize schema."""
@@ -214,9 +250,7 @@ class Database:
         assert self._conn is not None
         self._conn.executescript(SCHEMA_SQL)
         # Check/set schema version
-        row = self._conn.execute(
-            "SELECT version FROM schema_version"
-        ).fetchone()
+        row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         if row is None:
             self._conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
@@ -249,6 +283,12 @@ class Database:
                     if not _is_duplicate_column_error(exc):
                         raise
                 current = 4
+            if current < 5:
+                # v5 only adds indexes (all `IF NOT EXISTS`), so the
+                # script is fully idempotent without a duplicate-column
+                # catch.
+                self._conn.executescript(MIGRATION_V4_TO_V5)
+                current = 5
             self._conn.execute(
                 "UPDATE schema_version SET version = ?",
                 (SCHEMA_VERSION,),
@@ -296,7 +336,7 @@ class Database:
             )
         return user_id
 
-    def get_user_by_username(self, username: str) -> Optional[dict]:
+    def get_user_by_username(self, username: str) -> dict | None:
         """Look up a user by username. Returns None if not found."""
         with self._lock:
             row = self.conn.execute(
@@ -304,7 +344,7 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_user_by_id(self, user_id: str) -> Optional[dict]:
+    def get_user_by_id(self, user_id: str) -> dict | None:
         """Look up a user by user_id. Returns None if not found."""
         with self._lock:
             row = self.conn.execute(
@@ -313,15 +353,26 @@ class Database:
             return dict(row) if row else None
 
     def disable_user(self, username: str) -> bool:
-        """Disable a user account. Returns True if user existed."""
+        """Disable a user account AND bump session_version atomically.
+
+        Bumping session_version invalidates every outstanding token for
+        the user so a disabled user's existing sessions are revoked the
+        moment the next request hits ``require_auth`` (the version check
+        rejects the now-stale token).
+
+        Returns True if the user existed.
+        """
+        now = time.time()
         with self.transaction() as conn:
             cursor = conn.execute(
-                "UPDATE users SET is_active = 0, updated_at = ? WHERE username = ?",
-                (time.time(), username),
+                "UPDATE users SET is_active = 0, "
+                "session_version = session_version + 1, "
+                "updated_at = ? WHERE username = ?",
+                (now, username),
             )
             return cursor.rowcount > 0
 
-    def get_session_version(self, user_id: str) -> Optional[int]:
+    def get_session_version(self, user_id: str) -> int | None:
         """Return the user's current session_version, or None if missing."""
         with self._lock:
             row = self.conn.execute(
@@ -329,6 +380,22 @@ class Database:
                 (user_id,),
             ).fetchone()
             return row["session_version"] if row else None
+
+    def get_user_status(self, user_id: str) -> tuple[int, bool] | None:
+        """Return ``(session_version, is_active)`` for a user, or None.
+
+        Combines the two reads ``require_auth`` needs into a single
+        query so we don't pay two ``threading.Lock`` acquisitions and
+        two thread bounces per authenticated request.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT session_version, is_active " "FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return int(row["session_version"]), bool(row["is_active"])
 
     def bump_session_version(self, username: str) -> bool:
         """Invalidate all outstanding tokens for a user. Returns True if user existed."""
@@ -360,9 +427,7 @@ class Database:
                 (username, ip_address, time.time()),
             )
 
-    def count_recent_attempts(
-        self, username: str, window_seconds: int
-    ) -> int:
+    def count_recent_attempts(self, username: str, window_seconds: int) -> int:
         """Count login attempts within the rate limit window."""
         cutoff = time.time() - window_seconds
         with self._lock:
@@ -373,9 +438,7 @@ class Database:
             ).fetchone()
             return row["cnt"] if row else 0
 
-    def count_recent_attempts_by_ip(
-        self, ip_address: str, window_seconds: int
-    ) -> int:
+    def count_recent_attempts_by_ip(self, ip_address: str, window_seconds: int) -> int:
         """Count login attempts from an IP within the rate limit window (#6)."""
         cutoff = time.time() - window_seconds
         with self._lock:
@@ -434,7 +497,7 @@ class Database:
             ),
         )
 
-    def get_file(self, file_id: str) -> Optional[dict]:
+    def get_file(self, file_id: str) -> dict | None:
         """Get file metadata by file_id."""
         with self._lock:
             row = self.conn.execute(
@@ -442,7 +505,7 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_owner_ed25519_pubkey(self, file_id: str) -> Optional[bytes]:
+    def get_owner_ed25519_pubkey(self, file_id: str) -> bytes | None:
         """Return the file owner's Ed25519 identity public key (H17).
 
         Returns the raw bytes (possibly empty if the owner has not
@@ -462,24 +525,45 @@ class Database:
             # default — normalise to empty bytes.
             return bytes(pubkey) if pubkey is not None else b""
 
-    def list_user_files(self, user_id: str) -> list[dict]:
-        """List all files owned by or shared with a user."""
+    def list_user_files(
+        self,
+        user_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List files owned by, shared with, or publicly visible to the user.
+
+        Paginated to bound result-set size (#H9). Selects only the
+        columns the caller needs — previously the UNION returned every
+        column including ``encrypted_metadata`` and ``file_header`` BLOBs
+        that the route handler immediately discarded, costing significant
+        I/O on large public corpora.
+        """
+        if limit < 1 or limit > 200 or offset < 0:
+            raise ValueError("limit/offset out of range")
         with self._lock:
             rows = self.conn.execute(
-                """SELECT f.* FROM files f
-                   WHERE f.owner_id = ?
-                   UNION
-                   SELECT f.* FROM files f
-                   JOIN file_shares fs ON f.file_id = fs.file_id
-                   WHERE fs.shared_with_id = ?
-                   UNION
-                   SELECT f.* FROM files f
-                   WHERE f.visibility = 2""",  # Public files
-                (user_id, user_id),
+                """SELECT file_id, owner_id, filename, visibility,
+                          total_chunks, total_bytes, created_at FROM (
+                    SELECT f.file_id, f.owner_id, f.filename, f.visibility,
+                           f.total_chunks, f.total_bytes, f.created_at
+                    FROM files f WHERE f.owner_id = ?
+                    UNION
+                    SELECT f.file_id, f.owner_id, f.filename, f.visibility,
+                           f.total_chunks, f.total_bytes, f.created_at
+                    FROM files f
+                    JOIN file_shares fs ON f.file_id = fs.file_id
+                    WHERE fs.shared_with_id = ?
+                    UNION
+                    SELECT f.file_id, f.owner_id, f.filename, f.visibility,
+                           f.total_chunks, f.total_bytes, f.created_at
+                    FROM files f WHERE f.visibility = 2
+                ) ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                (user_id, user_id, limit, offset),
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def delete_file(self, file_id: str) -> Optional[int]:
+    def delete_file(self, file_id: str) -> int | None:
         """Delete a file. Returns total_bytes for quota adjustment, or None."""
         row = self.conn.execute(
             "SELECT total_bytes FROM files WHERE file_id = ?", (file_id,)
@@ -506,6 +590,34 @@ class Database:
             (file_id, shared_with_id, wrapped_keys, time.time()),
         )
 
+    def remove_file_share(
+        self,
+        file_id: str,
+        shared_with_id: str,
+    ) -> bool:
+        """Remove a file share. Returns True if a row was deleted.
+
+        Server-side revocation only — the recipient may already have
+        downloaded and decrypted the file; this endpoint blocks future
+        access to the wrapped keys from the server. To force key
+        rotation, the owner must re-upload the file under a new
+        file_key. Caller must wrap in a transaction.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM file_shares " "WHERE file_id = ? AND shared_with_id = ?",
+            (file_id, shared_with_id),
+        )
+        return cursor.rowcount > 0
+
+    def count_file_shares(self, file_id: str) -> int:
+        """Return the number of share rows for a file."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS cnt FROM file_shares WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+
     def get_file_shares(self, file_id: str) -> list[dict]:
         """Get all share records for a file."""
         with self._lock:
@@ -524,9 +636,7 @@ class Database:
             ).fetchone()
             return row is not None
 
-    def get_wrapped_keys(
-        self, file_id: str, user_id: str
-    ) -> Optional[bytes]:
+    def get_wrapped_keys(self, file_id: str, user_id: str) -> bytes | None:
         """Get wrapped keys for a specific file and user."""
         with self._lock:
             row = self.conn.execute(
@@ -543,7 +653,7 @@ class Database:
         upload_id: str,
         owner_id: str,
         filename: str,
-        expected_chunks: Optional[int],
+        expected_chunks: int | None,
         expiry_seconds: int,
     ) -> None:
         """Create a staging upload entry."""
@@ -564,7 +674,7 @@ class Database:
                 ),
             )
 
-    def get_staging_upload(self, upload_id: str) -> Optional[dict]:
+    def get_staging_upload(self, upload_id: str) -> dict | None:
         """Get a staging upload by upload_id."""
         with self._lock:
             row = self.conn.execute(
@@ -613,22 +723,32 @@ class Database:
         H19: Skips rows with finalizing = 1 so the periodic cleanup task
         cannot CASCADE-delete chunks out from under an in-flight finalize
         transaction.
+
+        Safety net: ALSO reclaims rows that have been finalizing=1 for
+        more than `_FINALIZING_GRACE_SECONDS`. A finalize handler that
+        crashed mid-commit otherwise leaves the row stuck forever (the
+        non-cleanup path also doesn't count it against quota, so it's a
+        slow row leak rather than disk leak). (Round-2 H4)
         """
         now = time.time()
+        grace_cutoff = now - _FINALIZING_GRACE_SECONDS
         with self._lock:
             rows = self.conn.execute(
                 "SELECT upload_id FROM staging_uploads "
-                "WHERE expires_at < ? AND finalizing = 0",
-                (now,),
+                "WHERE (expires_at < ? AND finalizing = 0) "
+                "   OR (finalizing = 1 AND expires_at < ?)",
+                (now, grace_cutoff),
             ).fetchall()
             upload_ids = [row["upload_id"] for row in rows]
             if upload_ids:
                 # Use the same predicate on DELETE so a row that flipped
-                # to finalizing=1 between SELECT and DELETE is preserved.
+                # to finalizing=1 between SELECT and DELETE in the
+                # non-finalizing branch is preserved.
                 self.conn.execute(
                     "DELETE FROM staging_uploads "
-                    "WHERE expires_at < ? AND finalizing = 0",
-                    (now,),
+                    "WHERE (expires_at < ? AND finalizing = 0) "
+                    "   OR (finalizing = 1 AND expires_at < ?)",
+                    (now, grace_cutoff),
                 )
             return upload_ids
 
@@ -683,14 +803,20 @@ class Database:
     # ──────────────────────────── Quota ────────────────────────────
 
     def get_user_usage(self, user_id: str) -> tuple[int, int]:
-        """Get (used_bytes, quota_bytes) for a user."""
-        row = self.conn.execute(
-            "SELECT used_bytes, quota_bytes FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("User not found")
-        return row["used_bytes"], row["quota_bytes"]
+        """Get (used_bytes, quota_bytes) for a user.
+
+        Acquires self._lock (RLock — safe to call inside a transaction).
+        Earlier code relied on caller-held lock; some call sites
+        (storage._quota_snapshot) forgot, producing torn reads. (#C1)
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT used_bytes, quota_bytes FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("User not found")
+            return row["used_bytes"], row["quota_bytes"]
 
     def increment_usage(self, user_id: str, bytes_added: int) -> None:
         """Atomically increment used_bytes. Must be called within a transaction."""
