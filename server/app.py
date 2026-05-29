@@ -6,7 +6,13 @@ import sys
 
 from quart import Quart, jsonify, request
 
-from server.auth import auth_bp, init_auth, sweep_composite_attempts
+from server.auth import (
+    assert_no_forwarded_header_middleware,
+    assert_single_worker,
+    auth_bp,
+    init_auth,
+    sweep_composite_attempts,
+)
 from server.config import ServerConfig
 from server.database import Database
 from server.storage import (
@@ -57,6 +63,12 @@ def create_app(config: ServerConfig | None = None) -> Quart:
     # deployments from starting with weak/empty session_secret
     config.validate()
 
+    # SEC-M3: fail closed if multiple workers are configured. The
+    # authoritative rate limiter and SQLite model are per-process; more
+    # than one worker silently splits rate-limit state and multiplies the
+    # Argon2 concurrency budget. Checked before building anything.
+    assert_single_worker()
+
     app = Quart(__name__)
     app.config["MAX_CONTENT_LENGTH"] = config.max_content_length
 
@@ -86,6 +98,14 @@ def create_app(config: ServerConfig | None = None) -> Quart:
     # ── Register blueprints ──
     app.register_blueprint(auth_bp)
     app.register_blueprint(storage_bp)
+
+    # SEC-M2: fail closed if any forwarded-header / ProxyFix middleware is
+    # registered. Peer identity must derive from request.remote_addr
+    # UNMODIFIED; a proxy shim that rewrites it from client-controlled
+    # headers would let any client spoof its peer identity and defeat
+    # session peer-binding + the per-(peer,username) rate limiter. Run
+    # after all registration so a middleware added anywhere above is seen.
+    assert_no_forwarded_header_middleware(app)
 
     # ── Security response headers (#17) ──
     @app.after_request
@@ -241,10 +261,13 @@ def main():
 
     try:
         app = create_app(config)
-    except (StorageError, ValueError) as e:
+    except (StorageError, ValueError, RuntimeError) as e:
         # Catches ConfigurationError (StorageError subclass) raised by
-        # init_storage when blob_dir/staging_dir are misconfigured.
-        # (#F12.1 / #23)
+        # init_storage when blob_dir/staging_dir are misconfigured
+        # (#F12.1 / #23), and the RuntimeError raised by the startup
+        # invariant assertions (e.g. assert_single_worker on a multi-
+        # worker misconfiguration) so a bad deployment exits cleanly
+        # fail-closed instead of dumping an uncaught traceback.
         print(f"Startup error: {e}", file=sys.stderr)
         sys.exit(1)
 

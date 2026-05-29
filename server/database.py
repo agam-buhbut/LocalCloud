@@ -418,14 +418,68 @@ class Database:
 
     # ──────────────────────────── Rate Limiting ────────────────────────────
 
-    def record_login_attempt(self, username: str, ip_address: str = "") -> None:
-        """Record a login attempt for rate limiting (#6: includes IP)."""
+    def record_login_attempt(
+        self,
+        username: str,
+        ip_address: str = "",
+        *,
+        max_rows_per_window: int | None = None,
+        window_seconds: int | None = None,
+    ) -> bool:
+        """Record a login attempt for rate limiting (#6: includes IP).
+
+        SEC-M4: when both ``max_rows_per_window`` and ``window_seconds``
+        are provided AND ``ip_address`` is non-empty, the insert is
+        skipped once this peer already has ``max_rows_per_window`` rows
+        within the trailing ``window_seconds``. This bounds login_attempts
+        row growth from a single peer flooding distinct (synthetic)
+        usernames — each distinct username would otherwise author its own
+        row indefinitely. The count + insert run under the same lock so
+        the cap is enforced atomically on the shared connection.
+
+        The cap is a storage-layer defense only: it does NOT change any
+        auth outcome (the in-memory composite limiter is authoritative
+        for lockout) and the count/insert is unconditional with respect
+        to whether the attempt succeeded or failed — callers record only
+        on failure exactly as before.
+
+        Args:
+            username: Canonical username the attempt targeted.
+            ip_address: Peer identity (WireGuard source IP). Empty string
+                disables the cap — there is no peer to attribute rows to.
+            max_rows_per_window: Maximum rows a single peer may hold in
+                the window before further inserts are dropped. ``None``
+                (the default) preserves the legacy unconditional insert.
+            window_seconds: Trailing window for the per-peer row count.
+
+        Returns:
+            True if a row was inserted, False if the per-peer cap was hit.
+        """
         with self._lock:
+            cap_active = (
+                max_rows_per_window is not None
+                and window_seconds is not None
+                and bool(ip_address)
+            )
+            if cap_active:
+                # Narrow: re-asserted for the type checker; cap_active
+                # already guarantees these are not None.
+                assert max_rows_per_window is not None
+                assert window_seconds is not None
+                cutoff = time.time() - window_seconds
+                row = self.conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM login_attempts "
+                    "WHERE ip_address = ? AND attempt_time > ?",
+                    (ip_address, cutoff),
+                ).fetchone()
+                if row is not None and row["cnt"] >= max_rows_per_window:
+                    return False
             self.conn.execute(
                 "INSERT INTO login_attempts (username, ip_address, attempt_time) "
                 "VALUES (?, ?, ?)",
                 (username, ip_address, time.time()),
             )
+            return True
 
     def count_recent_attempts(self, username: str, window_seconds: int) -> int:
         """Count login attempts within the rate limit window."""

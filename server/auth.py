@@ -254,6 +254,22 @@ def verify_session_token(
 # Global IP rate limit (higher than per-user to allow shared IPs)
 _IP_RATE_LIMIT_MULTIPLIER = 5
 
+
+# SEC-M4: hard cap on how many login_attempts rows a single peer may
+# author within the rate-limit window. Beyond this, record_login_attempt
+# drops the insert (the in-memory composite limiter still enforces
+# lockout and the response stays generic — auth outcomes are unchanged).
+#
+# Pinned to the per-IP DB threshold (_rate_limit_max ×
+# _IP_RATE_LIMIT_MULTIPLIER): the legacy per-IP check in check_rate_limit
+# already rejects once a peer reaches that many rows in the window, so a
+# peer can never legitimately need MORE rows than this. Capping inserts
+# at the same value bounds a distinct-username flood without altering the
+# behavior of either rate-limit gate.
+def _login_attempt_row_cap() -> int:
+    return _rate_limit_max * _IP_RATE_LIMIT_MULTIPLIER
+
+
 # In-memory composite-key rate limiter (#H11).
 # Key: (peer_ip, canonical_username) — prevents one peer from locking
 # out other peers via failed logins against their usernames. DB-backed
@@ -425,9 +441,158 @@ def _get_peer_identity() -> str:
 
     In a WireGuard-only deployment, the source IP within the tunnel
     uniquely identifies the peer. This is used for session binding (#5).
+
+    SEC-M2: identity is derived from ``request.remote_addr`` ONLY and is
+    never read from a client-supplied forwarded header (X-Forwarded-For,
+    Forwarded, etc.). Honoring such a header would let a client spoof its
+    peer identity and defeat both session peer-binding and the
+    per-(peer,username) rate limiter. The companion startup assertion
+    ``assert_no_forwarded_header_middleware`` guarantees no middleware
+    rewrites ``remote_addr`` from those headers behind our back.
     """
-    # WireGuard source IP serves as peer identity
+    # WireGuard source IP serves as peer identity. Do NOT consult any
+    # X-Forwarded-* / Forwarded header here (SEC-M2).
     return request.remote_addr or ""
+
+
+# Substrings (case-insensitive) in a middleware's class name or defining
+# module that mark it as a forwarded-header / reverse-proxy shim. Such a
+# shim rewrites request.remote_addr from client-controlled headers, which
+# would let any client spoof its peer identity (SEC-M2).
+_FORWARDED_MIDDLEWARE_MARKERS: tuple[str, ...] = (
+    "proxyfix",
+    "proxy_fix",
+    "forwarded",
+    "xforwarded",
+    "x_forwarded",
+    "realip",
+    "real_ip",
+)
+
+
+def _describe_callable(obj: object) -> str:
+    """Best-effort 'module.qualname' label for a middleware object."""
+    cls = type(obj)
+    module = getattr(cls, "__module__", "") or ""
+    qualname = getattr(cls, "__qualname__", "") or cls.__name__
+    return f"{module}.{qualname}".lower()
+
+
+def assert_no_forwarded_header_middleware(app: object) -> None:
+    """Fail closed if any forwarded-header / ProxyFix middleware is set.
+
+    Walks the ASGI (and, defensively, WSGI) middleware wrapper chain on
+    ``app`` and raises ``RuntimeError`` if any wrapper looks like a
+    reverse-proxy / forwarded-header shim. Such a shim would rewrite
+    ``request.remote_addr`` from client-controlled headers and break the
+    peer-binding + rate-limit model (SEC-M2). Call once at startup.
+
+    The default Quart ``asgi_app`` is a bound method of the app itself;
+    that terminal is recognised and not flagged. Only genuine wrapper
+    objects whose class name or module matches a forwarded-header marker
+    trip the assertion.
+
+    Raises:
+        RuntimeError: if a forwarded-header / proxy middleware is found.
+    """
+    # The Quart/Flask app instance is the chain terminal — stop there so
+    # we don't recurse into its own asgi_app -> app cycle.
+    app_id = id(app)
+    # Common attribute names a middleware uses to hold the next layer.
+    next_attrs = ("app", "asgi_app", "wsgi_app", "next_app", "_app")
+
+    def _walk(start: object) -> None:
+        seen: set[int] = set()
+        stack: list[object] = [start]
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) == app_id or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+
+            # A bound method whose __self__ is the app is the terminal
+            # dispatcher, not a middleware wrapper.
+            bound_self = getattr(obj, "__self__", None)
+            if bound_self is not None and id(bound_self) == app_id:
+                continue
+
+            label = _describe_callable(obj)
+            for marker in _FORWARDED_MIDDLEWARE_MARKERS:
+                if marker in label:
+                    raise RuntimeError(
+                        "Forwarded-header / proxy middleware detected "
+                        f"({label!r}); peer identity must derive from "
+                        "request.remote_addr UNMODIFIED (SEC-M2). Remove "
+                        "the middleware or do not register it."
+                    )
+
+            for attr in next_attrs:
+                nxt = getattr(obj, attr, None)
+                if nxt is not None and nxt is not obj:
+                    stack.append(nxt)
+
+    for entry in ("asgi_app", "wsgi_app"):
+        chain_start = getattr(app, entry, None)
+        if chain_start is not None:
+            _walk(chain_start)
+
+
+# Environment variables a process manager / ASGI server uses to declare
+# the worker count. Checked at startup for the single-worker invariant
+# (SEC-M3). WEB_CONCURRENCY is the de-facto cross-server convention;
+# the others are explicit overrides.
+_WORKER_COUNT_ENV_VARS: tuple[str, ...] = (
+    "WEB_CONCURRENCY",
+    "HYPERCORN_WORKERS",
+    "LOCALCLOUD_WORKERS",
+)
+
+
+def assert_single_worker() -> None:
+    """Fail closed unless the process is configured for a single worker.
+
+    The authoritative rate limiter and the per-process SQLite model are
+    per-process state; under multiple workers each worker keeps its own
+    rate-limit counters and Argon2 concurrency budget, silently
+    multiplying the effective limits and splitting lockout state
+    (SEC-M3). Single-worker is the committed deployment model.
+
+    There is no dedicated worker-count config field; the worker count is
+    owned by the ASGI server / process manager (e.g. Hypercorn
+    ``--workers``). We therefore read the de-facto ``WEB_CONCURRENCY`` and
+    explicit override variables. An unset count is treated as 1 (the
+    server defaults). A value we cannot parse fails closed rather than
+    being ignored.
+
+    Raises:
+        RuntimeError: if any worker-count variable indicates >1, or holds
+            an unparseable / non-positive value.
+    """
+    import os as _os
+
+    for var in _WORKER_COUNT_ENV_VARS:
+        raw = _os.environ.get(var)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            count = int(raw.strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{var}={raw!r} is not a valid worker count; the "
+                "single-worker model (SEC-M3) requires exactly 1 worker."
+            ) from exc
+        if count < 1:
+            raise RuntimeError(
+                f"{var}={raw!r} is not a positive worker count; the "
+                "single-worker model (SEC-M3) requires exactly 1 worker."
+            )
+        if count > 1:
+            raise RuntimeError(
+                f"{var}={count} configures multiple workers, but the "
+                "authoritative rate limiter and SQLite model are "
+                "per-process (SEC-M3). Run exactly 1 worker, or move the "
+                "rate limiter to shared state before scaling out."
+            )
 
 
 def _auth_failure_response():
@@ -553,7 +718,17 @@ async def login():
 
     if user is None or not user["is_active"] or not password_ok:
         await _composite_rate_limit_record(peer_id, username)
-        await asyncio.to_thread(_db.record_login_attempt, username, peer_id)
+        # SEC-M4: bound per-peer login_attempts row growth. The cap is a
+        # storage-layer defense; the composite limiter above remains
+        # authoritative and the response is identical regardless of
+        # whether the row was actually inserted.
+        await asyncio.to_thread(
+            _db.record_login_attempt,
+            username,
+            peer_id,
+            max_rows_per_window=_login_attempt_row_cap(),
+            window_seconds=_rate_limit_window,
+        )
         return _auth_failure_response()
 
     # #6: Successful login — clear previous failed attempts at both layers
