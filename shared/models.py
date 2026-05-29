@@ -75,6 +75,13 @@ MAX_CHUNKS: int = 1 << 20
 # noted in Round-2 LOW-1. (Round-3 fix)
 MAX_CHUNKS_PER_FILE: int = 100_000
 
+# Sentinel chunk_index used in the metadata blob's AAD (the metadata is
+# AEAD-encrypted independently of the data chunks). It is the maximum u32
+# value, deliberately chosen to sit above every legitimate chunk index so
+# it can never alias a real chunk's AAD. See the invariant assertion
+# below the safety bounds.
+METADATA_CHUNK_INDEX: int = 0xFFFFFFFF
+
 # Maximum size for a padded metadata blob (1 MiB). Anything larger is
 # unreasonable for metadata and likely indicates abuse or a bug.
 MAX_PADDED_SIZE: int = 1 << 20
@@ -349,6 +356,28 @@ class FileHeader:
             raise ProtocolError("Invalid signature length")
 
 
+# Wire-format width invariant for ChunkAAD (CRY-M1 / ARCH-L5).
+#
+# ChunkAAD.serialize() packs chunk_index and total_chunks as big-endian
+# u32 (">16sIHI"). The controller chose to KEEP the u32 packing (option
+# (b)): widening to u64 is a breaking wire change deferred to a protocol
+# bump. The packing is sound only while BOTH of the following hold, so we
+# bind them here as a hard module-load assertion rather than leaving the
+# relationship implicit and reviewer-checked:
+#   1. MAX_CHUNKS < 2**32 — every legitimate chunk index/count produced or
+#      accepted by this build fits in the u32 field with no truncation.
+#   2. METADATA_CHUNK_INDEX (0xFFFFFFFF) > MAX_CHUNKS — the metadata
+#      sentinel index sits strictly above every real chunk index, so the
+#      metadata AAD can never alias a data-chunk AAD.
+# If a future edit widens MAX_CHUNKS past the u32 ceiling without also
+# widening the packing, this assertion fails at import time instead of
+# silently producing aliasing AADs.
+assert MAX_CHUNKS < 2**32, "ChunkAAD packs chunk indices as u32"
+assert (
+    METADATA_CHUNK_INDEX > MAX_CHUNKS
+), "metadata sentinel index must not alias a real chunk index"
+
+
 @dataclass
 class ChunkAAD:
     """Associated Authenticated Data for per-chunk AEAD encryption.
@@ -401,7 +430,9 @@ class MetadataBlob:
     shared_with: list[str] = field(default_factory=list)
     created_at: float = 0.0
     modified_at: float = 0.0
-    original_size: int = 0  # Padded — not exact
+    original_size: int = (
+        0  # exact plaintext size; encrypted in the blob, never sent in clear.
+    )
     blob_ids: list[str] = field(default_factory=list)
     version_number: int = 1
 

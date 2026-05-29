@@ -42,6 +42,7 @@ from shared.models import (
     CHUNK_SIZE,
     MAX_CHUNKS_PER_FILE,
     MAX_METADATA_BYTES,
+    METADATA_CHUNK_INDEX,
     NONCE_LEN,
     TAG_LEN,
     ChunkAAD,
@@ -70,12 +71,13 @@ class EncryptResult:
     meta_key: bytes  # For key wrapping (owner keeps this)
 
 
-# Operational chunk-count ceiling. Imported from shared.models so the
-# encryptor, server, and any future consumer share one source of truth
-# (Round-2 LOW-1 / Round-3 fix). Each leaf hash is 32 bytes, so the
-# in-RAM Merkle leaf list is bounded by MAX_CHUNKS_PER_FILE * 32 bytes
-# (= ~3.2 MiB at 100k chunks).
-MAX_CHUNKS: int = MAX_CHUNKS_PER_FILE
+# Operational chunk-count ceiling lives in shared.models as
+# MAX_CHUNKS_PER_FILE so the encryptor, server, and any future consumer
+# share one source of truth (Round-2 LOW-1 / Round-3 fix). Each leaf hash
+# is 32 bytes, so the in-RAM Merkle leaf list is bounded by
+# MAX_CHUNKS_PER_FILE * 32 bytes (= ~3.2 MiB at 100k chunks). The name is
+# used directly — the previous `MAX_CHUNKS` alias was confusingly close to
+# the distinct wire-ceiling constant `MAX_CHUNKS` in shared.models.
 
 
 class FileEncryptor:
@@ -127,12 +129,22 @@ class FileEncryptor:
             total_chunks = 1
         else:
             total_chunks = math.ceil(original_size / self.chunk_size)
-        if total_chunks > MAX_CHUNKS:
-            raise CryptoError(f"File exceeds maximum chunk count ({MAX_CHUNKS})")
+        if total_chunks > MAX_CHUNKS_PER_FILE:
+            raise CryptoError(
+                f"File exceeds maximum chunk count ({MAX_CHUNKS_PER_FILE})"
+            )
 
         # Per-file random keys
         file_key = generate_key()
         meta_key = generate_key()
+        # Domain separation between the metadata blob and the data chunks
+        # rests on (a) DISTINCT AAD — the metadata uses the sentinel
+        # chunk_index=0xFFFFFFFF with total_chunks=0, which no data chunk
+        # ever uses — AND (b) two independently sampled random keys. This
+        # assertion is ONLY a tripwire for a catastrophic CSPRNG failure
+        # handing back identical keys; it is NOT the domain-separation
+        # mechanism and must not be read as such.
+        assert file_key != meta_key
         file_id = os.urandom(16)
 
         chunk_hashes: list[bytes] = []
@@ -198,7 +210,7 @@ class FileEncryptor:
         meta_nonce = generate_nonce()
         meta_aad = ChunkAAD(
             file_id=file_id,
-            chunk_index=0xFFFFFFFF,  # Special index for metadata
+            chunk_index=METADATA_CHUNK_INDEX,  # Special index for metadata
             total_chunks=0,
         ).serialize()
         meta_ct = encrypt_chunk(meta_key, meta_nonce, meta_padded, meta_aad)
@@ -276,6 +288,35 @@ class FileEncryptor:
         # 1. Parse and validate header
         header = FileHeader.deserialize(header_data)
         header.validate()
+
+        # 1b. Pin the on-wire geometry before any further work (CRY-M3 /
+        #     ARCH-M6). Runs *before* signature verification and before any
+        #     chunk byte is read, so a hostile server cannot drive us into
+        #     an oversized allocation or a mismatched-chunk decode loop by
+        #     presenting a structurally-valid-but-wrong header. BOTH
+        #     total_chunks AND chunk_size are pinned here, before the first
+        #     chunk is touched.
+        #
+        #     total_chunks is already bounded by FileHeader.validate()
+        #     against the wire ceiling MAX_CHUNKS (1<<20); here we
+        #     additionally pin it to the operational ceiling this build is
+        #     willing to process.
+        #
+        #     chunk_size is pinned to ``self.chunk_size`` — the operational
+        #     chunk size this instance was configured with. Every production
+        #     caller constructs FileEncryptor() with the default, which is
+        #     the module CHUNK_SIZE (verified: no production code builds a
+        #     non-default FileEncryptor); only tests pass a custom size, and
+        #     they use one instance for both encrypt and decrypt. Gating on
+        #     the instance size therefore rejects a hostile header that
+        #     advertises a different chunk_size (up to MAX_CHUNK_SIZE = 16
+        #     MiB, which FileHeader.validate() alone would accept) right here
+        #     — before it can inflate max_chunk_blob or the original_size
+        #     bound below.
+        if header.total_chunks > MAX_CHUNKS_PER_FILE:
+            raise CryptoError("File exceeds maximum chunk count")
+        if header.chunk_size != self.chunk_size:
+            raise CryptoError("Unexpected chunk_size in header")
 
         # 2. Verify Ed25519 signature on the domain-separated Merkle-root
         #    input *before* touching any chunk ciphertext. A bad signature
@@ -454,7 +495,7 @@ class FileEncryptor:
 
         aad = ChunkAAD(
             file_id=file_id,
-            chunk_index=0xFFFFFFFF,
+            chunk_index=METADATA_CHUNK_INDEX,
             total_chunks=0,
         ).serialize()
 

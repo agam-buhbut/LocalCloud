@@ -123,6 +123,59 @@ def test_chunk_aad_metadata_index_is_outside_max_chunks():
     assert MAX_CHUNKS < 0xFFFFFFFF
 
 
+def test_aad_u32_width_invariant_holds():
+    # The ChunkAAD wire format packs chunk_index / total_chunks as u32
+    # (">16sIHI"). The on-wire invariant that makes the metadata sentinel
+    # unambiguous is: every legitimate chunk index/count fits in u32, and
+    # the sentinel METADATA_CHUNK_INDEX is strictly above MAX_CHUNKS so it
+    # can never alias a real chunk index. (CRY-M1 / ARCH-L5)
+    from shared.models import MAX_CHUNKS, METADATA_CHUNK_INDEX
+
+    assert MAX_CHUNKS < 0xFFFFFFFF
+    assert METADATA_CHUNK_INDEX == 0xFFFFFFFF
+    assert METADATA_CHUNK_INDEX > MAX_CHUNKS
+
+
+def test_chunk_aad_roundtrip_representative_values_no_aliasing():
+    # Round-trip representative (total_chunks, chunk_index) pairs through
+    # the packed AAD and confirm each pair maps to a distinct byte string.
+    # Includes values near MAX_CHUNKS and the metadata sentinel, which is
+    # the boundary region where a too-narrow integer width would alias.
+    from shared.models import MAX_CHUNKS, METADATA_CHUNK_INDEX
+
+    fid = os.urandom(FILE_ID_LEN)
+    cases = [
+        (0, 1),  # first chunk of a 1-chunk file
+        (1, 2),  # second chunk of a 2-chunk file
+        (MAX_CHUNKS - 1, MAX_CHUNKS),  # last chunk at the operational ceiling
+        (METADATA_CHUNK_INDEX, 0),  # metadata sentinel (chunk_index, total)
+    ]
+    serialized: dict[tuple[int, int], bytes] = {}
+    for chunk_index, total_chunks in cases:
+        blob = ChunkAAD(
+            file_id=fid,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+        ).serialize()
+        # Fixed-width packing: 16 (file_id) + 4 (idx) + 2 (ver) + 4 (total).
+        assert len(blob) == 26
+        # Recover the packed integers and confirm they survive the round
+        # trip exactly (no truncation / NUL-padding).
+        recovered = struct.unpack(">16sIHI", blob)
+        assert recovered[0] == fid
+        assert recovered[1] == chunk_index
+        assert recovered[3] == total_chunks
+        serialized[(chunk_index, total_chunks)] = blob
+
+    # No two distinct (chunk_index, total_chunks) pairs collide on the wire.
+    assert len(set(serialized.values())) == len(cases)
+    # The metadata sentinel AAD differs from the real-chunk AADs.
+    meta_blob = serialized[(METADATA_CHUNK_INDEX, 0)]
+    for key, blob in serialized.items():
+        if key != (METADATA_CHUNK_INDEX, 0):
+            assert blob != meta_blob
+
+
 # ──────────────────────────── MetadataBlob ────────────────────────────
 
 
