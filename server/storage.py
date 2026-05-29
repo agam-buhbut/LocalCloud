@@ -18,12 +18,14 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import unicodedata
 import uuid
+from pathlib import Path
 
-from quart import Blueprint, jsonify, request, send_file
+from quart import Blueprint, Response, jsonify, request
 
 from server.auth import _canonicalize_username, require_auth
 from server.database import Database
@@ -35,8 +37,8 @@ from shared.exceptions import (
     QuotaExceededError,
     StorageError,
 )
-from shared.models import MAX_CHUNKS_PER_FILE as _MAX_CHUNKS
 from shared.models import (
+    MAX_CHUNKS_PER_FILE,
     MAX_HEADER_BYTES,
     MAX_METADATA_BYTES,
 )
@@ -62,8 +64,9 @@ _SAFE_HEX_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # and downstream consumers.
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
-# Maximum sane values (server-operational; wire-format limit
-# is MAX_CHUNKS in shared.models). _MAX_CHUNKS is imported above.
+# Maximum sane values (server-operational; wire-format limit is the
+# distinct constant MAX_CHUNKS in shared.models). MAX_CHUNKS_PER_FILE is
+# imported above and used by its real name.
 _MAX_FILENAME_LEN = 255
 _MAX_VISIBILITY = 2
 
@@ -184,15 +187,50 @@ def _validate_id(value: str, label: str = "ID") -> str:
 
 
 def _safe_path(base_dir: str, *components: str) -> str:
-    """Build a path and verify it stays within base_dir.
+    """Build a path under ``base_dir``, rejecting traversal and symlinks.
 
-    Resolves symlinks and relative path tricks, then checks containment.
+    Two distinct defenses (SEC-M1):
+
+    1. Containment: the ``realpath`` of the joined path must stay inside
+       ``base_dir``. This catches ``..`` traversal and symlinks that point
+       *outside* the data tree.
+    2. No-symlink-components: every existing path component *under*
+       ``base_dir`` must be a real file/dir, not a symlink — even one that
+       resolves back inside ``base_dir``. A naive containment check passes
+       such a link, but following it on read (``send_file``) or having it
+       in the final write target is exactly the SEC-M1 gap. ``base_dir``
+       itself is trusted (``init_storage`` ``realpath``-resolves it), so we
+       only vet the components appended here.
+
+    Raises:
+        ValueError: traversal detected, or any appended component is a
+            symlink.
     """
     joined = os.path.join(base_dir, *components)
     canonical = os.path.realpath(joined)
-    # Containment check: canonical path must start with base_dir + separator
+    # Defense 1 — containment. canonical must start with base_dir + sep.
     if not canonical.startswith(base_dir + os.sep) and canonical != base_dir:
         raise ValueError("Path traversal detected")
+
+    # Defense 2 — reject symlink components. Walk each appended component on
+    # the *lexical* path and lstat it (lstat does not dereference, so a
+    # symlink shows up as S_ISLNK rather than its target). Non-existent
+    # components are fine: a chunk path is vetted here before it is created,
+    # so ENOENT on a not-yet-created leaf is expected and allowed. Any other
+    # stat error (EACCES, ELOOP from a symlink loop already in an
+    # intermediate component) is treated as unsafe and rejected.
+    prefix = base_dir
+    for component in components:
+        prefix = os.path.join(prefix, component)
+        try:
+            st = os.lstat(prefix)
+        except FileNotFoundError:
+            # Leaf (or deeper) not created yet — nothing to follow.
+            break
+        except OSError as exc:
+            raise ValueError("Unsafe path component") from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError("Symlinked path component rejected")
     return canonical
 
 
@@ -263,7 +301,7 @@ async def upload_init():
     if not isinstance(raw_expected, int) or isinstance(raw_expected, bool):
         return jsonify({"error": "Invalid request"}), 400
     expected_chunks = raw_expected
-    if expected_chunks < 1 or expected_chunks > _MAX_CHUNKS:
+    if expected_chunks < 1 or expected_chunks > MAX_CHUNKS_PER_FILE:
         return jsonify({"error": "Invalid request"}), 400
 
     # K3: Cap concurrent staging sessions per user to bound parallel
@@ -325,7 +363,7 @@ async def upload_chunk(upload_id: str, chunk_index: int):
         return jsonify({"error": "Invalid content type"}), 415
 
     # Validate chunk_index range (#17)
-    if chunk_index < 0 or chunk_index >= _MAX_CHUNKS:
+    if chunk_index < 0 or chunk_index >= MAX_CHUNKS_PER_FILE:
         return jsonify({"error": "Invalid request"}), 400
 
     # Verify upload exists and belongs to this user
@@ -480,7 +518,7 @@ async def upload_finalize(upload_id: str):
     if not isinstance(raw_total_chunks, int) or isinstance(raw_total_chunks, bool):
         return jsonify({"error": "Invalid request"}), 400
     total_chunks = raw_total_chunks
-    if total_chunks < 1 or total_chunks > _MAX_CHUNKS:
+    if total_chunks < 1 or total_chunks > MAX_CHUNKS_PER_FILE:
         return jsonify({"error": "Invalid request"}), 400
 
     raw_visibility = data.get("visibility", 0)
@@ -763,22 +801,30 @@ async def get_chunk(file_id: str, chunk_index: int):
 
     # Build and validate path (#1)
     chunk_path = _safe_path(_blob_dir, file_id, f"{chunk_index}.bin")
-    # Skip the prior isfile() probe — `send_file` issues its own stat and
-    # we just save one to_thread bounce per chunk download.
 
-    # last_modified=None + conditional=False suppress the Last-Modified
-    # response header and ETag conditional handling that would otherwise
-    # leak per-chunk ingestion timestamps (#H13 metadata leak).
+    # Read the chunk through an O_NOFOLLOW fd (in a worker thread) and
+    # return a plain Response. Two reasons we do NOT use send_file here:
+    #
+    #   1. O_NOFOLLOW closes the TOCTOU window after _safe_path's lstat
+    #      check — if a symlink is swapped in at the final component
+    #      between the check and the open, open() fails atomically
+    #      (ELOOP) instead of following the link, and the helper maps
+    #      both ELOOP and ENOENT to 404. send_file would open and follow.
+    #   2. A plain Response emits NO ETag / Last-Modified header, so the
+    #      per-chunk on-disk ingestion timestamp never leaks to the
+    #      client (#H13 metadata leak). The old send_file call tried to
+    #      suppress those headers via last_modified=None/conditional=
+    #      False/etag=... but `etag` is not even a valid parameter on the
+    #      installed Quart (it is `add_etags`), so that call raised
+    #      TypeError at runtime.
+    #
+    # The chunk (<= ~4 MiB on the wire) is read fully into memory; a
+    # streaming read is a possible Phase 4 optimization.
     try:
-        response = await send_file(
-            chunk_path,
-            mimetype="application/octet-stream",
-            last_modified=None,
-            conditional=False,
-            etag=False,
-        )
+        data = await asyncio.to_thread(_read_blob_chunk_nofollow, Path(chunk_path))
     except FileNotFoundError:
         return jsonify({"error": "Not found"}), 404
+    response = Response(data, mimetype="application/octet-stream")
     response.headers["Cache-Control"] = "no-store, private"
     return response
 
@@ -1167,6 +1213,25 @@ async def get_quota():
 
 
 # ──────────────────────────── Internal Helpers ────────────────────────────
+
+
+def _read_blob_chunk_nofollow(chunk_path: Path) -> bytes:
+    """Read a blob chunk via an O_NOFOLLOW fd so a symlink swapped in
+    after the _safe_path check is rejected atomically at open() rather
+    than followed. Raises FileNotFoundError if the chunk is absent or
+    the final component is a symlink (ELOOP), so callers map both to 404.
+    """
+    try:
+        fd = os.open(chunk_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ELOOP):
+            raise FileNotFoundError(str(chunk_path)) from exc
+        raise
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            return handle.read()
+    except OSError as exc:
+        raise FileNotFoundError(str(chunk_path)) from exc
 
 
 def _write_file_bytes(path: str, data: bytes) -> None:
