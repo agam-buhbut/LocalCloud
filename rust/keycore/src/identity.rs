@@ -183,6 +183,11 @@ impl IdentityKeyPair {
 
         // mlock the heap allocations — addresses remain valid across
         // the upcoming move of the outer IdentityKeyPair struct.
+        //
+        // mlock failure is intentionally non-fatal here (CRY-L3): we warn
+        // but still return the keypair. Production hardening (Phase 5:
+        // systemd RLIMIT_MEMLOCK) must guarantee mlock succeeds so key
+        // material is never swapped to disk. No behavior change here.
         let x25519_locked = secure_memory::mlock_slice(&x25519_private[..]);
         let ed25519_locked = secure_memory::mlock_slice(&ed25519_private[..]);
         let lock_ok = x25519_locked && ed25519_locked;
