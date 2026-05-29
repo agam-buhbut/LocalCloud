@@ -44,3 +44,6 @@ Thumbs.db
 .env.local
 session_secret*
 *.secret
+
+# Claude Code local tooling (session scratchpad + machine-local settings)
+.claude/
