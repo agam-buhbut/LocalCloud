@@ -1,197 +1,566 @@
+================================================================================
+LocalCloud — End-to-End-Encrypted Personal Cloud Storage
+================================================================================
+
+A personal cloud storage system in which the server is treated as a hostile
+storage box: it holds only ciphertext and encrypted metadata, and all
+confidentiality, integrity, forward secrecy, and metadata privacy terminate on
+the client. The intended deployment is a single hardened Linux box reachable
+only through WireGuard.
+
+This README has two parts:
+
+  PART I  — CURRENT IMPLEMENTATION
+            What actually exists in this repository today, how to build/run/
+            test it, the real wire protocol, the real crypto, the HTTP API,
+            and the known gaps.
+
+  PART II — TARGET DESIGN SPEC (ROADMAP)
+            The full system vision, including the OS / network / deployment
+            hardening that lives OUTSIDE this repository. This is the
+            "final product" the implementation is working toward. PART I is
+            the source of truth for what is built; PART II is the source of
+            truth for what is intended.
+
+When PART I and PART II disagree, PART I describes reality.
+
+
+================================================================================
+PART I — CURRENT IMPLEMENTATION
+================================================================================
+
+--------------------------------------------------------------------------------
+1. What is implemented
+--------------------------------------------------------------------------------
+
+This repository implements the APPLICATION layer of the system: a client, a
+server, a shared wire-format/crypto library, and a native Rust key-management
+module. It does NOT provision the operating system, WireGuard, the firewall,
+AppArmor, systemd units, disk encryption, or the backup system — those are
+deployment concerns described in PART II and are not yet automated here.
+
+Implemented and tested (86 Python tests + 22 Rust tests, all passing):
+
+  * Per-file client-side encryption: independent random file_key + meta_key,
+    per-chunk random 192-bit nonces, fixed 4 MiB chunks, AEAD chunk binding,
+    BLAKE2b Merkle tree with an Ed25519-signed root, fully streaming I/O,
+    fail-closed atomic decryption.
+  * Native key management in Rust (keycore): X25519 + Ed25519 identity keys,
+    Argon2id-encrypted key store, mlock + zeroize-on-drop + core-dump
+    suppression, per-recipient key wrapping with ephemeral-static ECDH
+    (sender-side forward secrecy).
+  * Server (Quart/ASGI): chunked upload (init/chunk/finalize) with atomic
+    directory-rename commit, ciphertext-only download, per-user ciphertext
+    quota with transactional accounting, visibility-based access policy
+    (private / shared / public), per-recipient wrapped-key storage, server-
+    side Argon2id login, HMAC session tokens bound to the WireGuard peer,
+    layered rate limiting, and timing-equalized endpoints to suppress
+    username-enumeration oracles.
+  * SQLite metadata store (WAL, schema v5 with migrations).
+  * Operator admin CLI (physical-console-only user/account management).
+  * Client CLI (init / login / upload / download / ls / rm / quota /
+    share / unshare).
+
+--------------------------------------------------------------------------------
+2. Repository layout
+--------------------------------------------------------------------------------
+
+  shared/                 Wire format + crypto primitives (used by both ends)
+    crypto.py             XChaCha20-Poly1305 AEAD, BLAKE2b, domain-separated
+                          Merkle tree (build/prove/verify), server-side Argon2id
+    models.py             Protocol constants, FileHeader / ChunkAAD /
+                          MetadataBlob (canonical CBOR), padding, hardened CBOR
+                          decoder, Merkle signing-input builder
+    exceptions.py         Typed exception hierarchy (generic messages)
+    io.py                 read_capped() — TOCTOU-safe size-capped file read
+
+  rust/keycore/           Native key-management module (PyO3), Python pkg "keycore"
+    src/identity.rs       Keypair lifecycle, Argon2id-encrypted store v2, mlock
+    src/wrapping.rs       Ephemeral-static X25519 -> HKDF -> AEAD key wrapping
+    src/signing.rs        Ed25519 sign / verify
+    src/secure_memory.rs  mlock/munlock, constant-time eq, prctl no-core-dump
+    src/lib.rs            PyO3 bindings (KeyPair class, verify_signature fn)
+
+  server/                 Server application (Quart/ASGI, WireGuard-only)
+    app.py                App factory, security headers, periodic cleanup task
+    auth.py               Argon2id login, HMAC session tokens, rate limiting
+    storage.py            Upload/download/delete/list/share blob engine
+    database.py           SQLite data-access layer (WAL, schema v5)
+    config.py             Env-driven config with secure defaults + validation
+    policy.py             Visibility access control (private/shared/public)
+    quota.py              Ciphertext-only quota accounting
+    admin.py              Operator CLI (create-user, set-quota, ...)
+
+  client/                 Client application
+    cli.py                Click CLI entry point
+    encryptor.py          Streaming per-file encrypt/decrypt engine
+    keystore.py           KeyStore wrapper over keycore (auto-lock on idle)
+    api_client.py         httpx HTTP client (connection-pooled)
+    sharing.py            Thin wrap/unwrap helpers over the keystore
+
+  tests/                  pytest suite (server, client, shared)
+  pyproject.toml          Python project + tool config (source of truth)
+  requirements.txt        Convenience pin list (NOT the source of truth)
+
+--------------------------------------------------------------------------------
+3. Build & install
+--------------------------------------------------------------------------------
+
+Prerequisites: Python >= 3.11 and a Rust toolchain (stable).
+
+  # 1. Create and activate a virtualenv
+  python -m venv .venv
+  source .venv/bin/activate
+
+  # 2. Install the Python project (server + client + shared) with dev tools
+  pip install -e ".[dev]"
+
+  # 3. Build and install the native keycore module into the venv
+  pip install maturin
+  cd rust/keycore && maturin develop --release && cd ../..
+
+The `keycore` module is required by the client (encryptor, keystore, sharing).
+The server does not import keycore. Tests that need keycore skip automatically
+if it is not installed.
+
+--------------------------------------------------------------------------------
+4. Running the server
+--------------------------------------------------------------------------------
+
+The server refuses to start without a session secret of >= 64 characters and,
+by default, refuses to bind to a public or unspecified address (it expects the
+WireGuard interface address).
+
+  # Generate a session secret (prefer a root-owned 0600 file in production)
+  python -c 'import os; print(os.urandom(32).hex())' > /etc/localcloud/session.secret
+  chmod 600 /etc/localcloud/session.secret
+
+  # Point the server at it and run (development server)
+  export LOCALCLOUD_SESSION_SECRET_FILE=/etc/localcloud/session.secret
+  export LOCALCLOUD_BIND_HOST=10.0.0.1
+  localcloud-server
+
+For production, run the ASGI app under Hypercorn instead of the built-in
+dev server, e.g.:
+
+  hypercorn "server.app:create_app()" --bind 10.0.0.1:8443
+
+(create_app() validates config and connects the DB at import-time of the app
+object, so the secret env vars must be set before Hypercorn imports it.)
+
+--------------------------------------------------------------------------------
+5. Operator administration (physical console only)
+--------------------------------------------------------------------------------
+
+There is NO HTTP endpoint that creates or mutates accounts. All user state is
+managed by the operator running the admin CLI directly against the database:
+
+  python -m server.admin create-user alice                 # prompts for password
+  python -m server.admin set-quota   alice 5368709120      # 5 GiB
+  python -m server.admin register-pubkey alice <ed25519-hex>
+  python -m server.admin disable-user alice                # revokes sessions too
+  python -m server.admin bump-session alice                # revoke all live tokens
+  python -m server.admin list-users
+  python -m server.admin run-cleanup                        # one-shot GC
+
+`register-pubkey` records the user's long-term Ed25519 identity key so that
+other clients can fetch it (via the file's owner_pubkey endpoint) to verify
+signatures on that owner's files. The user obtains the hex from `localcloud
+init` output and gives it to the operator out-of-band.
+
+--------------------------------------------------------------------------------
+6. Client usage
+--------------------------------------------------------------------------------
+
+  # One-time: generate an identity keypair (encrypted at rest under a password)
+  localcloud init
+  # -> prints X25519 and Ed25519 public keys; give the Ed25519 key to the
+  #    operator for register-pubkey, and your X25519 key to anyone who will
+  #    share files WITH you.
+
+  # Authenticate (session token saved next to the key file as ".session")
+  localcloud --server http://10.0.0.1:8443 login alice
+
+  # Upload (encrypt + stream). Writes a local owner key cache <file_id>.keys.json
+  localcloud upload ./report.pdf --visibility private
+
+  # List / quota
+  localcloud ls
+  localcloud quota
+
+  # Download + verify + decrypt
+  localcloud download <file_id> ./report.pdf
+
+  # Share with a recipient (needs their X25519 public key, obtained out-of-band)
+  localcloud share <file_id> bob --recipient-pubkey <bob-x25519-hex>
+
+  # Revoke a share (server-side only; see note in section 9)
+  localcloud unshare <file_id> bob
+
+  # Delete
+  localcloud rm <file_id>
+
+Default key file: ~/.localcloud/keys.enc (override with --key-file or
+LOCALCLOUD_KEY_FILE). Default server: http://10.0.0.1:8443 (override with
+--server or LOCALCLOUD_SERVER).
+
+--------------------------------------------------------------------------------
+7. Configuration (server environment variables)
+--------------------------------------------------------------------------------
+
+  LOCALCLOUD_SESSION_SECRET_FILE  Path to a root/owner-owned 0400/0600 file
+                                  holding the HMAC session secret. Preferred
+                                  over the env var (env is visible via /proc).
+  LOCALCLOUD_SESSION_SECRET       HMAC session secret (>= 64 chars). Used only
+                                  if the *_FILE form is unset.
+  LOCALCLOUD_BIND_HOST            Bind address (default 10.0.0.1). Must be a
+                                  private/loopback/link-local address unless
+                                  LOCALCLOUD_ALLOW_PUBLIC_BIND=1.
+  LOCALCLOUD_BIND_PORT            Bind port (default 8443).
+  LOCALCLOUD_DATA_DIR             Base data dir (default /srv/cloud).
+  LOCALCLOUD_BLOB_DIR             Finalized blobs (default <DATA_DIR>/blobs).
+  LOCALCLOUD_STAGING_DIR          In-progress uploads (default <DATA_DIR>/staging).
+                                  MUST be on the same filesystem as BLOB_DIR
+                                  (finalize uses an atomic rename).
+  LOCALCLOUD_DB_PATH              SQLite metadata DB (default <DATA_DIR>/meta.db).
+  LOCALCLOUD_SESSION_LIFETIME     Token lifetime in seconds (60..86400, def 3600).
+  LOCALCLOUD_DEFAULT_QUOTA        Default per-user quota in bytes (def 1 GiB).
+  LOCALCLOUD_RATE_LIMIT_MAX       Max login attempts per window (def 5).
+  LOCALCLOUD_RATE_LIMIT_WINDOW    Rate-limit window in seconds (def 60).
+  LOCALCLOUD_STAGING_EXPIRY       Staging upload TTL in seconds (def 3600).
+  LOCALCLOUD_MAX_CONTENT_LENGTH   Max request body in bytes (def 5 MiB).
+  LOCALCLOUD_ALLOW_PUBLIC_BIND    Set to "1" to permit a public/unspecified bind.
+
+--------------------------------------------------------------------------------
+8. Wire protocol & cryptography (as implemented)
+--------------------------------------------------------------------------------
+
+Primitives:
+  * AEAD:            XChaCha20-Poly1305 (192-bit nonce, 128-bit tag), via
+                     PyNaCl on the Python side and the chacha20poly1305 crate
+                     in Rust.
+  * Hash / Merkle:   BLAKE2b-256.
+  * Identity keys:   X25519 (key agreement) + Ed25519 (signatures), separate.
+  * Password KDF:    Argon2id. Client key store: 512 MiB, t=3, p=1.
+                     Server login: 128 MiB, t=3, p=1.
+  * Key wrap KDF:    HKDF-SHA256.
+  * Randomness:      OS CSPRNG (os.urandom / OsRng); aborts on entropy failure.
+
+Per-file encryption (client/encryptor.py):
+  * file_key, meta_key: independent 256-bit random keys per file. Never derived
+    from filenames, timestamps, counters, or user secrets. Never reused.
+  * file_id: 128-bit random.
+  * Chunking: fixed CHUNK_SIZE = 4 MiB. The final (or only) chunk is zero-padded
+    up to CHUNK_SIZE so every ciphertext block is the same length on the wire.
+    The verified metadata's original_size is used to trim padding on download.
+  * Per-chunk AAD (binds each chunk to its file/position/version), packed as
+    ">16sIHI": file_id(16) || chunk_index(u32) || protocol_version(u16) ||
+    total_chunks(u32). Metadata uses the sentinel chunk_index 0xFFFFFFFF.
+  * On-wire chunk blob = nonce(24) || XChaCha20-Poly1305(file_key, nonce,
+    padded_plaintext, AAD).
+  * Integrity: BLAKE2b of each chunk blob forms the leaves of a Merkle tree
+    (leaf tag 0x00, internal-node tag 0x01, odd nodes re-hashed under the node
+    tag — closes the CVE-2012-2459 second-preimage class). The root is signed
+    with the owner's Ed25519 key over a domain-separated input:
+        "localcloud-merkle-v2" || file_id(16) || merkle_root(32) ||
+        chunk_size(u64) || total_chunks(u64) || protocol_version(u16).
+  * FileHeader (canonical CBOR): magic "LCLD", version, file_id, chunk_size,
+    total_chunks, merkle_root, signature. Strict bounds + type checks on decode.
+  * MetadataBlob (canonical CBOR, encrypted under meta_key, the whole blob
+    padded to a power-of-two bucket from {1 KiB, 4 KiB, 16 KiB, 64 KiB} via a
+    length-prefixed scheme): owner, visibility, shared_with, created_at,
+    modified_at, original_size, blob_ids, version_number. NOTE: original_size
+    is the EXACT plaintext size; it is carried encrypted inside the blob and is
+    never sent to the server in clear. On-wire size leakage to the server is
+    bounded only by the 4 MiB chunk granularity (total chunk count), not by
+    this field.
+  * Decryption order (fail-closed, atomic): parse/validate header -> verify
+    Ed25519 root signature -> decrypt metadata -> per-chunk AEAD verify while
+    streaming to a 0600 temp file -> recompute & constant-time-compare Merkle
+    root -> only then os.replace into place. Any failure deletes the temp file.
+
+Key wrapping for sharing (rust/keycore/src/wrapping.rs):
+  * Ephemeral-static X25519 ECDH: a fresh ephemeral keypair per wrap gives
+    sender-side forward secrecy (compromise of the sender's long-term key does
+    not expose past wrapped bundles).
+  * Wrapping key = HKDF-SHA256(ikm = ECDH, info = "localcloud-file-wrap-v2" ||
+    sender_ed25519_pub(32) || file_id(16)).
+  * AEAD AAD = "localcloud-file-wrap-aad-v3" || sender_pub(32) ||
+    recipient_pub(32) || ephemeral_pub(32) || file_id(16).
+  * Low-order / contributory-to-zero ECDH outputs are rejected (RFC 7748 §6.1).
+  * Bundle (exactly 136 bytes) = ephemeral_pub(32) || nonce(24) ||
+    ciphertext+tag(80). file_key||meta_key (64 bytes) is the plaintext.
+
+Encrypted key store (rust/keycore/src/identity.rs), store version 2:
+  * Argon2id(password, salt) -> master key -> XChaCha20-Poly1305 over a CBOR
+    KeyBundle of the four 32-byte keys. Stored CBOR carries version, salt,
+    Argon2 params, nonce, ciphertext. Argon2 params read from disk are bounds-
+    checked (half..double of canonical) to prevent an OOM via a tampered store.
+  * Private keys live in heap-stable, mlock'd, zeroize-on-drop storage; public/
+    private consistency is checked in constant time on decrypt.
+
+Authentication & sessions (server/auth.py):
+  * Login: username + password over the tunnel. Argon2id verify runs against a
+    real hash if the user exists, else a per-process random dummy hash, so the
+    timing is independent of user existence. Concurrent Argon2id verifies are
+    semaphore-bounded.
+  * Session token: base64url(JSON).hex(HMAC-SHA256(secret, JSON)). Payload:
+    {user_id, username, iat, exp, jti, peer, sv}. "peer" binds the token to the
+    WireGuard source IP (mandatory). "sv" is the user's session_version; an
+    operator bump or disable revokes all outstanding tokens immediately.
+  * Rate limiting: authoritative in-memory composite (peer, username) limiter,
+    plus DB-backed per-username and per-IP counters as defense-in-depth. Every
+    failure path returns a uniform 401 to avoid leaking which gate tripped.
+
+--------------------------------------------------------------------------------
+9. Server HTTP API (as implemented)
+--------------------------------------------------------------------------------
+
+All endpoints except login require "Authorization: Bearer <token>" and a
+WireGuard peer identity. All errors are generic.
+
+  POST   /api/auth/login
+         body {username, password} -> {token}
+
+  POST   /api/files/upload/init
+         body {filename, expected_chunks} -> {upload_id}
+  POST   /api/files/upload/<upload_id>/chunk/<chunk_index>
+         body: raw application/octet-stream ciphertext -> {chunk_hash}
+  POST   /api/files/upload/<upload_id>/finalize
+         body {file_id, total_chunks, file_header(hex), encrypted_metadata(hex),
+               visibility, expected_hashes[]} -> {file_id}
+
+  GET    /api/files                      list accessible files (limit/offset)
+  GET    /api/files/<file_id>            metadata (header + encrypted metadata)
+  GET    /api/files/<file_id>/owner_pubkey   owner's Ed25519 key (hex) for verify
+  GET    /api/files/<file_id>/chunk/<chunk_index>   raw ciphertext chunk
+  DELETE /api/files/<file_id>            delete (owner only; idempotent)
+
+  POST   /api/files/<file_id>/share      body {shared_with, wrapped_keys(hex)}
+  DELETE /api/files/<file_id>/share/<recipient_username>   revoke a share
+  GET    /api/files/<file_id>/wrapped_keys    caller's wrapped keys for the file
+
+  GET    /api/files/quota                {used_bytes, quota_bytes, available_bytes}
+
+Server-side storage layout:
+  <DATA_DIR>/meta.db                       SQLite metadata (WAL)
+  <DATA_DIR>/blobs/<file_id>/<n>.bin       finalized ciphertext chunks
+  <DATA_DIR>/staging/<upload_id>/<n>.bin   in-progress upload chunks
+
+--------------------------------------------------------------------------------
+10. Security properties & threat model (as implemented)
+--------------------------------------------------------------------------------
+
+The application layer is built to assume a malicious storage server with full
+read/write access to ciphertext and metadata blobs, able to replay old state,
+reorder/truncate chunks, and snapshot disks.
+
+Holds against (at the application layer):
+  * Server reading file contents or metadata (everything but the filename and
+    coarse padded sizes is E2E-encrypted).
+  * Chunk reorder / cross-file substitution (per-chunk AAD binding).
+  * Rollback / truncation to old state (signed Merkle root + chunk-count check).
+  * Retroactive decryption of shared bundles after sender long-term-key
+    compromise (ephemeral-static wrapping).
+  * Username enumeration via login or share/unshare (timing-equalized, uniform
+    errors).
+  * Token theft across peers (peer-bound tokens) and stale tokens after
+    disable/rotate (session_version).
+
+Out of scope / weak against: client-side compromise, live coercion while
+online, total hardware loss, and traffic-analysis inference from filenames and
+padded sizes (filenames are intentionally server-visible plaintext).
+
+--------------------------------------------------------------------------------
+11. Known gaps vs. the target spec (PART II)
+--------------------------------------------------------------------------------
+
+These are intentionally listed so the roadmap (PART II) is honest about the
+distance remaining.
+
+Deployment / infrastructure — NOT in this repo (operator must provision):
+  * Minimal Debian, LUKS2 + encrypted LVM, secondary encrypted backup disk.
+  * WireGuard transport (server-key pinning, peer allowlist), nftables default-
+    deny + WireGuard-only port + pre-daemon rate limiting.
+  * systemd service units + scheduled-uptime timers + operator kill-switch.
+  * AppArmor profiles and systemd sandboxing (NoNewPrivileges, read-only root,
+    tmpfs writable paths, device/socket restrictions), separate unprivileged
+    users for tunnel vs. cloud service.
+  * Encrypted-HDD backup flow and minimal security logging policy.
+
+Application-level gaps:
+  * Public visibility: the access policy authorizes any authenticated user to
+    fetch a public file's ciphertext + metadata, but there is no automated
+    per-user on-demand key wrapping. A non-owner can only obtain file/meta keys
+    if a wrapped-keys row was explicitly created for them (i.e. via share).
+  * Owner self-access uses a local plaintext key cache (<file_id>.keys.json,
+    mode 0600) rather than keys wrapped to the owner's own identity key.
+  * Recipient public-key discovery is out-of-band; there is no directory
+    service, and register-pubkey is a manual operator step.
+  * Merkle range-proof downloads are not used: the client downloads all chunks
+    and recomputes the root. merkle_proof()/verify_merkle_proof() exist but are
+    unused by the download path.
+  * MetadataBlob version_number / blob_ids are placeholders (no version history).
+  * No fuzz / property-based tests yet (hypothesis is a declared dev dependency
+    but not yet exercised), despite the spec mandate for parser fuzzing and
+    property tests on nonce uniqueness / key isolation.
+  * Dependency hygiene: the installed environment uses newer versions than the
+    upper bounds pinned in pyproject.toml (e.g. cbor2, argon2-cffi, pytest,
+    pytest-asyncio). requirements.txt duplicates a subset and is not the source
+    of truth.
+
+--------------------------------------------------------------------------------
+12. Development
+--------------------------------------------------------------------------------
+
+  # Python tests
+  pytest
+
+  # Python toolchain (configured in pyproject.toml)
+  black .          # format (line length 88)
+  isort .          # import order (black profile)
+  ruff check .     # lint (correctness-focused ruleset, incl. bandit-style "S")
+  pylint server client shared
+  pyright          # standard mode
+
+  # Rust crate
+  cd rust/keycore
+  cargo test
+  cargo clippy
+  cargo fmt
+
+Notes:
+  * pyproject.toml is the single source of truth for dependencies and tool
+    config. requirements.txt is a convenience list only.
+  * Tests are deterministic and use tmp_path for filesystem state. Tests that
+    require the native keycore module skip if it is not installed.
+
+
+================================================================================
+PART II — TARGET DESIGN SPEC (ROADMAP)
+================================================================================
+
+This is the original system specification — the "final product." Most of the
+APPLICATION-layer crypto and server logic in sections 4–5 below is implemented
+(see PART I). The machine/network/deployment hardening in sections 1–3 and 6–7
+is the primary remaining work and is not yet automated in this repository.
+
 Goal
-Lenovo V14 IIL running barebones Debian 13 + encrypted LVM, hosting a globally reachable personal cloud storage server that is:
-hardened and minimal (low attack surface)
-reachable only through WireGuard
-supports full E2EE storage (server cannot read file contents or metadata except filenames)
-supports public / shared / private file visibility rules
-can be taken offline on a schedule or instantly by operator
-physical-console-only administration
-local encrypted backups to internal HDD
+  A barebones Debian host with encrypted LVM, hosting a globally reachable
+  personal cloud storage server that is:
+    - hardened and minimal (low attack surface)
+    - reachable only through WireGuard
+    - full E2EE storage (server cannot read contents or metadata except filenames)
+    - public / shared / private file visibility rules
+    - takeable offline on a schedule or instantly by the operator
+    - physical-console-only administration
+    - local encrypted backups to an internal HDD
 
-Machine (server laptop)
-Features
-Minimal Debian 13
-No GUI No bluetooth / audio / camera / mic stacks Only essential packages: kernel, networking, storage, WireGuard, service deps
-No sleep or suspend states enabled; system remains fully awake when online and fully offline otherwise
-Encrypted storage
-Primary disk (SSD): LUKS2 + encrypted LVM containing OS and live cloud data
-Secondary disk (HDD): internal 750gb WD Blue HDD, separate LUKS2 partition used only for encrypted backups, never auto-mounted
-Server boot requires local unlock (physical presence)
-Physical-console-only admin No admin SSH No remote root access
-Strict service model
-Separate unprivileged users for tunnel and cloud service
-Cloud service has no plaintext access to user data or metadata
-Backup disk only mountable by operator from console
-Hardening requirements
-Network exposure Only one inbound UDP port open (WireGuard) Everything else closed
-Mandatory Access Control
-AppArmor enforced
-systemd sandboxing
-No new privileges, no device access, no raw sockets
-Filesystem writes restricted to explicit directories
-Root filesystem mounted read-only with writable paths via tmpfs or bind mounts
-Logging
-Minimal security logs only (connections, auth failures, quota events, backup events) No plaintext metadata
+1. Machine (server laptop)
+  Minimal Debian: no GUI, no bluetooth/audio/camera/mic stacks; only essential
+  packages (kernel, networking, storage, WireGuard, service deps). No sleep or
+  suspend; fully awake when online, fully offline otherwise.
+  Encrypted storage:
+    - Primary disk (SSD): LUKS2 + encrypted LVM containing OS and live data.
+    - Secondary disk (HDD): separate LUKS2 partition used only for encrypted
+      backups, never auto-mounted.
+    - Boot requires local unlock (physical presence).
+  Physical-console-only admin: no admin SSH, no remote root.
+  Strict service model: separate unprivileged users for tunnel and cloud
+  service; the cloud service has no plaintext access to user data or metadata;
+  the backup disk is only mountable by the operator from the console.
+  Hardening: only one inbound UDP port open (WireGuard); everything else closed.
+  AppArmor enforced; systemd sandboxing (no-new-privileges, no device access,
+  no raw sockets); filesystem writes restricted to explicit directories;
+  root filesystem mounted read-only with writable paths via tmpfs/bind mounts.
+  Logging: minimal security logs only (connections, auth failures, quota
+  events, backup events); no plaintext metadata.
 
-Firewall + Availability Control Layer
-Features
-Default deny inbound via nftables
-Only allow WireGuard UDP port
-Scheduled uptime
-systemd timers add/remove firewall rule controlling WireGuard availability
-Offline means no listening port and no established sessions
-Operator kill-switch
-Single command that removes firewall rule, kills active sessions, and stops services
-Rate limiting
-nftables rate limiting on WireGuard port prior to daemon
-No tunnel-level rate limiting relied upon
+2. Firewall + availability control layer
+  Default-deny inbound via nftables; allow only the WireGuard UDP port.
+  Scheduled uptime via systemd timers that add/remove the firewall rule
+  controlling WireGuard availability; offline means no listening port and no
+  established sessions. Operator kill-switch: a single command that removes the
+  firewall rule, kills active sessions, and stops services. nftables rate
+  limiting on the WireGuard port prior to the daemon.
 
-Tunnel (WireGuard transport layer)
-Goal Provide secure, authenticated, replay-resistant transport with minimal metadata leakage
-Transport
-WireGuard using Curve25519 and ChaCha20-Poly1305
-Built-in replay protection and forward secrecy
-Server public key pinned client-side
-Client authentication via WireGuard public key allowlist
-Application authentication inside tunnel using username + password
-Design rule
-Tunnel is transport-only
-No file keys, no metadata keys, no persistence of secrets
-Compromise of tunnel does not compromise stored data
+3. Tunnel (WireGuard transport layer)
+  Secure, authenticated, replay-resistant transport with minimal metadata
+  leakage. WireGuard (Curve25519, ChaCha20-Poly1305) with built-in replay
+  protection and forward secrecy; server public key pinned client-side; client
+  authentication via WireGuard public-key allowlist; application auth inside the
+  tunnel via username + password. Tunnel is transport-only: no file keys, no
+  metadata keys, no persistence of secrets. Compromise of the tunnel does not
+  compromise stored data.
 
-Server Application (cloud logic)
-Cloud server runs only behind WireGuard
-4.1 Core responsibilities
-User management
-Accounts: username
-Auth factors: WireGuard key + username + password
-Quota enforcement per user enforced server-side
-File storage
-Store encrypted blobs and encrypted metadata blobs
-Server cannot read contents or metadata except filenames
-Sharing rules
-File visibility modes: private, shared to specific users, public to authenticated users
-Server enforces access policy only
+4. Server application (cloud logic)   [IMPLEMENTED — see PART I §4,8,9]
+  Runs only behind WireGuard.
+  4.1 Core responsibilities: user management (accounts keyed by username; auth
+      factors = WireGuard key + username + password); server-side per-user quota
+      enforcement; storage of encrypted blobs and encrypted metadata blobs (the
+      server cannot read contents or metadata except filenames); sharing rules
+      (private / shared-to-specific-users / public-to-authenticated-users) with
+      the server enforcing access policy only.
+  4.2 Data model: plaintext on the server is limited to file_id, filename,
+      owner, visibility mode, sharing list, timestamps, padded size, blob
+      identifiers, and versioning/integrity data; everything else lives in the
+      E2E-encrypted metadata blob.
 
-4.2 Data model
-Plaintext on server
-file_id
-filename
-Encrypted metadata blob (E2EE)
-owner username
-visibility mode
-sharing list
-timestamps
-file size padded to fixed block sizes
-blob identifiers
-versioning and integrity data
+5. E2EE design with forward secrecy   [IMPLEMENTED — see PART I §8]
+  5.1 Identity keys: each user has a long-term encryption keypair (X25519) and a
+      long-term signing keypair (Ed25519), separate from WireGuard keys, stored
+      encrypted on the client.
+  5.2 File/metadata encryption: per file, generate random file_key and meta_key;
+      encrypt contents and metadata with XChaCha20-Poly1305; pad to fixed-size
+      blocks; never reuse keys.
+  5.3 Forward secrecy: per-file random keys, per-recipient key wrapping, no
+      shared global keys, on-demand wrapping for public access, no server-side
+      caching of wrapped keys; compromise of long-term keys does not allow
+      retroactive decryption without the wrapped keys.
+  5.4 Access control: private = keys encrypted only to owner; shared = keys
+      encrypted individually to each recipient public key; public = server only
+      authorizes the request and the client wraps keys on demand per user.
+      (Implementation note: per-user on-demand wrapping for PUBLIC files, and
+      wrapping owner keys to the owner's own identity instead of a local cache,
+      are the main remaining items here — see PART I §11.)
 
-E2EE Design with Forward Secrecy
-Goal
-Server stores files and metadata but cannot decrypt them
-Sharing must work without leaking metadata
-Past data remains secure after compromise
-5.1 Identity keys
-Each user has long-term encryption key pair and long-term signing key pair
-Separate from WireGuard keys
-Stored encrypted on client
-5.2 File and metadata encryption
-Per file generate random file_key and meta_key
-Encrypt file contents with file_key using XChaCha20-Poly1305
-Encrypt metadata blob with meta_key using XChaCha20-Poly1305
-Pad ciphertext and metadata to fixed-size blocks to reduce size leakage
-Keys are never reused
-5.3 Forward secrecy
-Per-file random keys
-Per-recipient key wrapping
-No shared global keys
-Public access requires on-demand key wrapping per user
-No server-side caching of wrapped keys
-Compromise of long-term keys does not allow retroactive decryption without wrapped keys
-5.4 Access control
-Private: keys encrypted only to owner
-Shared: keys encrypted individually to each recipient public key
-Public: server only authorizes request, client generates wrapped keys on demand
+6. Client application   [IMPLEMENTED — see PART I §6,8]
+  Local key management; local encryption/decryption; upload/download logic;
+  keys encrypted at rest and unlocked only in memory; keys locked on inactivity;
+  plaintext files exist only in memory or tmpfs. Upload = encrypt locally then
+  upload ciphertext in chunks with integrity verification. Download = fetch
+  ciphertext then decrypt locally with integrity verification. Sharing = client
+  handles all key wrapping and signing. Quota display from the server. Secure
+  deletion relies on encryption and key destruction, not physical shredding.
 
-Client Application
-Features
-Local key management
-Local encryption and decryption
-Upload and download logic
-Keys encrypted at rest and unlocked only in memory
-Keys locked on inactivity
-Plaintext files exist only in memory or tmpfs
-Upload
-Encrypt locally then upload ciphertext in chunks with integrity verification
-Download
-Fetch ciphertext then decrypt locally with integrity verification
-Sharing
-Client handles all key wrapping and signing
-Quota display
-Server reports usage only
-Secure deletion
-Rely on encryption and key destruction, not physical shredding
+7. Backup system   [NOT IMPLEMENTED]
+  Internal HDD backup only, LUKS2-encrypted, offline by default, mounted
+  manually by the operator. Stores only encrypted blobs and encrypted metadata;
+  no plaintext ever written. Flow: operator mounts disk, snapshots or rsyncs
+  encrypted data, unmounts disk.
 
-Backup System
-Internal HDD backup only
-Encrypted with LUKS2
-Offline by default
-Mounted manually by operator only
-Stores only encrypted blobs and encrypted metadata
-No plaintext ever written
-Backup flow
-Operator mounts disk
-Snapshots or rsync encrypted data
-Operator unmounts disk
+8. Operator controls
+  Create and disable users; set quotas; revoke WireGuard keys; force the server
+  offline instantly; mount/unmount the backup disk; rotate keys and credentials.
+  (Account/quota/session controls are IMPLEMENTED in the admin CLI — PART I §5.
+  WireGuard key revocation, offline kill-switch, and backup mounting are
+  deployment-layer controls — see PART II §1–3,7.)
 
-Operator Controls
-Create and disable users
-Set quotas
-Revoke WireGuard keys
-Force server offline instantly
-Mount and unmount backup disk
-Rotate keys and credentials
+9. Security check (target)
+  Strong against random scanning, brute force, server compromise reading data,
+  disk theft, metadata inspection, replay, and retroactive decryption. Weak
+  against total hardware loss, client-side compromise, and live coercion while
+  online.
 
-Security check
-Strong against random scanning, brute force, server compromise reading data, disk theft, metadata inspection, replay, and retroactive decryption
-Weak against total hardware loss, client-side compromise, and live coercion while online
-
-Implementation Instructions
-Server
-Minimal Debian with encrypted LVM
-WireGuard only
-systemd services for cloud daemon
-AppArmor profiles
-Filesystem layout
-/srv/cloud/blobs/
-/srv/cloud/meta.enc
-Client
-systemd services for cloud daemon
-AppArmor profiles
-Stores encrypted private keys and pinned server identity
-Implements encrypt upload verify and download verify decrypt
-Design rule
-The server is a hostile storage box and all confidentiality, metadata privacy, and forward secrecy live on the client
-
-Program instructions:
-The client encryption program, upload/download API, Argon2 authentication layer, and per-user quota logic together form a distributed trust boundary where confidentiality and integrity terminate exclusively at the client, and the server enforces policy without access to plaintext or unwrapped symmetric keys. The system must be designed assuming a malicious storage server with full read/write access to stored ciphertext and metadata blobs, the ability to replay old state, reorder chunks, truncate uploads, and snapshot disks. The client must therefore provide cryptographic isolation at file granularity, strong misuse resistance, replay detection, authenticated chunking, strict key lifecycle discipline, and deterministic failure behavior.
-
-The client encryption subsystem must implement per-file cryptographic isolation. For every file, it must generate independent, uniformly random 256-bit file_key and meta_key values using a CSPRNG backed by the OS entropy source. Keys must never be derived from filenames, timestamps, counters, or user secrets. Nonces must be 192-bit random values for XChaCha20-Poly1305 and must never be reused with the same key. Each encrypted chunk must use a unique nonce, and the tuple (file_key, nonce) must be globally unique within the lifetime of the file. The encryption process must treat file contents as a stream, chunked at a fixed size boundary such as 4 MiB, padded to a multiple of that size to reduce length leakage. Each chunk must be encrypted independently with AEAD, with associated data binding file_id, chunk_index, protocol_version, and optionally total_chunks to prevent cross-file substitution and chunk reordering. The metadata blob must be serialized deterministically (e.g., canonical CBOR or length-delimited binary struct), padded to a fixed size class (e.g., 1 KiB, 4 KiB, or power-of-two bucket), and encrypted separately under meta_key. No plaintext metadata except filename may ever be transmitted or persisted server-side.
-
-The file format must be rigidly versioned and self-describing. A header should contain a magic constant, protocol version, file_id (128-bit random), chunk_size, total_chunks, and possibly a Merkle root hash. The header itself must be authenticated either by signing or by embedding it in associated data of the first chunk. If Merkle trees are used, each chunk hash must be computed over ciphertext and organized into a binary tree whose root is signed using the client’s Ed25519 signing key to prevent server rollback attacks. The client must verify all AEAD tags and Merkle proofs before releasing any plaintext to callers. Partial decryption is forbidden; decryption must fail atomically.
-
-Identity management must use separate long-term keypairs for encryption (X25519) and signing (Ed25519). These keys must be generated client-side and stored only in encrypted form. Key storage must use Argon2id with high memory cost parameters (e.g., >=512 MiB memory, t >=3, p=1 unless parallelism justified) to derive a master encryption key from a user password and a per-user random salt. The encrypted key bundle format must include versioning, salt, Argon2 parameters, and an AEAD-protected payload containing serialized private keys. The password verification process must be constant-time and must not reveal whether decryption failed due to wrong password or corrupted ciphertext. The client must lock private key memory using mlock or equivalent, disable core dumps, zeroize buffers after use, and avoid unintended copies by using explicit zeroizing types. Key material must never be logged, formatted, or included in panic traces.
-
-Sharing requires per-recipient key wrapping. For each recipient public key, the client must compute an X25519 shared secret, derive a wrapping key using HKDF or BLAKE2-based KDF with domain separation including file_id and context label, and encrypt file_key and meta_key under this wrapping key with AEAD. Wrapped keys must be stored alongside encrypted metadata but never in plaintext. There must be no group symmetric keys and no reuse of wrapping keys across files. Public visibility must not imply universal decryption keys; instead, on-demand wrapping per authenticated user must occur client-side. The server must not persist long-lived wrapped keys for unauthenticated public access unless policy explicitly allows and leakage implications are accepted.
-The upload API must accept only authenticated requests over WireGuard transport and bind to the tunnel interface exclusively. Application-layer authentication must require username plus password verified via Argon2id hashes stored server-side. Server-side password storage must use Argon2id with high memory cost (lower than client but still GPU-resistant, e.g., >=128 MiB). Stored password records must include per-user random salts and full parameter sets. Password comparison must use constant-time equality checks. Login endpoints must implement rate limiting independent of WireGuard to prevent brute force attempts from authenticated peers. Upon successful authentication, the server must issue a short-lived session token signed with a server-side secret key and bound to user_id, peer public key, and expiration time. Session tokens must be opaque and verified on every request.
-
-The upload protocol must be chunk-aware and integrity-enforcing. The client must upload encrypted chunks with explicit file_id and chunk_index. The server must write chunks to a staging area and compute BLAKE2b hashes of received ciphertext. After full upload, the client must send a finalize request including total_chunks and expected file hash. The server must verify chunk count and optionally recompute aggregate hash before committing metadata. Incomplete uploads must expire and be garbage-collected. The server must never accept plaintext; content-type enforcement should reject unexpected formats.
-
-The download API must return ciphertext only. The server must not transform or re-encrypt data. The client must verify file_id consistency, total_chunks, AEAD tags, and optional Merkle proofs before decrypting. If any chunk fails authentication, the entire download must abort. The server may support range requests, but the client must treat each chunk as independently authenticated and must not release partial plaintext without verifying integrity of the relevant authenticated unit.
-
-Per-user quota logic must operate exclusively on ciphertext size, not plaintext size. The server must track total allocated bytes per user as sum of stored ciphertext chunks and encrypted metadata blobs. Quota checks must occur before finalization of uploads. Quota accounting must be atomic; concurrent uploads must not allow race conditions that exceed limits. This requires transactional updates or database-level compare-and-swap semantics. Deletion must immediately decrement usage accounting. Garbage collection of abandoned uploads must also reconcile quota state. The server must never infer plaintext size beyond padded ciphertext length and must not store unpadded length.
-
-All APIs must fail closed. Any decryption error, authentication failure, malformed request, or state mismatch must terminate the operation without partial success. Error messages must be generic and not leak whether a username exists, whether a password was correct, or whether a file_id is valid. Logging must exclude filenames, plaintext sizes, wrapped keys, or metadata contents. Only high-level events such as authentication success/failure, quota exceedance, upload completion, and download attempts may be logged.
-
-The entire system must enforce strict versioning and protocol negotiation. Each serialized structure must include explicit version fields to allow migration. All parsers must be fuzz-tested against malformed input. All cryptographic operations must be covered by property-based tests verifying nonce uniqueness, key isolation, and failure on corruption. Any unsafe code must be minimized and audited. Randomness acquisition must abort if the OS entropy source fails. The client must not implement custom cryptographic primitives; it must rely on well-audited libraries and treat misuse resistance as a primary design constraint.
-In summary, the client enforces confidentiality, forward secrecy at file granularity, and integrity against replay and reordering; the upload/download API enforces authenticated, atomic, integrity-checked ciphertext transport; Argon2 authentication enforces memory-hard password verification with constant-time behavior; and quota logic enforces storage limits strictly over ciphertext accounting without metadata leakage. Every boundary must assume adversarial conditions, deterministic failure, and zero tolerance for cryptographic misuse.
+10. Design rule
+  The server is a hostile storage box. All confidentiality, metadata privacy,
+  and forward secrecy live on the client. The client provides cryptographic
+  isolation at file granularity, strong misuse resistance, replay detection,
+  authenticated chunking, strict key-lifecycle discipline, and deterministic
+  failure behavior. The client must not implement custom cryptographic
+  primitives; it relies on well-audited libraries and treats misuse resistance
+  as a primary design constraint. Randomness acquisition aborts if the OS
+  entropy source fails. All serialized structures are explicitly versioned;
+  all parsers must be fuzz-tested; all cryptographic operations must be covered
+  by property-based tests verifying nonce uniqueness, key isolation, and failure
+  on corruption.
