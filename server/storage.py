@@ -31,6 +31,7 @@ from server.auth import _canonicalize_username, require_auth
 from server.database import Database
 from server.policy import check_file_access, check_file_ownership
 from server.quota import check_quota, commit_usage, release_usage
+from server.state import app_state, current_identity
 from shared.crypto import blake2b_hash
 from shared.exceptions import (
     AuthError,
@@ -122,15 +123,24 @@ MAX_WRAPPED_KEYS_BYTES = 4096
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
 
+# Maximum accepted size of a single uploaded chunk (ciphertext + AEAD
+# overhead). Surfaced as a module-level constant so create_app can seed
+# AppState.max_chunk_size from it; the value is not runtime-configurable.
+DEFAULT_MAX_CHUNK_SIZE = 5 * 1024 * 1024  # 5 MiB
+
 # ──────────────────────────── Blueprint ────────────────────────────
 
 storage_bp = Blueprint("storage", __name__, url_prefix="/api/files")
 
+# Module globals retained ONLY for the non-request-context paths: the
+# periodic cleanup task (cleanup_expired_uploads / cleanup_orphan_staging_dirs)
+# and _cleanup_staging run outside any Quart request, so they cannot read
+# app_state(). init_storage populates these. Request handlers do NOT read
+# them — they use the fully-typed app_state() instead (ARCH-H2).
 _db: Database | None = None
 _blob_dir: str = ""
 _staging_dir: str = ""
 _staging_expiry: int = 3600
-_max_chunk_size: int = 5 * 1024 * 1024  # 5 MiB (chunk + overhead)
 
 
 def init_storage(
@@ -280,7 +290,8 @@ async def upload_init():
     Request: {"filename": str, "expected_chunks": int}
     Response: {"upload_id": str}
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     data = await request.get_json(silent=True)
     if not data or "filename" not in data or "expected_chunks" not in data:
@@ -306,15 +317,13 @@ async def upload_init():
 
     # K3: Cap concurrent staging sessions per user to bound parallel
     # disk-fill attacks. Counted against non-expired, non-finalizing rows.
-    open_count = await asyncio.to_thread(
-        _db.count_open_uploads, request.user_id  # type: ignore
-    )
+    open_count = await asyncio.to_thread(state.db.count_open_uploads, identity.user_id)
     if open_count >= MAX_OPEN_UPLOADS_PER_USER:
         return jsonify({"error": "Too many open uploads"}), 429
 
     # Generate upload ID (server-generated, always safe)
     upload_id = str(uuid.uuid4())
-    staging_path = _safe_path(_staging_dir, upload_id)
+    staging_path = _safe_path(state.staging_dir, upload_id)
     await asyncio.to_thread(os.makedirs, staging_path, mode=0o700, exist_ok=True)
 
     # Record in database — if this fails, clean up the staging directory
@@ -322,12 +331,12 @@ async def upload_init():
     # directory with no DB row would otherwise persist indefinitely.
     try:
         await asyncio.to_thread(
-            _db.create_staging_upload,
+            state.db.create_staging_upload,
             upload_id=upload_id,
-            owner_id=request.user_id,  # type: ignore
+            owner_id=identity.user_id,
             filename=filename,
             expected_chunks=expected_chunks,
-            expiry_seconds=_staging_expiry,
+            expiry_seconds=state.staging_expiry,
         )
     except Exception:
         try:
@@ -349,7 +358,8 @@ async def upload_chunk(upload_id: str, chunk_index: int):
     Request body: raw ciphertext bytes (Content-Type: application/octet-stream)
     Response: {"chunk_hash": str}
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     # Validate IDs
     try:
@@ -367,8 +377,8 @@ async def upload_chunk(upload_id: str, chunk_index: int):
         return jsonify({"error": "Invalid request"}), 400
 
     # Verify upload exists and belongs to this user
-    upload = await asyncio.to_thread(_db.get_staging_upload, upload_id)
-    if upload is None or upload["owner_id"] != request.user_id:  # type: ignore
+    upload = await asyncio.to_thread(state.db.get_staging_upload, upload_id)
+    if upload is None or upload["owner_id"] != identity.user_id:
         return jsonify({"error": "Invalid request"}), 400
 
     # Refuse new chunks once finalize has claimed this upload (#H19).
@@ -395,7 +405,7 @@ async def upload_chunk(upload_id: str, chunk_index: int):
     if not chunk_data:
         return jsonify({"error": "Empty chunk"}), 400
 
-    if len(chunk_data) > _max_chunk_size:
+    if len(chunk_data) > state.max_chunk_size:
         return jsonify({"error": "Chunk too large"}), 413
 
     # Medium: minimum chunk size for all but the last chunk. The last
@@ -416,7 +426,7 @@ async def upload_chunk(upload_id: str, chunk_index: int):
     # so we tighten it here. (Round-2 H2/H3)
     new_chunk_size = len(chunk_data)
     chunk_hash = blake2b_hash(chunk_data).hex()
-    chunk_path = _safe_path(_staging_dir, upload_id, f"{chunk_index}.bin")
+    chunk_path = _safe_path(state.staging_dir, upload_id, f"{chunk_index}.bin")
 
     # Phase 1: write to disk OUTSIDE the DB lock so concurrent uploads
     # don't serialize on disk I/O. _write_file_bytes is itself atomic
@@ -436,18 +446,14 @@ async def upload_chunk(upload_id: str, chunk_index: int):
     # Phase 2: transactional check-and-insert. If quota is blown,
     # remove the just-written chunk from disk.
     def _check_and_insert() -> tuple[bool, str]:
-        with _db.transaction():  # type: ignore[union-attr]
-            used, quota = _db.get_user_usage(  # type: ignore[union-attr]
-                request.user_id  # type: ignore[attr-defined]
-            )
-            staging = _db.get_total_staging_bytes(  # type: ignore[union-attr]
-                request.user_id  # type: ignore[attr-defined]
-            )
+        with state.db.transaction():
+            used, quota = state.db.get_user_usage(identity.user_id)
+            staging = state.db.get_total_staging_bytes(identity.user_id)
             if used + staging + new_chunk_size > quota:
                 return False, "Quota exceeded"
             if staging + new_chunk_size > MAX_STAGING_BYTES_PER_USER:
                 return False, "Staging quota exceeded"
-            _db.add_staging_chunk(  # type: ignore[union-attr]
+            state.db.add_staging_chunk(
                 upload_id=upload_id,
                 chunk_index=chunk_index,
                 chunk_hash=chunk_hash,
@@ -480,7 +486,8 @@ async def upload_finalize(upload_id: str):
     }
     Response: {"file_id": str} on success
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     # Validate upload_id
     try:
@@ -493,8 +500,8 @@ async def upload_finalize(upload_id: str):
         return jsonify({"error": "Invalid request"}), 400
 
     # Verify upload exists and belongs to this user
-    upload = await asyncio.to_thread(_db.get_staging_upload, upload_id)
-    if upload is None or upload["owner_id"] != request.user_id:  # type: ignore
+    upload = await asyncio.to_thread(state.db.get_staging_upload, upload_id)
+    if upload is None or upload["owner_id"] != identity.user_id:
         return jsonify({"error": "Invalid request"}), 400
 
     # #5: Enforce upload expiry at request time
@@ -560,8 +567,8 @@ async def upload_finalize(upload_id: str):
     # deletes by upload_id regardless of the flag so a failed finalize
     # still releases the row.
     def _claim_finalizing() -> bool:
-        with _db.transaction() as _conn:  # type: ignore[union-attr]
-            return _db.mark_upload_finalizing(upload_id)  # type: ignore[union-attr]
+        with state.db.transaction():
+            return state.db.mark_upload_finalizing(upload_id)
 
     try:
         claimed = await asyncio.to_thread(_claim_finalizing)
@@ -574,7 +581,7 @@ async def upload_finalize(upload_id: str):
         return jsonify({"error": "Upload expired"}), 410
 
     # Verify chunk count matches
-    staged_chunks = await asyncio.to_thread(_db.get_staging_chunks, upload_id)
+    staged_chunks = await asyncio.to_thread(state.db.get_staging_chunks, upload_id)
     if len(staged_chunks) != total_chunks:
         await asyncio.to_thread(_cleanup_staging, upload_id)
         return jsonify({"error": "Invalid request"}), 400
@@ -615,8 +622,8 @@ async def upload_finalize(upload_id: str):
     # directory is a single atomic FS operation — replacing the per-
     # chunk move loop, which left partial state on crash or partial-
     # write failure.
-    blob_path = _safe_path(_blob_dir, file_id)
-    src_dir = _safe_path(_staging_dir, upload_id)
+    blob_path = _safe_path(state.blob_dir, file_id)
+    src_dir = _safe_path(state.staging_dir, upload_id)
 
     total_bytes = sum(c["chunk_size"] for c in staged_chunks)
     total_bytes += len(encrypted_metadata) + len(file_header)
@@ -644,11 +651,11 @@ async def upload_finalize(upload_id: str):
         # a finalizing=1 row wedged for 1 hour if anything went wrong
         # between commit and that call. (Round-3 H2)
         try:
-            with _db.transaction() as _conn:  # type: ignore[union-attr]
-                check_quota(_db, request.user_id, total_bytes)  # type: ignore
-                _db.create_file(  # type: ignore[union-attr]
+            with state.db.transaction() as _conn:
+                check_quota(state.db, identity.user_id, total_bytes)
+                state.db.create_file(
                     file_id=file_id,
-                    owner_id=request.user_id,  # type: ignore
+                    owner_id=identity.user_id,
                     filename=upload["filename"],
                     visibility=visibility,
                     total_chunks=total_chunks,
@@ -656,7 +663,7 @@ async def upload_finalize(upload_id: str):
                     encrypted_metadata=encrypted_metadata,
                     file_header=file_header,
                 )
-                commit_usage(_db, request.user_id, total_bytes)  # type: ignore
+                commit_usage(state.db, identity.user_id, total_bytes)
                 _conn.execute(
                     "DELETE FROM staging_uploads WHERE upload_id = ?",
                     (upload_id,),
@@ -705,7 +712,8 @@ async def get_file_metadata(file_id: str):
     Ed25519 public key — which is what the client actually needs for
     signature verification — is served separately at /owner_pubkey.
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     try:
         file_id = _validate_id(file_id, "file_id")
@@ -714,12 +722,12 @@ async def get_file_metadata(file_id: str):
 
     try:
         file_record = await asyncio.to_thread(
-            check_file_access, _db, file_id, request.user_id  # type: ignore
+            check_file_access, state.db, file_id, identity.user_id
         )
     except AuthError:
         return jsonify({"error": "Not found"}), 404
 
-    is_owner = file_record["owner_id"] == request.user_id  # type: ignore[attr-defined]
+    is_owner = file_record["owner_id"] == identity.user_id
     body: dict = {
         "file_id": file_record["file_id"],
         "filename": file_record["filename"],
@@ -755,7 +763,8 @@ async def get_owner_pubkey(file_id: str):
     yet registered a key. 404 for unknown / inaccessible files (same as
     metadata endpoint, no enumeration distinction).
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     try:
         file_id = _validate_id(file_id, "file_id")
@@ -765,13 +774,11 @@ async def get_owner_pubkey(file_id: str):
     # Authorization: caller must have access to the file before we
     # disclose the owner's pubkey (which is publishing-by-implication).
     try:
-        await asyncio.to_thread(
-            check_file_access, _db, file_id, request.user_id  # type: ignore
-        )
+        await asyncio.to_thread(check_file_access, state.db, file_id, identity.user_id)
     except AuthError:
         return jsonify({"error": "Not found"}), 404
 
-    pubkey = await asyncio.to_thread(_db.get_owner_ed25519_pubkey, file_id)
+    pubkey = await asyncio.to_thread(state.db.get_owner_ed25519_pubkey, file_id)
     if pubkey is None:
         return jsonify({"error": "Not found"}), 404
     return jsonify({"pubkey": pubkey.hex()}), 200
@@ -781,7 +788,8 @@ async def get_owner_pubkey(file_id: str):
 @require_auth
 async def get_chunk(file_id: str, chunk_index: int):
     """Download a single encrypted chunk (ciphertext only)."""
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     # Validate file_id format (#1)
     try:
@@ -791,7 +799,7 @@ async def get_chunk(file_id: str, chunk_index: int):
 
     try:
         file_record = await asyncio.to_thread(
-            check_file_access, _db, file_id, request.user_id  # type: ignore
+            check_file_access, state.db, file_id, identity.user_id
         )
     except AuthError:
         return jsonify({"error": "Not found"}), 404
@@ -800,7 +808,7 @@ async def get_chunk(file_id: str, chunk_index: int):
         return jsonify({"error": "Not found"}), 404
 
     # Build and validate path (#1)
-    chunk_path = _safe_path(_blob_dir, file_id, f"{chunk_index}.bin")
+    chunk_path = _safe_path(state.blob_dir, file_id, f"{chunk_index}.bin")
 
     # Read the chunk through an O_NOFOLLOW fd (in a worker thread) and
     # return a plain Response. Two reasons we do NOT use send_file here:
@@ -841,7 +849,8 @@ async def delete_file(file_id: str):
     transaction first, then clean up filesystem. If FS cleanup fails,
     orphaned blobs are harmless (no metadata pointing to them).
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     # Validate file_id format (#1)
     try:
@@ -851,7 +860,7 @@ async def delete_file(file_id: str):
 
     try:
         await asyncio.to_thread(
-            check_file_ownership, _db, file_id, request.user_id  # type: ignore
+            check_file_ownership, state.db, file_id, identity.user_id
         )
     except AuthError:
         return jsonify({"error": "Not found"}), 404
@@ -863,10 +872,10 @@ async def delete_file(file_id: str):
     # — doing so would let a user inflate their effective quota by
     # double-deleting the same file.
     def _db_delete() -> int | None:
-        with _db.transaction() as _conn:  # type: ignore[union-attr]
-            deleted_bytes = _db.delete_file(file_id)  # type: ignore[union-attr]
+        with state.db.transaction():
+            deleted_bytes = state.db.delete_file(file_id)
             if deleted_bytes is not None:
-                release_usage(_db, request.user_id, deleted_bytes)  # type: ignore
+                release_usage(state.db, identity.user_id, deleted_bytes)
             return deleted_bytes
 
     deleted_bytes = await asyncio.to_thread(_db_delete)
@@ -874,7 +883,7 @@ async def delete_file(file_id: str):
     # Phase 2: Filesystem cleanup (best-effort after DB commit). Even on
     # idempotent re-delete (deleted_bytes is None) we attempt blob
     # cleanup in case the first delete left orphans.
-    blob_path = _safe_path(_blob_dir, file_id)
+    blob_path = _safe_path(state.blob_dir, file_id)
     try:
         if await asyncio.to_thread(os.path.isdir, blob_path):
             await asyncio.to_thread(shutil.rmtree, blob_path)
@@ -903,7 +912,8 @@ async def list_files():
     own — leaking padded-ciphertext sizes across users would be a
     metadata-leak (#H9).
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     # Parse pagination params with strict bounds.
     try:
@@ -917,12 +927,12 @@ async def list_files():
         return jsonify({"error": "Invalid request"}), 400
 
     files = await asyncio.to_thread(
-        _db.list_user_files,
-        request.user_id,  # type: ignore
+        state.db.list_user_files,
+        identity.user_id,
         limit,
         offset,
     )
-    caller_id = request.user_id  # type: ignore[attr-defined]
+    caller_id = identity.user_id
     result = []
     for f in files:
         is_owner = f["owner_id"] == caller_id
@@ -963,7 +973,8 @@ async def share_file(file_id: str):
     (#H1) that previously returned 400 for unknown targets and 200 for
     known ones.
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     try:
         file_id = _validate_id(file_id, "file_id")
@@ -972,7 +983,7 @@ async def share_file(file_id: str):
 
     try:
         await asyncio.to_thread(
-            check_file_ownership, _db, file_id, request.user_id  # type: ignore
+            check_file_ownership, state.db, file_id, identity.user_id
         )
     except AuthError:
         return jsonify({"error": "Not found"}), 404
@@ -1017,15 +1028,18 @@ async def share_file(file_id: str):
     # so an attacker can't enumerate via lock contention or fsync tail.
     # (Round-7 H1/H2)
     target_user = (
-        await asyncio.to_thread(_db.get_user_by_username, target_username)
+        await asyncio.to_thread(state.db.get_user_by_username, target_username)
         if target_username is not None
         else None
     )
     is_self_share = (
-        target_user is not None
-        and target_user["user_id"] == request.user_id  # type: ignore[attr-defined]
+        target_user is not None and target_user["user_id"] == identity.user_id
     )
     do_real_work = target_user is not None and not is_self_share
+    # Snapshot the share target's id while the None-narrowing is visible
+    # to the type checker; the closure below only reads it on the
+    # do_real_work branch (which implies target_user is not None).
+    target_user_id = target_user["user_id"] if target_user is not None else ""
 
     def _db_share_or_dummy():
         # Both branches enter a write transaction so they contend on
@@ -1033,11 +1047,11 @@ async def share_file(file_id: str):
         # commit a WAL frame so fsync tail latency hits both alike.
         # The constant-deadline sleep at the end caps any residual
         # variance.
-        with _db.transaction() as conn:  # type: ignore[union-attr]
+        with state.db.transaction() as conn:
             if do_real_work:
-                _db.add_file_share(  # type: ignore[union-attr]
+                state.db.add_file_share(
                     file_id=file_id,
-                    shared_with_id=target_user["user_id"],  # type: ignore[index]
+                    shared_with_id=target_user_id,
                     wrapped_keys=wrapped_keys,
                 )
                 conn.execute(
@@ -1058,7 +1072,7 @@ async def share_file(file_id: str):
                 )
                 conn.execute(
                     "UPDATE users SET user_id = user_id WHERE user_id = ?",
-                    (request.user_id,),  # type: ignore[attr-defined]
+                    (identity.user_id,),
                 )
 
     await asyncio.to_thread(_db_share_or_dummy)
@@ -1090,7 +1104,8 @@ async def unshare_file(file_id: str, recipient_username: str):
     /share/POST: ``{"status": "unshared"}``. Returns 200 even if the
     target user / share row doesn't exist (no enumeration oracle).
     """
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     try:
         file_id = _validate_id(file_id, "file_id")
@@ -1100,9 +1115,9 @@ async def unshare_file(file_id: str, recipient_username: str):
     try:
         await asyncio.to_thread(
             check_file_ownership,
-            _db,
+            state.db,
             file_id,
-            request.user_id,  # type: ignore[attr-defined]
+            identity.user_id,
         )
     except AuthError:
         return jsonify({"error": "Not found"}), 404
@@ -1123,21 +1138,24 @@ async def unshare_file(file_id: str, recipient_username: str):
     started = time.monotonic()
 
     target_user = (
-        await asyncio.to_thread(_db.get_user_by_username, canon_recipient)
+        await asyncio.to_thread(state.db.get_user_by_username, canon_recipient)
         if canon_recipient is not None
         else None
     )
+    # Snapshot the recipient id while None-narrowing is visible to the
+    # type checker; the closure's real branch implies target_user is set.
+    target_user_id = target_user["user_id"] if target_user is not None else ""
 
     def _db_unshare_or_dummy():
         # Both branches enter a write transaction (BEGIN IMMEDIATE) so
         # they contend on Database._lock + SQLite reserved-lock
         # identically, and both commit a WAL frame so fsync tail hits
         # both. (Round-7 H1/H2)
-        with _db.transaction() as conn:  # type: ignore[union-attr]
+        with state.db.transaction() as conn:
             if target_user is not None:
-                _db.remove_file_share(  # type: ignore[union-attr]
+                state.db.remove_file_share(
                     file_id=file_id,
-                    shared_with_id=target_user["user_id"],
+                    shared_with_id=target_user_id,
                 )
                 # If no shares remain AND the file isn't public,
                 # downgrade visibility back to PRIVATE so the server
@@ -1159,7 +1177,7 @@ async def unshare_file(file_id: str, recipient_username: str):
                 )
                 conn.execute(
                     "UPDATE users SET user_id = user_id WHERE user_id = ?",
-                    (request.user_id,),  # type: ignore[attr-defined]
+                    (identity.user_id,),
                 )
 
     await asyncio.to_thread(_db_unshare_or_dummy)
@@ -1175,7 +1193,8 @@ async def unshare_file(file_id: str, recipient_username: str):
 @require_auth
 async def get_wrapped_keys(file_id: str):
     """Get wrapped keys for the authenticated user."""
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
 
     try:
         file_id = _validate_id(file_id, "file_id")
@@ -1183,14 +1202,12 @@ async def get_wrapped_keys(file_id: str):
         return jsonify({"error": "Not found"}), 404
 
     try:
-        await asyncio.to_thread(
-            check_file_access, _db, file_id, request.user_id  # type: ignore
-        )
+        await asyncio.to_thread(check_file_access, state.db, file_id, identity.user_id)
     except AuthError:
         return jsonify({"error": "Not found"}), 404
 
     wrapped = await asyncio.to_thread(
-        _db.get_wrapped_keys, file_id, request.user_id  # type: ignore
+        state.db.get_wrapped_keys, file_id, identity.user_id
     )
     if wrapped is None:
         return jsonify({"wrapped_keys": None}), 200
@@ -1205,10 +1222,11 @@ async def get_wrapped_keys(file_id: str):
 @require_auth
 async def get_quota():
     """Get quota information for the authenticated user."""
-    assert _db is not None
+    state = app_state()
+    identity = current_identity()
     from server.quota import get_quota_info
 
-    info = await asyncio.to_thread(get_quota_info, _db, request.user_id)  # type: ignore
+    info = await asyncio.to_thread(get_quota_info, state.db, identity.user_id)
     return jsonify(info), 200
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 
 from quart import Quart, jsonify, request
@@ -15,7 +16,9 @@ from server.auth import (
 )
 from server.config import ServerConfig
 from server.database import Database
+from server.state import AppState, store_app_state
 from server.storage import (
+    DEFAULT_MAX_CHUNK_SIZE,
     cleanup_expired_uploads,
     cleanup_orphan_staging_dirs,
     init_storage,
@@ -93,6 +96,30 @@ def create_app(config: ServerConfig | None = None) -> Quart:
         blob_dir=config.blob_dir,
         staging_dir=config.staging_dir,
         staging_expiry=config.staging_expiry_seconds,
+    )
+
+    # ── Typed, immutable app state for handlers (ARCH-H2) ──
+    # init_auth / init_storage still populate the module globals that the
+    # NON-request-context paths use (the periodic cleanup task and the
+    # Argon2 semaphore). Request handlers, however, read this fully-typed
+    # snapshot via app_state(), which eliminates the Database|None /
+    # str-slot typing suppressions the module globals forced.
+    # blob_dir/staging_dir are stored in their realpath'd form (the same
+    # value init_storage canonicalizes and the handlers' _safe_path
+    # expects).
+    store_app_state(
+        app,
+        AppState(
+            db=db,
+            blob_dir=os.path.realpath(config.blob_dir),
+            staging_dir=os.path.realpath(config.staging_dir),
+            staging_expiry=config.staging_expiry_seconds,
+            max_chunk_size=DEFAULT_MAX_CHUNK_SIZE,
+            session_secret=config.session_secret,
+            session_lifetime=config.session_lifetime,
+            rate_limit_max=config.rate_limit_max_attempts,
+            rate_limit_window=config.rate_limit_window_seconds,
+        ),
     )
 
     # ── Register blueprints ──

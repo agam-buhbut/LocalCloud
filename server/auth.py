@@ -19,9 +19,10 @@ import uuid
 from collections import defaultdict, deque
 from functools import wraps
 
-from quart import Blueprint, jsonify, request
+from quart import Blueprint, g, jsonify, request
 
 from server.database import Database
+from server.state import Identity, app_state
 from shared.crypto import hash_password, verify_password
 from shared.exceptions import AuthError, RateLimitError, SessionExpiredError
 
@@ -266,8 +267,8 @@ _IP_RATE_LIMIT_MULTIPLIER = 5
 # peer can never legitimately need MORE rows than this. Capping inserts
 # at the same value bounds a distinct-username flood without altering the
 # behavior of either rate-limit gate.
-def _login_attempt_row_cap() -> int:
-    return _rate_limit_max * _IP_RATE_LIMIT_MULTIPLIER
+def _login_attempt_row_cap(max_attempts: int) -> int:
+    return max_attempts * _IP_RATE_LIMIT_MULTIPLIER
 
 
 # In-memory composite-key rate limiter (#H11).
@@ -400,7 +401,11 @@ def check_rate_limit(
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
-# These will be set by the app factory
+# Legacy module-level snapshot of the auth config (ARCH-H2). Request
+# handlers now read the typed AppState via app_state(); these slots are
+# retained only so a direct init_auth() caller (or a future non-request
+# code path) still observes a consistent config. create_app keeps them in
+# lock-step with the AppState it builds from the same ServerConfig.
 _db: Database | None = None
 _session_secret: str = ""
 _session_lifetime: int = 3600
@@ -415,14 +420,18 @@ def init_auth(
     rate_limit_max: int = 5,
     rate_limit_window: int = 60,
 ) -> None:
-    """Initialize auth module with dependencies.
+    """Initialize the auth module's process-global state.
 
-    Also eagerly creates ``_argon2_semaphore`` to close the lazy-init
-    race (Round-10 M7): two concurrent first-callers of
-    `_get_argon2_semaphore` could otherwise each create their own
-    semaphore (the `if is None: = Semaphore(...)` window is not GIL-
-    protected across `await` boundaries). Creating it here, inside the
-    running event loop at app startup, guarantees one instance.
+    Its essential job is to eagerly create ``_argon2_semaphore`` inside
+    the running event loop, closing the lazy-init race (Round-10 M7): two
+    concurrent first-callers of `_get_argon2_semaphore` could otherwise
+    each create their own semaphore (the ``if is None: = Semaphore(...)``
+    window is not GIL-protected across ``await`` boundaries). Creating it
+    here at app startup guarantees one instance.
+
+    It also records the auth config in the legacy module globals; request
+    handlers read the typed ``AppState`` instead (ARCH-H2), but these
+    slots are kept consistent for any direct caller.
     """
     global _db, _session_secret, _session_lifetime
     global _rate_limit_max, _rate_limit_window
@@ -614,7 +623,7 @@ async def login():
               peer identity. The status code is uniformly 401 so an
               attacker cannot probe rate-limit state. (#H12)
     """
-    assert _db is not None, "Auth module not initialized"
+    state = app_state()
 
     # Cap pre-parse body size so an oversized "password" can't consume
     # Argon2 budget. (medium)
@@ -662,7 +671,7 @@ async def login():
     # DB-level legacy check so we don't leak whether the per-username
     # global counter is hot.
     if await _composite_rate_limit_check(
-        peer_id, username, _rate_limit_max, _rate_limit_window
+        peer_id, username, state.rate_limit_max, state.rate_limit_window
     ):
         await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
         return _auth_failure_response()
@@ -673,11 +682,11 @@ async def login():
     try:
         await asyncio.to_thread(
             check_rate_limit,
-            _db,
+            state.db,
             username,
             peer_id,
-            _rate_limit_max,
-            _rate_limit_window,
+            state.rate_limit_max,
+            state.rate_limit_window,
         )
     except RateLimitError:
         await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
@@ -688,7 +697,7 @@ async def login():
     # user exists, or against a fresh dummy hash otherwise. The dummy
     # hash is computed lazily inside _get_dummy_hash so import time
     # stays cheap.
-    user = await asyncio.to_thread(_db.get_user_by_username, username)
+    user = await asyncio.to_thread(state.db.get_user_by_username, username)
     stored_hash = user["password_hash"] if user is not None else _get_dummy_hash()
 
     # Bound concurrent Argon2id verifications (medium). Outside this
@@ -723,17 +732,17 @@ async def login():
         # authoritative and the response is identical regardless of
         # whether the row was actually inserted.
         await asyncio.to_thread(
-            _db.record_login_attempt,
+            state.db.record_login_attempt,
             username,
             peer_id,
-            max_rows_per_window=_login_attempt_row_cap(),
-            window_seconds=_rate_limit_window,
+            max_rows_per_window=_login_attempt_row_cap(state.rate_limit_max),
+            window_seconds=state.rate_limit_window,
         )
         return _auth_failure_response()
 
     # #6: Successful login — clear previous failed attempts at both layers
     await _composite_rate_limit_clear(peer_id, username)
-    await asyncio.to_thread(_db.clear_login_attempts, username)
+    await asyncio.to_thread(state.db.clear_login_attempts, username)
 
     # Create session token bound to WireGuard peer (#5) and snapshot the
     # user's current session_version so an operator bump revokes this
@@ -743,8 +752,8 @@ async def login():
         token = create_session_token(
             user["user_id"],
             username,
-            _session_secret,
-            _session_lifetime,
+            state.session_secret,
+            state.session_lifetime,
             peer_pubkey=peer_id,
             session_version=int(user.get("session_version", 1)),
         )
@@ -763,11 +772,15 @@ def require_auth(f):
     """Decorator that verifies the session token on every request.
 
     Verifies HMAC signature, expiration, and WireGuard peer binding (#5).
-    Sets request.user_id and request.username on success.
+    On success, binds a typed ``Identity`` to Quart's ``g`` (read via
+    ``current_identity()``), replacing the previously untyped
+    ``request.user_id`` / ``request.username`` attributes (ARCH-H2).
     """
 
     @wraps(f)
     async def decorated(*args, **kwargs):
+        state = app_state()
+
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Authentication required"}), 401
@@ -781,7 +794,7 @@ def require_auth(f):
 
         try:
             payload = verify_session_token(
-                token, _session_secret, expected_peer=peer_id
+                token, state.session_secret, expected_peer=peer_id
             )
         except SessionExpiredError:
             return jsonify({"error": "Authentication required"}), 401
@@ -791,8 +804,9 @@ def require_auth(f):
         # the user still holds a non-expired token. Previously
         # require_auth only checked session_version, so a disabled user
         # remained usable until their token expired.
-        assert _db is not None, "Auth module not initialized"
-        user_status = await asyncio.to_thread(_db.get_user_status, payload["user_id"])
+        user_status = await asyncio.to_thread(
+            state.db.get_user_status, payload["user_id"]
+        )
         if user_status is None:
             return jsonify({"error": "Authentication required"}), 401
         current_sv, is_active = user_status
@@ -808,9 +822,11 @@ def require_auth(f):
         if token_sv != current_sv:
             return jsonify({"error": "Authentication required"}), 401
 
-        # Attach user info to request context
-        request.user_id = payload["user_id"]  # type: ignore
-        request.username = payload["username"]  # type: ignore
+        # Attach the typed caller identity to the request-scoped ``g``.
+        g.identity = Identity(
+            user_id=payload["user_id"],
+            username=payload["username"],
+        )
 
         return await f(*args, **kwargs)
 
