@@ -143,6 +143,19 @@ property tests despite the spec mandating them); plus the defects below.
 
 ## Phase 0 — Correctness & safety quick wins (low risk, high value)
 
+> **✅ EXECUTED 2026-05-29** — commits `1ca93f0..9448bb8`. All tasks landed;
+> **120 Python + 24 Rust tests green**; pyright/black/isort/ruff clean; pip-audit
+> ("no known vulnerabilities") + cargo audit (75 crates, 0 advisories) clean.
+> Deviations from the written plan: 0.2 kept non-breaking (option b, no wire
+> change); **0.3 chunk_size gate pins to `self.chunk_size`** (which equals the
+> module `CHUNK_SIZE` for every production caller — no production code builds a
+> non-default `FileEncryptor` — so no pre-existing test had to be modified);
+> **0.4 read path** uses an `O_NOFOLLOW` fd + plain `Response` (the installed
+> Quart `send_file` cannot accept an fd), which also fixed a latent
+> `etag=`-on-`send_file` `TypeError` in the chunk-download path; `requirements.txt`
+> deleted and `target/` untracked (both approved); application lockfile deferred
+> to Phase 7. 0.6d: tool targets `py311` vs the 3.13 runtime is correct — no change.
+
 **Objective:** Close the cheap, high-confidence defects with no architectural
 change. Everything here is small, locally testable, and unblocks trust in the
 rest of the work. Each item ships with a regression test.
