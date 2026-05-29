@@ -8,18 +8,9 @@ behaves. (Round-2 H9 / Round-3 fix)
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from server.database import Database
 
-
-@pytest.fixture()
-def db(tmp_path: Path) -> Database:
-    d = Database(str(tmp_path / "meta.db"))
-    d.connect()
-    return d
+# The `db` fixture now lives in tests/conftest.py (canonical, shared).
 
 
 def _user(db: Database, name: str) -> str:
