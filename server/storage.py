@@ -321,8 +321,13 @@ async def upload_init():
     if open_count >= MAX_OPEN_UPLOADS_PER_USER:
         return jsonify({"error": "Too many open uploads"}), 429
 
-    # Generate upload ID (server-generated, always safe)
-    upload_id = str(uuid.uuid4())
+    # Generate upload ID (server-generated, always safe). It MUST be in the
+    # same canonical 32-char no-hyphen form _validate_id returns, so the
+    # staging dir, the DB row, and the later chunk/finalize lookups (which
+    # run upload_id through _validate_id, stripping hyphens) all agree on
+    # the same key. A hyphenated str(uuid4()) would never match the
+    # canonicalized lookup, so every chunk POST would 400.
+    upload_id = uuid.uuid4().hex
     staging_path = _safe_path(state.staging_dir, upload_id)
     await asyncio.to_thread(os.makedirs, staging_path, mode=0o700, exist_ok=True)
 
