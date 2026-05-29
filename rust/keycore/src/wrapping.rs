@@ -194,9 +194,7 @@ pub fn unwrap_file_keys(
         let secret_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*recipient_arr);
         let recipient_secret = x25519_dalek::StaticSecret::from(*secret_bytes);
         let recipient_pub_bytes = *X25519PublicKey::from(&recipient_secret).as_bytes();
-        let ss = Zeroizing::new(
-            recipient_secret.diffie_hellman(&ephemeral_pub).to_bytes(),
-        );
+        let ss = Zeroizing::new(recipient_secret.diffie_hellman(&ephemeral_pub).to_bytes());
         (ss, recipient_pub_bytes)
     };
 
