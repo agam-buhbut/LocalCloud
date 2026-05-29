@@ -215,9 +215,8 @@ impl IdentityKeyPair {
     pub fn encrypt_to_store(&self, password: &[u8]) -> Result<Vec<u8>, String> {
         // Generate random salt and nonce
         let mut salt = [0u8; SALT_LEN];
-        let mut nonce_bytes = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut salt);
-        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce_bytes = Self::gen_seal_nonce();
 
         // Derive encryption key from password via Argon2id
         let master_key = Self::derive_master_key(password, &salt)?;
@@ -423,6 +422,19 @@ impl IdentityKeyPair {
 
     // ──────────── Internal key derivation ────────────
 
+    /// Draw a fresh random AEAD nonce for sealing the key store.
+    ///
+    /// Each call MUST return an independent draw from the OS CSPRNG: the
+    /// store is sealed with XChaCha20-Poly1305, so a repeated nonce under
+    /// the (password-derived) key would break confidentiality and
+    /// authenticity. Factored out of `encrypt_to_store` so its uniqueness
+    /// property is testable without paying the Argon2id KDF cost per call.
+    fn gen_seal_nonce() -> [u8; NONCE_LEN] {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        nonce_bytes
+    }
+
     /// Derive master encryption key from password using default Argon2id params
     fn derive_master_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
         Self::derive_master_key_with_params(
@@ -517,5 +529,35 @@ mod tests {
 
         assert_ne!(kp1.x25519_public_key(), kp2.x25519_public_key());
         assert_ne!(kp1.ed25519_public_key(), kp2.ed25519_public_key());
+    }
+
+    // ──────────────── Seal-nonce uniqueness ────────────────
+    //
+    // Property: the AEAD nonce used to seal the encrypted key store is a
+    // fresh CSPRNG draw on every encryption. A repeated nonce under the
+    // password-derived key would be a critical break of the key-store
+    // AEAD. This exercises the exact nonce-drawing path that
+    // `encrypt_to_store` uses (`gen_seal_nonce`) over many iterations and
+    // asserts no collision — it fails loudly if that draw is ever made
+    // constant or counter-based-with-reset. We test the factored-out
+    // generator rather than full `encrypt_to_store` calls because the
+    // latter each run a 512 MiB Argon2id KDF; the nonce draw is wholly
+    // independent of the KDF, so this is the same code under test without
+    // the per-iteration cost.
+
+    #[test]
+    fn test_seal_nonce_unique_over_many_iterations() {
+        use std::collections::HashSet;
+
+        const ITERS: usize = 1000;
+        let mut nonces: HashSet<[u8; NONCE_LEN]> = HashSet::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let nonce = IdentityKeyPair::gen_seal_nonce();
+            assert!(
+                nonces.insert(nonce),
+                "duplicate key-store seal nonce produced"
+            );
+        }
+        assert_eq!(nonces.len(), ITERS);
     }
 }

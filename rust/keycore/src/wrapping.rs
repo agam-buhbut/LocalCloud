@@ -56,6 +56,13 @@ const TAG_LEN: usize = 16;
 /// Wrapped payload: file_key (32) + meta_key (32) = 64 bytes plaintext.
 const PAYLOAD_LEN: usize = 64;
 
+/// The two 32-byte keys recovered by [`unwrap_file_keys`]: the file_key
+/// and the meta_key, each held in a `Zeroizing` wrapper so the recovered
+/// secret bytes are wiped on drop. Aliased to keep the function signature
+/// within clippy's `type_complexity` bound (the tuple-of-Zeroizing is
+/// otherwise flagged) without changing the returned shape.
+type UnwrappedKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+
 // ──────────────────────────── Key Wrapping ────────────────────────────
 
 /// Wrap file_key and meta_key for a specific recipient using
@@ -150,7 +157,7 @@ pub fn unwrap_file_keys(
     file_id: &[u8],
     sender_identity_pub: &[u8; 32],
     recipient_privkey: &[u8; 32],
-) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), String> {
+) -> Result<UnwrappedKeys, String> {
     if file_id.len() != REQUIRED_FILE_ID_LEN {
         return Err("file_id must be 16 bytes".to_string());
     }
@@ -456,5 +463,72 @@ mod tests {
 
         let result_unwrap = unwrap_file_keys(&[0u8; 136], b"short", &[0u8; 32], &[0u8; 32]);
         assert!(result_unwrap.is_err());
+    }
+
+    // ──────────────── Nonce / ephemeral-key uniqueness ────────────────
+    //
+    // Property: every wrap() draws a FRESH ephemeral X25519 pair AND a
+    // FRESH 24-byte AEAD nonce from OsRng. Reuse of either is a critical
+    // failure — a repeated (key, nonce) pair under XChaCha20-Poly1305
+    // destroys confidentiality and authenticity. These collect the
+    // ephemeral-pub prefix and the nonce field across many wraps and
+    // assert no collision. They fail loudly if the ephemeral pair or
+    // nonce generation is ever made deterministic / constant.
+
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_wrap_nonces_unique_over_many_iterations() {
+        let sender_identity = [0x88u8; 32];
+        let (_recipient_priv, recipient_pub) = generate_x25519_keypair();
+        let file_id = [9u8; 16];
+
+        const ITERS: usize = 1000;
+        let mut nonces: HashSet<[u8; NONCE_LEN]> = HashSet::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let bundle = wrap_file_keys(
+                &[0xAA; 32],
+                &[0xBB; 32],
+                &file_id,
+                &recipient_pub,
+                &sender_identity,
+            )
+            .unwrap();
+            // Wire layout: ephemeral_pub (32) || nonce (24) || ct+tag.
+            let mut nonce = [0u8; NONCE_LEN];
+            nonce.copy_from_slice(&bundle[PUBKEY_LEN..PUBKEY_LEN + NONCE_LEN]);
+            assert!(
+                nonces.insert(nonce),
+                "duplicate AEAD nonce produced by wrap_file_keys"
+            );
+        }
+        assert_eq!(nonces.len(), ITERS);
+    }
+
+    #[test]
+    fn test_wrap_ephemeral_pubkeys_unique_over_many_iterations() {
+        let sender_identity = [0x99u8; 32];
+        let (_recipient_priv, recipient_pub) = generate_x25519_keypair();
+        let file_id = [7u8; 16];
+
+        const ITERS: usize = 1000;
+        let mut ephemerals: HashSet<[u8; PUBKEY_LEN]> = HashSet::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let bundle = wrap_file_keys(
+                &[0xAA; 32],
+                &[0xBB; 32],
+                &file_id,
+                &recipient_pub,
+                &sender_identity,
+            )
+            .unwrap();
+            let mut eph = [0u8; PUBKEY_LEN];
+            eph.copy_from_slice(&bundle[..PUBKEY_LEN]);
+            assert!(
+                ephemerals.insert(eph),
+                "duplicate ephemeral public key produced by wrap_file_keys"
+            );
+        }
+        assert_eq!(ephemerals.len(), ITERS);
     }
 }
