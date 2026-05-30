@@ -185,7 +185,13 @@ def test_oversize_encrypted_metadata_rejected(keystore: KeyStore, tmp_path: Path
     enc = FileEncryptor(keystore, chunk_size=1024)
     huge_meta = b"x" * (1 << 21)  # 2 MiB — well above the cap
     with pytest.raises(DecryptionError):
-        enc.decrypt_metadata(huge_meta, result.meta_key, result.header.file_id)
+        enc.decrypt_metadata(
+            huge_meta,
+            result.meta_key,
+            result.header.file_id,
+            result.header.merkle_root,
+            result.header.version,
+        )
 
 
 def test_chunk_count_mismatch_rejected(keystore: KeyStore, tmp_path: Path):

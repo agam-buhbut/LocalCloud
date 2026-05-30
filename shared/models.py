@@ -17,8 +17,12 @@ import cbor2
 
 # ──────────────────────────── Protocol Constants ────────────────────────────
 
-# Protocol version — increment on breaking wire format changes
-PROTOCOL_VERSION: int = 1
+# Protocol version — increment on breaking wire format changes.
+# v2 (CRY-I2 / item 2D): the metadata blob's AAD now binds merkle_root via
+# build_metadata_aad, pinning the encrypted metadata to one file version.
+# This is a HARD CUTOVER — FileHeader.validate() accepts ONLY version 2;
+# there is no v1 compatibility-read path (no version-downgrade oracle).
+PROTOCOL_VERSION: int = 2
 
 # Magic bytes identifying a LocalCloud encrypted file
 MAGIC: bytes = b"LCLD"
@@ -95,6 +99,13 @@ _MAX_META_STR_LEN: int = 256
 # merkle_root) so v1 signatures cannot replay against v2 verifiers.
 MERKLE_SIG_CONTEXT: bytes = b"localcloud-merkle-v2"
 
+# Domain separation tag for the metadata blob's AEAD AAD (item 2D). The
+# "v2" tracks PROTOCOL_VERSION 2: a metadata blob sealed under this tag can
+# never verify under any other domain (the data-chunk ChunkAAD or a future
+# version), so the data-vs-metadata separation the v1 sentinel index
+# provided is now carried by the domain tag instead.
+METADATA_AAD_CONTEXT: bytes = b"localcloud-meta-aad-v2"
+
 
 def build_merkle_signing_input(
     file_id: bytes,
@@ -136,6 +147,53 @@ def build_merkle_signing_input(
         + file_id
         + merkle_root
         + struct.pack(">QQH", chunk_size, total_chunks, protocol_version)
+    )
+
+
+def build_metadata_aad(
+    file_id: bytes,
+    merkle_root: bytes,
+    protocol_version: int,
+) -> bytes:
+    """Build the AAD that binds the encrypted metadata blob to one file version.
+
+    Format::
+
+        METADATA_AAD_CONTEXT
+            || file_id (16 bytes)
+            || merkle_root (32 bytes)
+            || protocol_version (2 bytes, big-endian u16)
+
+    Including ``merkle_root`` pins the metadata blob to exactly the file
+    version whose chunk set produces that root: a hostile server can no
+    longer pair version-N's metadata with version-M's chunks/header for the
+    same ``file_id`` (item 2D / CRY-I2). ``merkle_root`` is the right binder
+    because it is the file's unique chunk-set fingerprint and is already what
+    the Ed25519 signature covers; the signature itself is intentionally NOT
+    in the AAD (it is over the root, so it adds no information).
+
+    The domain tag ``METADATA_AAD_CONTEXT`` provides the data-chunk-vs-metadata
+    separation that the v1 sentinel index (``METADATA_CHUNK_INDEX``) provided,
+    and the ``protocol_version`` field forces non-interoperability on a future
+    bump (defense in depth; the tag already does this). The u16 width matches
+    ``FileHeader.version``.
+
+    Raises:
+        ValueError: ``file_id`` is not ``FILE_ID_LEN`` bytes, ``merkle_root``
+            is not ``BLAKE2B_DIGEST_LEN`` bytes, or ``protocol_version`` is
+            outside the u16 range.
+    """
+    if len(file_id) != FILE_ID_LEN:
+        raise ValueError("file_id must be 16 bytes")
+    if len(merkle_root) != BLAKE2B_DIGEST_LEN:
+        raise ValueError("merkle_root must be 32 bytes")
+    if protocol_version < 0 or protocol_version > 0xFFFF:
+        raise ValueError("protocol_version out of range")
+    return (
+        METADATA_AAD_CONTEXT
+        + file_id
+        + merkle_root
+        + struct.pack(">H", protocol_version)
     )
 
 

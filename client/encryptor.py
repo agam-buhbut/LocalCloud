@@ -42,14 +42,15 @@ from shared.models import (
     CHUNK_SIZE,
     MAX_CHUNKS_PER_FILE,
     MAX_METADATA_BYTES,
-    METADATA_CHUNK_INDEX,
     NONCE_LEN,
+    PROTOCOL_VERSION,
     TAG_LEN,
     ChunkAAD,
     FileHeader,
     MetadataBlob,
     Visibility,
     build_merkle_signing_input,
+    build_metadata_aad,
     pad_to_size_class,
     unpad,
 )
@@ -138,12 +139,13 @@ class FileEncryptor:
         file_key = generate_key()
         meta_key = generate_key()
         # Domain separation between the metadata blob and the data chunks
-        # rests on (a) DISTINCT AAD — the metadata uses the sentinel
-        # chunk_index=0xFFFFFFFF with total_chunks=0, which no data chunk
-        # ever uses — AND (b) two independently sampled random keys. This
-        # assertion is ONLY a tripwire for a catastrophic CSPRNG failure
-        # handing back identical keys; it is NOT the domain-separation
-        # mechanism and must not be read as such.
+        # rests on (a) DISTINCT AAD — the metadata blob is sealed under
+        # build_metadata_aad's METADATA_AAD_CONTEXT domain tag (item 2D),
+        # which no data-chunk ChunkAAD ever produces — AND (b) two
+        # independently sampled random keys. This assertion is ONLY a
+        # tripwire for a catastrophic CSPRNG failure handing back identical
+        # keys; it is NOT the domain-separation mechanism and must not be
+        # read as such.
         assert file_key != meta_key
         file_id = os.urandom(16)
 
@@ -175,8 +177,6 @@ class FileEncryptor:
         # prevents cross-context signature replay AND server-side header
         # field tampering. (Round-2 H3)
         root = merkle_root(chunk_hashes)
-        from shared.models import PROTOCOL_VERSION
-
         signature = self.keystore.sign(
             build_merkle_signing_input(
                 file_id,
@@ -208,11 +208,12 @@ class FileEncryptor:
         meta_plain = metadata.serialize()
         meta_padded = pad_to_size_class(meta_plain)
         meta_nonce = generate_nonce()
-        meta_aad = ChunkAAD(
-            file_id=file_id,
-            chunk_index=METADATA_CHUNK_INDEX,  # Special index for metadata
-            total_chunks=0,
-        ).serialize()
+        # Bind the metadata to THIS file version via merkle_root (item 2D).
+        # `root` was computed above from the data-chunk hashes only — the
+        # metadata ciphertext is never a Merkle leaf — so this introduces no
+        # circular dependency. Ordering is load-bearing: hash chunks ->
+        # compute root -> encrypt metadata with the root-bound AAD.
+        meta_aad = build_metadata_aad(file_id, root, PROTOCOL_VERSION)
         meta_ct = encrypt_chunk(meta_key, meta_nonce, meta_padded, meta_aad)
         encrypted_metadata = meta_nonce + meta_ct
 
@@ -345,8 +346,18 @@ class FileEncryptor:
 
         # Decrypt metadata up front so original_size is known when we hit
         # the last (possibly padded) chunk — also fails fast on a wrong
-        # meta_key.
-        metadata = self.decrypt_metadata(encrypted_metadata, meta_key, header.file_id)
+        # meta_key. The AAD binds header.merkle_root + header.version, both
+        # of which were AUTHENTICATED by the Ed25519 signature verified just
+        # above — so the binder is not attacker-chosen. This pins the
+        # metadata to exactly this file version (item 2D): a metadata blob
+        # from a different version of the same file_id fails the AEAD here.
+        metadata = self.decrypt_metadata(
+            encrypted_metadata,
+            meta_key,
+            header.file_id,
+            header.merkle_root,
+            header.version,
+        )
         original_size: int = metadata.original_size
         # Reject malformed original_size before we use it to slice the
         # last chunk. A hostile sender (file owner) could put a negative
@@ -471,16 +482,32 @@ class FileEncryptor:
         encrypted_metadata: bytes,
         meta_key: bytes,
         file_id: bytes,
+        merkle_root: bytes,
+        protocol_version: int,
     ) -> MetadataBlob:
         """Decrypt the metadata blob.
+
+        The AAD binds ``file_id`` + ``merkle_root`` + ``protocol_version``
+        (item 2D), so the blob decrypts only against the file version whose
+        chunk set produced ``merkle_root``. Callers MUST pass an
+        authenticated ``merkle_root``/``protocol_version`` (e.g. from a
+        signature-verified ``FileHeader``); passing an attacker-chosen root
+        would defeat the binding.
 
         Args:
             encrypted_metadata: nonce || ciphertext
             meta_key: metadata encryption key
             file_id: file ID for AAD binding
+            merkle_root: authenticated Merkle root the metadata is bound to
+            protocol_version: authenticated protocol version (header.version)
 
         Returns:
             deserialized MetadataBlob
+
+        Raises:
+            DecryptionError: payload bounds violated, or the AEAD tag fails
+                (wrong meta_key, wrong file_id, or a metadata blob from a
+                different file version — mismatched merkle_root).
         """
         # Upper-bound the input size so a hostile server can't ship a
         # multi-GiB "metadata" payload and force the AEAD to allocate
@@ -495,11 +522,7 @@ class FileEncryptor:
         nonce = encrypted_metadata[:NONCE_LEN]
         ciphertext = encrypted_metadata[NONCE_LEN:]
 
-        aad = ChunkAAD(
-            file_id=file_id,
-            chunk_index=METADATA_CHUNK_INDEX,
-            total_chunks=0,
-        ).serialize()
+        aad = build_metadata_aad(file_id, merkle_root, protocol_version)
 
         padded = decrypt_chunk(meta_key, nonce, ciphertext, aad)
         meta_bytes = unpad(padded)
