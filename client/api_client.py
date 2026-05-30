@@ -42,39 +42,28 @@ class CloudClient:
     def is_authenticated(self) -> bool:
         return self._token is not None
 
-    def _headers(self) -> dict:
-        """Build request headers with auth token."""
-        headers = {"Content-Type": "application/json"}
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-        return headers
+    def _auth_header(self) -> dict[str, str]:
+        """Return the Authorization header, or ``{}`` when unauthenticated.
 
-    def _check_response(self, resp: httpx.Response) -> dict:
-        """Check response status and return JSON body.
-
-        Narrow exception handlers; full chain of cause via ``raise from``
-        so the original transport failure isn't lost.
+        When no session token is set we omit the header entirely rather than
+        sending ``Authorization: Bearer None`` (a literal "None" string),
+        which the server would treat as a malformed token instead of as the
+        absence of one.
         """
-        if resp.status_code == 401:
-            raise AuthError("Authentication required")
-        if resp.status_code == 429:
-            raise AuthError("Rate limited")
-        if resp.status_code >= 400:
-            try:
-                body = resp.json()
-            except (json.JSONDecodeError, ValueError):
-                body = {"error": resp.text or "Request failed"}
-            raise StorageError(body.get("error", "Request failed"))
-        try:
-            return resp.json()
-        except (json.JSONDecodeError, ValueError) as e:
-            raise StorageError("Invalid server response") from e
+        if self._token:
+            return {"Authorization": f"Bearer {self._token}"}
+        return {}
 
-    def _check_binary_response(self, resp: httpx.Response) -> bytes:
-        """Like _check_response but for endpoints returning raw bytes.
+    def _headers(self) -> dict[str, str]:
+        """Build JSON request headers, including auth when present."""
+        return {"Content-Type": "application/json", **self._auth_header()}
 
-        Maps 4xx/5xx to typed exceptions; on success, returns the body
-        without forcing a JSON decode.
+    def _raise_for_status(self, resp: httpx.Response) -> None:
+        """Map a non-2xx response to a typed exception (single mapper).
+
+        Shared by ``_check_response`` and ``_check_binary_response`` so the
+        status-code → exception policy lives in exactly one place. No-op for
+        a successful (<400) response.
         """
         if resp.status_code == 401:
             raise AuthError("Authentication required")
@@ -87,6 +76,26 @@ class CloudClient:
             except (json.JSONDecodeError, ValueError):
                 msg = resp.text or f"HTTP {resp.status_code}"
             raise StorageError(msg)
+
+    def _check_response(self, resp: httpx.Response) -> dict:
+        """Check response status and return JSON body.
+
+        Narrow exception handlers; full chain of cause via ``raise from``
+        so the original transport failure isn't lost.
+        """
+        self._raise_for_status(resp)
+        try:
+            return resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raise StorageError("Invalid server response") from e
+
+    def _check_binary_response(self, resp: httpx.Response) -> bytes:
+        """Like _check_response but for endpoints returning raw bytes.
+
+        Maps 4xx/5xx to typed exceptions; on success, returns the body
+        without forcing a JSON decode.
+        """
+        self._raise_for_status(resp)
         if resp.status_code != 200:
             raise StorageError(f"Unexpected status {resp.status_code}")
         return resp.content
@@ -132,7 +141,7 @@ class CloudClient:
             content=chunk_data,
             headers={
                 "Content-Type": "application/octet-stream",
-                "Authorization": f"Bearer {self._token}",
+                **self._auth_header(),
             },
         )
         data = self._check_response(resp)
@@ -209,9 +218,7 @@ class CloudClient:
         """
         resp = self._client.get(
             f"{self.server_url}/api/files/{file_id}/chunk/{chunk_index}",
-            headers={
-                "Authorization": f"Bearer {self._token}",
-            },
+            headers=self._auth_header(),
         )
         return self._check_binary_response(resp)
 

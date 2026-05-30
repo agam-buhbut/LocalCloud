@@ -26,6 +26,7 @@ from quart import Blueprint, jsonify, request
 
 from server.auth import require_auth
 from server.state import app_state, current_identity
+from server.timing import TIMING_BUDGET_S, sleep_until_deadline
 from shared.exceptions import AuthError
 from shared.usernames import (
     X25519_PUBKEY_LEN,
@@ -49,11 +50,13 @@ _ED25519_HEX_WIDTH = _ED25519_LEN * 2  # 64
 _SELF_SIG_HEX_WIDTH = _SELF_SIG_LEN * 2  # 128
 
 # Constant-deadline budget for the directory lookup, mirroring the
-# share-endpoint timing envelope (server/storage.py _SHARE_TIMING_BUDGET_S
-# = 0.150). A row that exists touches BLOB columns while an absent one is
-# an empty index probe; capping the wall-clock at a fixed deadline closes
-# that timing delta so existence is not measurable (T-N2 / L6).
-_DIRECTORY_TIMING_BUDGET_S = 0.150
+# share-endpoint timing envelope (both reuse the shared
+# server.timing.TIMING_BUDGET_S). A row that exists touches BLOB columns
+# while an absent one is an empty index probe; capping the wall-clock at a
+# fixed deadline closes that timing delta so existence is not measurable
+# (T-N2 / L6). Kept as a module attribute so a test can monkeypatch the
+# floor without touching the shared constant.
+_DIRECTORY_TIMING_BUDGET_S = TIMING_BUDGET_S
 
 # Pagination caps for /enrolled, mirroring list_files (storage.py).
 _DEFAULT_ENROLLED_LIMIT = 50
@@ -205,11 +208,9 @@ async def get_pubkeys(username: str):
     body = {"ed25519": ed_hex, "x25519": x_hex, "self_sig": sig_hex}
 
     # Constant-deadline sleep: cap residual timing variance between the
-    # row-exists and no-row paths (T-N2 / L6).
-    elapsed = time.monotonic() - started
-    remaining = _DIRECTORY_TIMING_BUDGET_S - elapsed
-    if remaining > 0:
-        await asyncio.sleep(remaining)
+    # row-exists and no-row paths (T-N2 / L6). Reads the module attribute
+    # (not the import) so a test monkeypatching the budget is honored.
+    await sleep_until_deadline(started, _DIRECTORY_TIMING_BUDGET_S)
     return jsonify(body), 200
 
 

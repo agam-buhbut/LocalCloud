@@ -636,13 +636,23 @@ def unpad(data: bytes) -> bytes:
 
     Reads the 4-byte big-endian length prefix and extracts exactly
     that many bytes of payload.
+
+    Raises:
+        PaddingError: if the prefix is missing or claims more bytes than
+            are present. ``PaddingError`` subclasses ``ValueError`` so the
+            historical ``except ValueError`` / ``pytest.raises(ValueError)``
+            contract still holds.
     """
+    # Local import mirrors the other shared.exceptions uses in this module
+    # (avoids a module-level import cycle).
+    from shared.exceptions import PaddingError
+
     if len(data) < _LENGTH_PREFIX_SIZE:
-        raise ValueError("Data too short to contain length prefix")
+        raise PaddingError("Data too short to contain length prefix")
 
     original_len = struct.unpack(">I", data[:_LENGTH_PREFIX_SIZE])[0]
 
     if original_len > len(data) - _LENGTH_PREFIX_SIZE:
-        raise ValueError("Invalid length prefix — exceeds available data")
+        raise PaddingError("Invalid length prefix — exceeds available data")
 
     return data[_LENGTH_PREFIX_SIZE : _LENGTH_PREFIX_SIZE + original_len]

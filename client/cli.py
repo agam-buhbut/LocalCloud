@@ -19,6 +19,7 @@ from client.encryptor import FileEncryptor
 from client.keystore import KeyStore
 from shared.crypto import blake2b_hash
 from shared.exceptions import AuthError, CryptoError, StorageError
+from shared.file_ids import canonicalize_file_id
 from shared.io import read_capped
 from shared.models import FileHeader, Visibility
 
@@ -215,6 +216,95 @@ def _resolve_owner_pubkey(
     return pk
 
 
+def _encrypt_and_upload(
+    client: CloudClient, encryptor: FileEncryptor, src: Path, vis: Visibility
+):
+    """Init the upload, stream-encrypt + upload every chunk, finalize.
+
+    Returns the ``EncryptedFile`` result (carrying file_key/meta_key for the
+    subsequent self-wrap) and the server-confirmed ``file_id``. Behavior is
+    unchanged from the inline body: the per-chunk hash is cross-checked
+    against the server echo, and the authoritative ``expected_hashes`` sent
+    to finalize are the CLIENT-computed hashes (never the server echoes).
+    """
+    import math
+
+    filename = src.name
+    size = src.stat().st_size
+    # Pre-compute total chunks so upload_init can pass expected_chunks
+    # (the server enforces the count at finalize).
+    total_chunks = max(1, math.ceil(size / encryptor.chunk_size))
+
+    click.echo(
+        f"Initializing upload: {filename} ({size} bytes, {total_chunks} chunks)..."
+    )
+    upload_id = client.upload_init(filename, total_chunks)
+
+    def on_chunk(idx: int, blob: bytes) -> None:
+        # Upload the chunk and verify the server's echoed-back BLAKE2b hash
+        # matches the locally computed one — defense in depth. The
+        # authoritative expected-hashes list passed to finalize comes from
+        # ``encrypted.chunk_hashes`` (the CLIENT view), not from server
+        # returns; using server returns there would make the integrity
+        # check a tautology the server could trivially defeat. (Round-3
+        # CRITICAL fix)
+        server_hash = client.upload_chunk(upload_id, idx, blob)
+        local_hash = blake2b_hash(blob).hex()
+        if not hmac.compare_digest(server_hash, local_hash):
+            raise CryptoError(
+                "Server echoed a different chunk hash than the client "
+                "computed — possible MITM or storage corruption"
+            )
+        click.echo(f"  uploaded chunk {idx + 1}/{total_chunks}")
+
+    click.echo("Encrypting + uploading...")
+    encrypted = encryptor.encrypt_file(
+        src,
+        filename,
+        on_chunk,
+        visibility=vis,
+        owner="",
+    )
+
+    # Authoritative hash list: the client's locally computed BLAKE2b over
+    # each (nonce || ciphertext) chunk blob, captured during encrypt_file.
+    # The server compares ITS own stored hash against this — any divergence
+    # (server tampered, disk corruption, network bit-flip) causes finalize
+    # to reject.
+    client_hashes = [h.hex() for h in encrypted.chunk_hashes]
+    click.echo("Finalizing...")
+    file_id = client.upload_finalize(
+        upload_id=upload_id,
+        file_id=encrypted.header.file_id.hex(),
+        total_chunks=encrypted.header.total_chunks,
+        file_header=encrypted.header.serialize(),
+        encrypted_metadata=encrypted.encrypted_metadata,
+        visibility=int(vis),
+        expected_hashes=client_hashes,
+    )
+    return encrypted, file_id
+
+
+def _register_owner_self_keys(
+    client: CloudClient, ks: KeyStore, encrypted, file_id: str
+) -> None:
+    """Wrap the file's keys to the owner's OWN X25519 and register them (2A).
+
+    The wrap uses the LOCAL keypair (own X25519 as recipient, own Ed25519 as
+    the internal sender binding) — it does NOT depend on directory
+    enrollment. No plaintext key is written to disk; the owner later acquires
+    the keys through the same server path as any recipient.
+    """
+    own_x25519 = ks.x25519_public_key()
+    self_bundle = ks.wrap_file_keys(
+        file_key=encrypted.file_key,
+        meta_key=encrypted.meta_key,
+        file_id=encrypted.header.file_id,
+        recipient_pubkey=own_x25519,
+    )
+    client.post_self_keys(file_id, self_bundle)
+
+
 @cli.command()
 @click.argument("filepath", type=click.Path(exists=True, dir_okay=False))
 @click.option(
@@ -243,94 +333,46 @@ def upload(ctx, filepath: str, visibility: str):
     _load_session(ctx, client)
 
     try:
-        src = Path(filepath)
-        filename = src.name
-        size = src.stat().st_size
+        vis = _VIS_MAP[visibility]
         encryptor = FileEncryptor(ks)
-        # Pre-compute total chunks so we can call upload_init with
-        # expected_chunks (server uses it to enforce the count at
-        # finalize).
-        import math
-
-        total_chunks = max(1, math.ceil(size / encryptor.chunk_size))
-
-        click.echo(
-            f"Initializing upload: {filename} ({size} bytes, {total_chunks} chunks)..."
-        )
-        upload_id = client.upload_init(filename, total_chunks)
-
-        def on_chunk(idx: int, blob: bytes) -> None:
-            # We upload the chunk and also verify that the server's
-            # echoed-back BLAKE2b hash matches the one we computed
-            # locally — defense in depth. The authoritative expected-
-            # hashes list passed to finalize comes from `encrypted.
-            # chunk_hashes` (the CLIENT view), not from server returns;
-            # using server returns there would make the integrity check
-            # a tautology the server could trivially defeat. (Round-3
-            # CRITICAL fix)
-            server_hash = client.upload_chunk(upload_id, idx, blob)
-            local_hash = blake2b_hash(blob).hex()
-            if not hmac.compare_digest(server_hash, local_hash):
-                raise CryptoError(
-                    "Server echoed a different chunk hash than the client "
-                    "computed — possible MITM or storage corruption"
-                )
-            click.echo(f"  uploaded chunk {idx + 1}/{total_chunks}")
-
-        click.echo("Encrypting + uploading...")
-        encrypted = encryptor.encrypt_file(
-            src,
-            filename,
-            on_chunk,
-            visibility=_VIS_MAP[visibility],
-            owner="",
-        )
-
-        file_id_hex = encrypted.header.file_id.hex()
-        # Authoritative hash list: the client's locally computed BLAKE2b
-        # over each (nonce || ciphertext) chunk blob, captured during
-        # encrypt_file. The server compares ITS own stored hash against
-        # this — any divergence (server tampered, disk corruption,
-        # network bit-flip) causes finalize to reject.
-        client_hashes = [h.hex() for h in encrypted.chunk_hashes]
-        click.echo("Finalizing...")
-        file_id = client.upload_finalize(
-            upload_id=upload_id,
-            file_id=file_id_hex,
-            total_chunks=encrypted.header.total_chunks,
-            file_header=encrypted.header.serialize(),
-            encrypted_metadata=encrypted.encrypted_metadata,
-            visibility=int(_VIS_MAP[visibility]),
-            expected_hashes=client_hashes,
-        )
-
-        # 2A: wrap file_key/meta_key to the OWNER'S OWN X25519 key and
-        # register the bundle server-side as a self-share. The wrap uses
-        # the LOCAL keypair (own X25519 as recipient, own Ed25519 as the
-        # internal sender binding) — it does NOT depend on directory
-        # enrollment. No plaintext key is written to disk.
-        own_x25519 = ks.x25519_public_key()
-        self_bundle = ks.wrap_file_keys(
-            file_key=encrypted.file_key,
-            meta_key=encrypted.meta_key,
-            file_id=encrypted.header.file_id,
-            recipient_pubkey=own_x25519,
-        )
-        client.post_self_keys(file_id, self_bundle)
+        encrypted, file_id = _encrypt_and_upload(client, encryptor, Path(filepath), vis)
+        _register_owner_self_keys(client, ks, encrypted, file_id)
         click.echo(f"Upload complete. File ID: {file_id}")
     except (StorageError, CryptoError, AuthError) as e:
         click.echo(f"Upload failed: {e}", err=True)
         sys.exit(1)
-    except Exception as e:
-        # Surface the type to aid debugging while not leaking values.
-        click.echo(
-            f"Upload failed: unexpected error ({type(e).__name__})",
-            err=True,
-        )
+    except Exception:
+        click.echo("Upload failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         ks.lock()
         client.close()
+
+
+def _fetch_metadata_and_header(
+    client: CloudClient, file_id: str
+) -> tuple[bytes, bytes, int, FileHeader]:
+    """Fetch file metadata, parse the header, and verify the file_id binding.
+
+    Returns ``(header_bytes, encrypted_metadata, total_chunks, header)``.
+
+    Defense in depth: the URL file_id MUST match the cryptographic file_id
+    inside the header so a hostile server cannot substitute a different
+    file. Both sides are canonicalized to lowercase, hyphen-free before
+    compare (URLs are case-insensitive; Python ``str ==`` is not). (Round-3
+    H8)
+    """
+    click.echo(f"Fetching metadata for {file_id}...")
+    metadata = client.get_file_metadata(file_id)
+    header_bytes = bytes.fromhex(metadata["file_header"])
+    enc_meta = bytes.fromhex(metadata["encrypted_metadata"])
+    total_chunks = int(metadata["total_chunks"])
+
+    header = FileHeader.deserialize(header_bytes)
+    url_canon = file_id.lower().replace("-", "")
+    if header.file_id.hex() != url_canon:
+        raise CryptoError("Header file_id does not match requested file_id")
+    return header_bytes, enc_meta, total_chunks, header
 
 
 @cli.command()
@@ -355,6 +397,8 @@ def download(
     same path for an owner (self-share) and a recipient. There is no
     plaintext key cache on disk.
     """
+    from client.keymgmt import acquire_file_keys
+
     ks = _get_keystore(ctx.obj["key_file"])
     key_password = click.prompt("Key password", hide_input=True)
     ks.unlock(key_password)
@@ -363,22 +407,9 @@ def download(
     _load_session(ctx, client)
 
     try:
-        click.echo(f"Fetching metadata for {file_id}...")
-        metadata = client.get_file_metadata(file_id)
-        header_bytes = bytes.fromhex(metadata["file_header"])
-        enc_meta = bytes.fromhex(metadata["encrypted_metadata"])
-        total_chunks = int(metadata["total_chunks"])
-
-        # Parse header to get binding info for the per-recipient unwrap.
-        header = FileHeader.deserialize(header_bytes)
-        # Defense in depth: the URL file_id must match the cryptographic
-        # file_id inside the header so a hostile server can't substitute
-        # a different file. Canonicalize both to lowercase no-hyphens
-        # before compare — URLs are case-insensitive but Python str ==
-        # is not. (Round-3 H8)
-        url_canon = file_id.lower().replace("-", "")
-        if header.file_id.hex() != url_canon:
-            raise CryptoError("Header file_id does not match requested file_id")
+        header_bytes, enc_meta, total_chunks, _header = _fetch_metadata_and_header(
+            client, file_id
+        )
 
         # 2A unified acquisition: fetch + unwrap the bundle for THIS caller
         # (owner self-share or recipient share alike). The Merkle signature
@@ -386,8 +417,6 @@ def download(
         # the wrap's sender binding; _resolve_owner_pubkey honors an
         # explicit --sender-pubkey override and otherwise pins the
         # server-returned key (TOFU). One path, fail-closed.
-        from client.keymgmt import acquire_file_keys
-
         click.echo("Acquiring and unwrapping file keys...")
         file_key, meta_key = acquire_file_keys(client, ks, file_id)
         sig_pubkey = _resolve_owner_pubkey(client, file_id, sender_pubkey)
@@ -407,11 +436,8 @@ def download(
     except (StorageError, CryptoError, AuthError) as e:
         click.echo(f"Download failed: {e}", err=True)
         sys.exit(1)
-    except Exception as e:
-        click.echo(
-            f"Download failed: unexpected error ({type(e).__name__})",
-            err=True,
-        )
+    except Exception:
+        click.echo("Download failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         ks.lock()
@@ -699,20 +725,20 @@ def _discover_key_caches(key_dir: Path, extra: str | None) -> list[Path]:
     return sorted(found)
 
 
-_SAFE_FILE_ID_RE = __import__("re").compile(
-    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$"
-)
-
-
 def _validate_file_id_local(file_id: str) -> str:
     """Validate a server-supplied file_id before using it as part of
     a local filesystem name. Without this, a hostile file_id with
     path separators or ``..`` could escape the keys-cache directory.
     Returns the canonical 32-char hex form. (Round-10 M5)
+
+    Thin wrapper over the shared ``canonicalize_file_id`` (Phase 3B dedup)
+    that re-raises the shared ``ValueError`` as the client's ``CryptoError``
+    so the existing caller contract is unchanged.
     """
-    if not _SAFE_FILE_ID_RE.match(file_id):
-        raise CryptoError(f"Invalid file_id format: {file_id!r}")
-    return file_id.lower().replace("-", "")
+    try:
+        return canonicalize_file_id(file_id)
+    except ValueError as e:
+        raise CryptoError(f"Invalid file_id format: {file_id!r}") from e
 
 
 def _load_owner_key_cache(cache_path: Path) -> dict:

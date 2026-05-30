@@ -18,11 +18,13 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import tempfile
 import time
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -32,17 +34,20 @@ from server.auth import _canonicalize_username, require_auth
 from server.database import Database
 from server.policy import check_file_access, check_file_ownership
 from server.quota import check_quota, commit_usage, release_usage
-from server.state import app_state, current_identity
+from server.state import AppState, app_state, current_identity
+from server.timing import sleep_until_deadline
 from shared.crypto import blake2b_hash
 from shared.exceptions import (
     AuthError,
     QuotaExceededError,
     StorageError,
 )
+from shared.file_ids import canonicalize_file_id, is_canonical_id
 from shared.models import (
     MAX_CHUNKS_PER_FILE,
     MAX_HEADER_BYTES,
     MAX_METADATA_BYTES,
+    Visibility,
 )
 
 logger = logging.getLogger("localcloud.storage")
@@ -54,11 +59,10 @@ class ConfigurationError(StorageError):
 
 # ──────────────────────────── Constants ────────────────────────────
 
-# Strict pattern for file_id and upload_id: lowercase hex UUID (no hyphens) or UUID4
-_SAFE_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
-_SAFE_HEX_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# file_id / upload_id format + canonicalization now lives in
+# shared.file_ids (canonicalize_file_id / is_canonical_id), shared with the
+# client (Phase 3B dedup). _validate_id below wraps it to keep this module's
+# label-bearing, ValueError-raising contract.
 
 # Disallow C0 control characters and DEL in filenames at upload_init.
 # Newlines, tabs, embedded NULs and similar are never meaningful in a
@@ -70,7 +74,9 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 # distinct constant MAX_CHUNKS in shared.models). MAX_CHUNKS_PER_FILE is
 # imported above and used by its real name.
 _MAX_FILENAME_LEN = 255
-_MAX_VISIBILITY = 2
+# Largest valid visibility value, derived from the Visibility enum rather
+# than a bare ``2`` so the bound tracks the enum if a level is ever added.
+_MAX_VISIBILITY = int(Visibility.PUBLIC)
 
 # Unicode categories rejected in filenames (in addition to the C0 control
 # regex). Bidirectional override codepoints and zero-width characters are
@@ -203,12 +209,14 @@ def _validate_id(value: str, label: str = "ID") -> str:
     or DB rows for the same logical ID. (Round-10 LOW #10)
 
     Prevents path traversal by enforcing a strict allowlist format.
+
+    Thin wrapper over the shared ``canonicalize_file_id`` (Phase 3B dedup);
+    keeps the ``label``-bearing message so callers' error logs are unchanged.
     """
-    if _SAFE_ID_RE.match(value):
-        return value.replace("-", "")
-    if _SAFE_HEX_ID_RE.match(value):
-        return value
-    raise ValueError(f"Invalid {label} format")
+    try:
+        return canonicalize_file_id(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label} format") from exc
 
 
 def _safe_path(base_dir: str, *components: str) -> str:
@@ -370,93 +378,34 @@ async def upload_init():
     return jsonify({"upload_id": upload_id}), 201
 
 
-@storage_bp.route("/upload/<upload_id>/chunk/<int:chunk_index>", methods=["POST"])
-@require_auth
-async def upload_chunk(upload_id: str, chunk_index: int):
-    """Upload a single encrypted chunk.
+async def _persist_staged_chunk(
+    state: AppState,
+    *,
+    upload_id: str,
+    chunk_index: int,
+    owner_id: str,
+    chunk_data: bytes,
+):
+    """Write a validated chunk to staging, gated transactionally on quota.
 
-    Request body: raw ciphertext bytes (Content-Type: application/octet-stream)
-    Response: {"chunk_hash": str}
+    Two phases, unchanged from the original handler:
+
+    * Phase 1 writes the bytes to disk OUTSIDE the DB lock (so concurrent
+      uploads don't serialize on disk I/O). ``_write_file_bytes`` is itself
+      atomic (tempfile + fsync + replace).
+    * Phase 2 does a transactional check-and-insert; if the per-user quota
+      (or the staging cap) is blown, the just-written chunk is removed.
+      Gating the quota check inside the same transaction as the insert is
+      what makes two parallel uploads from one user unable to both pass a
+      snapshot check and then both overshoot (Round-2 H2/H3).
+
+    Returns the final response tuple (200 with the chunk hash, or a 4xx/5xx
+    error).
     """
-    state = app_state()
-    identity = current_identity()
-
-    # Validate IDs
-    try:
-        upload_id = _validate_id(upload_id, "upload_id")
-    except ValueError:
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Enforce content-type (#11)
-    content_type = request.content_type or ""
-    if not content_type.startswith("application/octet-stream"):
-        return jsonify({"error": "Invalid content type"}), 415
-
-    # Validate chunk_index range (#17)
-    if chunk_index < 0 or chunk_index >= MAX_CHUNKS_PER_FILE:
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Verify upload exists and belongs to this user
-    upload = await asyncio.to_thread(state.db.get_staging_upload, upload_id)
-    if upload is None or upload["owner_id"] != identity.user_id:
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Refuse new chunks once finalize has claimed this upload (#H19).
-    # Without this, a slow chunk write could rename into the just-
-    # renamed-away staging dir under the wrong path, or — worse —
-    # land inside `<blob_dir>/<file_id>/N.bin` and clobber a
-    # legitimate chunk in the finalized file. (Round-3 H3)
-    if upload.get("finalizing", 0):
-        return jsonify({"error": "Upload finalizing"}), 410
-
-    # Reject chunk_index >= expected_chunks so an attacker can't write
-    # 100k tiny chunks to arbitrary indices for a 3-chunk upload
-    # (inode-exhaustion + per-row DB cost). (Round-3 M6)
-    expected_chunks = upload.get("expected_chunks")
-    if expected_chunks is not None and chunk_index >= expected_chunks:
-        return jsonify({"error": "Invalid request"}), 400
-
-    # #5: Enforce upload expiry at request time
-    if time.time() > upload["expires_at"]:
-        return jsonify({"error": "Upload expired"}), 410
-
-    # Read chunk data
-    # quart's Request.get_data is annotated `-> str | bytes` with no
-    # @overload on `as_text`, so the type checker can't narrow on the
-    # literal. With as_text=False the runtime contract is always bytes;
-    # cast is a no-op at runtime and documents that invariant for the
-    # downstream blake2b_hash / _write_file_bytes calls (both want bytes).
-    chunk_data = cast(bytes, await request.get_data(as_text=False))
-    if not chunk_data:
-        return jsonify({"error": "Empty chunk"}), 400
-
-    if len(chunk_data) > state.max_chunk_size:
-        return jsonify({"error": "Chunk too large"}), 413
-
-    # Medium: minimum chunk size for all but the last chunk. The last
-    # chunk's size is determined by file length so it may be smaller.
-    # `expected_chunks` was looked up above; we re-use that binding.
-    if (
-        expected_chunks is not None
-        and chunk_index < expected_chunks - 1
-        and len(chunk_data) < MIN_CHUNK_SIZE
-    ):
-        return jsonify({"error": "Chunk too small"}), 400
-
-    # Per-user quota gating happens transactionally with the chunk
-    # insert so two parallel uploads from the same user cannot both
-    # pass the snapshot check and then both write their chunks past
-    # the limit. Previously this was acknowledged as a "coarse DoS
-    # bound"; README §4.2 actually mandates atomic quota accounting,
-    # so we tighten it here. (Round-2 H2/H3)
     new_chunk_size = len(chunk_data)
     chunk_hash = blake2b_hash(chunk_data).hex()
     chunk_path = _safe_path(state.staging_dir, upload_id, f"{chunk_index}.bin")
 
-    # Phase 1: write to disk OUTSIDE the DB lock so concurrent uploads
-    # don't serialize on disk I/O. _write_file_bytes is itself atomic
-    # (tempfile + fsync + replace) so a crash mid-write doesn't leave
-    # a half-written chunk with a recorded hash.
     try:
         await asyncio.to_thread(_write_file_bytes, chunk_path, chunk_data)
     except OSError as exc:
@@ -468,12 +417,10 @@ async def upload_chunk(upload_id: str, chunk_index: int):
         )
         return jsonify({"error": "Upload failed"}), 500
 
-    # Phase 2: transactional check-and-insert. If quota is blown,
-    # remove the just-written chunk from disk.
     def _check_and_insert() -> tuple[bool, str]:
         with state.db.transaction():
-            used, quota = state.db.get_user_usage(identity.user_id)
-            staging = state.db.get_total_staging_bytes(identity.user_id)
+            used, quota = state.db.get_user_usage(owner_id)
+            staging = state.db.get_total_staging_bytes(owner_id)
             if used + staging + new_chunk_size > quota:
                 return False, "Quota exceeded"
             if staging + new_chunk_size > MAX_STAGING_BYTES_PER_USER:
@@ -496,25 +443,352 @@ async def upload_chunk(upload_id: str, chunk_index: int):
     return jsonify({"chunk_hash": chunk_hash}), 200
 
 
+@storage_bp.route("/upload/<upload_id>/chunk/<int:chunk_index>", methods=["POST"])
+@require_auth
+async def upload_chunk(upload_id: str, chunk_index: int):
+    """Upload a single encrypted chunk.
+
+    Request body: raw ciphertext bytes (Content-Type: application/octet-stream)
+    Response: {"chunk_hash": str}
+    """
+    state = app_state()
+    identity = current_identity()
+
+    try:
+        upload_id = _validate_id(upload_id, "upload_id")
+    except ValueError:
+        return jsonify({"error": "Invalid request"}), 400
+
+    # Enforce content-type (#11).
+    content_type = request.content_type or ""
+    if not content_type.startswith("application/octet-stream"):
+        return jsonify({"error": "Invalid content type"}), 415
+
+    # Validate chunk_index range (#17).
+    if chunk_index < 0 or chunk_index >= MAX_CHUNKS_PER_FILE:
+        return jsonify({"error": "Invalid request"}), 400
+
+    upload = await asyncio.to_thread(state.db.get_staging_upload, upload_id)
+    if upload is None or upload["owner_id"] != identity.user_id:
+        return jsonify({"error": "Invalid request"}), 400
+
+    # Refuse new chunks once finalize has claimed this upload (#H19).
+    # Without this, a slow chunk write could rename into the just-
+    # renamed-away staging dir under the wrong path, or — worse — land
+    # inside `<blob_dir>/<file_id>/N.bin` and clobber a legitimate chunk
+    # in the finalized file. (Round-3 H3)
+    if upload.get("finalizing", 0):
+        return jsonify({"error": "Upload finalizing"}), 410
+
+    # Reject chunk_index >= expected_chunks so an attacker can't write
+    # 100k tiny chunks to arbitrary indices for a 3-chunk upload
+    # (inode-exhaustion + per-row DB cost). (Round-3 M6)
+    expected_chunks = upload.get("expected_chunks")
+    if expected_chunks is not None and chunk_index >= expected_chunks:
+        return jsonify({"error": "Invalid request"}), 400
+
+    # #5: Enforce upload expiry at request time.
+    if time.time() > upload["expires_at"]:
+        return jsonify({"error": "Upload expired"}), 410
+
+    # quart's Request.get_data is annotated `-> str | bytes` with no
+    # @overload on `as_text`, so the type checker can't narrow on the
+    # literal. With as_text=False the runtime contract is always bytes;
+    # cast is a no-op at runtime and documents that invariant for the
+    # downstream blake2b_hash / _write_file_bytes calls (both want bytes).
+    chunk_data = cast(bytes, await request.get_data(as_text=False))
+    if not chunk_data:
+        return jsonify({"error": "Empty chunk"}), 400
+    if len(chunk_data) > state.max_chunk_size:
+        return jsonify({"error": "Chunk too large"}), 413
+
+    # Minimum chunk size for all but the last chunk. The last chunk's size
+    # is determined by file length so it may be smaller.
+    if (
+        expected_chunks is not None
+        and chunk_index < expected_chunks - 1
+        and len(chunk_data) < MIN_CHUNK_SIZE
+    ):
+        return jsonify({"error": "Chunk too small"}), 400
+
+    return await _persist_staged_chunk(
+        state,
+        upload_id=upload_id,
+        chunk_index=chunk_index,
+        owner_id=identity.user_id,
+        chunk_data=chunk_data,
+    )
+
+
+@dataclass(frozen=True)
+class _FinalizeRequest:
+    """Validated finalize-request fields (server-trusted after parsing).
+
+    ``expected_hashes`` is the RAW value from the body (possibly ``None`` or
+    a non-list): its presence/type/length are checked post-claim inside
+    ``_verify_staged_chunks`` so a malformed list still triggers the same
+    ``_cleanup_staging`` path the original handler used (preserving DB state
+    on that branch).
+    """
+
+    file_id: str
+    total_chunks: int
+    visibility: int
+    file_header: bytes
+    encrypted_metadata: bytes
+    expected_hashes: object
+
+
+def _validate_finalize_request(
+    data: dict, expected_chunks: int | None
+) -> _FinalizeRequest | None:
+    """Strictly parse + range-check the finalize JSON body.
+
+    Returns the validated request, or ``None`` if any field is missing,
+    mistyped, or out of range — the caller maps ``None`` to a uniform 400.
+    Pure (no I/O, no staging cleanup): cleanup only applies AFTER the
+    finalizing claim, so this stays side-effect free.
+
+    Strict ``isinstance`` checks (rejecting bool-as-int, int-as-str, etc.)
+    are preserved from the original handler. (Round-3 H4 / H5)
+    """
+    raw_file_id = data.get("file_id")
+    if not isinstance(raw_file_id, str):
+        return None
+    try:
+        file_id = _validate_id(raw_file_id, "file_id")
+    except ValueError:
+        return None
+
+    raw_total_chunks = data.get("total_chunks")
+    if not isinstance(raw_total_chunks, int) or isinstance(raw_total_chunks, bool):
+        return None
+    total_chunks = raw_total_chunks
+    if total_chunks < 1 or total_chunks > MAX_CHUNKS_PER_FILE:
+        return None
+
+    raw_visibility = data.get("visibility", int(Visibility.PRIVATE))
+    if not isinstance(raw_visibility, int) or isinstance(raw_visibility, bool):
+        return None
+    visibility = raw_visibility
+    if visibility < int(Visibility.PRIVATE) or visibility > _MAX_VISIBILITY:
+        return None
+
+    try:
+        file_header = bytes.fromhex(data.get("file_header", ""))
+        encrypted_metadata = bytes.fromhex(data.get("encrypted_metadata", ""))
+    except (ValueError, TypeError):
+        return None
+    if not file_header or not encrypted_metadata:
+        return None
+
+    # Per-field size caps. MAX_CONTENT_LENGTH (5 MiB) bounds the whole
+    # request, but without per-field caps an attacker could store a
+    # 2.5 MiB file_header + 2.5 MiB encrypted_metadata BLOB in the DB.
+    # The wire-format contract is MAX_HEADER_BYTES=4096 and
+    # MAX_METADATA_BYTES=65536. (Round-4 H1)
+    if len(file_header) > MAX_HEADER_BYTES:
+        return None
+    if len(encrypted_metadata) > MAX_METADATA_BYTES:
+        return None
+
+    if expected_chunks is not None and total_chunks != expected_chunks:
+        return None
+
+    # expected_hashes is intentionally NOT validated here — it is checked
+    # post-claim in _verify_staged_chunks so its failure path runs the same
+    # _cleanup_staging the original handler did.
+    return _FinalizeRequest(
+        file_id=file_id,
+        total_chunks=total_chunks,
+        visibility=visibility,
+        file_header=file_header,
+        encrypted_metadata=encrypted_metadata,
+        expected_hashes=data.get("expected_hashes"),
+    )
+
+
+def _verify_staged_chunks(staged_chunks: list, req: _FinalizeRequest) -> bool:
+    """Verify staged chunks match the finalize request, in the exact order.
+
+    Checks, in the SAME order as the original handler: chunk count,
+    contiguous indices 0..N-1, ``expected_hashes`` present + a list of the
+    right length, then a per-chunk constant-time hash compare. Returns
+    ``True`` iff every gate passes; the caller is responsible for
+    ``_cleanup_staging`` + 400 on ``False`` (no cleanup here, so the side
+    effect stays at the single call site).
+
+    The per-chunk compare uses ``hmac.compare_digest``: the hashes are
+    public to both ends so a naive ``!=`` is not catastrophic, but
+    compare_digest closes a latent timing channel that could probe a
+    known-plaintext exfiltration in a hostile-client scenario.
+    """
+    if len(staged_chunks) != req.total_chunks:
+        return False
+    chunk_indices = {c["chunk_index"] for c in staged_chunks}
+    if chunk_indices != set(range(req.total_chunks)):
+        return False
+
+    expected_hashes = req.expected_hashes
+    if not expected_hashes or not isinstance(expected_hashes, list):
+        return False
+    if len(expected_hashes) != req.total_chunks:
+        return False
+
+    for chunk, expected in zip(staged_chunks, expected_hashes, strict=True):
+        if not isinstance(expected, str) or len(expected) != len(chunk["chunk_hash"]):
+            return False
+        if not hmac.compare_digest(chunk["chunk_hash"], expected):
+            return False
+    return True
+
+
+def _commit_finalized_blob(
+    state: AppState,
+    *,
+    upload_id: str,
+    owner_id: str,
+    filename: str,
+    req: _FinalizeRequest,
+    total_bytes: int,
+) -> None:
+    """Atomically promote staging→blob and commit the DB row (one txn).
+
+    Phase 1 is a single atomic directory rename (``os.rename`` refuses to
+    clobber a non-empty destination, so a file_id collision fails before
+    touching the existing blob). Phase 2 does create_file + commit_usage +
+    the staging-row delete in ONE transaction so a crash anywhere between
+    them leaves the DB consistent (Round-3 H2). On any DB failure the
+    rename is rolled back; a failed rollback is logged as an orphan blob.
+
+    Raises:
+        QuotaExceededError: caller maps to 413.
+        StorageError: file_id collision; caller maps to 409.
+        Exception: any other failure; caller maps to 500.
+    """
+    blob_path = _safe_path(state.blob_dir, req.file_id)
+    src_dir = _safe_path(state.staging_dir, upload_id)
+
+    # Phase 1: atomic directory rename.
+    try:
+        os.rename(src_dir, blob_path)
+    except FileExistsError as exc:
+        raise StorageError("file_id collision") from exc
+    except OSError as exc:
+        # Linux returns ENOTEMPTY for rename-onto-existing-non-empty
+        # directory, surfaced as OSError; treat both as collision.
+        if exc.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.EXDEV):
+            raise StorageError("file_id collision") from exc
+        raise
+
+    # Phase 2: DB commit.
+    try:
+        with state.db.transaction() as _conn:
+            check_quota(state.db, owner_id, total_bytes)
+            state.db.create_file(
+                file_id=req.file_id,
+                owner_id=owner_id,
+                filename=filename,
+                visibility=req.visibility,
+                total_chunks=req.total_chunks,
+                total_bytes=total_bytes,
+                encrypted_metadata=req.encrypted_metadata,
+                file_header=req.file_header,
+            )
+            commit_usage(state.db, owner_id, total_bytes)
+            _conn.execute(
+                "DELETE FROM staging_uploads WHERE upload_id = ?",
+                (upload_id,),
+            )
+    except Exception:
+        # Undo the rename: move blob_path back. If THIS fails we have a
+        # real orphan — log it loudly.
+        try:
+            os.rename(blob_path, src_dir)
+        except OSError:
+            logger.error(
+                "ORPHAN BLOB: rolled-back finalize left "
+                "blob_path=%s with no DB record",
+                blob_path,
+            )
+        raise
+
+
+async def _claim_finalizing(state: AppState, upload_id: str) -> bool | None:
+    """Atomically claim the staging row for finalize (wire H19 protection).
+
+    Until this transaction commits, the background cleanup task cannot
+    delete the staging row out from under us. The ``finalizing = 1`` flag
+    remains set if a later step fails; ``_cleanup_staging`` deletes by
+    upload_id regardless of the flag so a failed finalize still releases
+    the row.
+
+    Returns the claim outcome (``True`` claimed / ``False`` lost the race),
+    or ``None`` if the claim transaction itself errored (caller maps to 500).
+    """
+
+    def _claim() -> bool:
+        with state.db.transaction():
+            return state.db.mark_upload_finalizing(upload_id)
+
+    try:
+        return await asyncio.to_thread(_claim)
+    except Exception:
+        logger.exception("Failed to claim staging upload for finalize")
+        return None
+
+
+async def _run_finalize_commit(
+    state: AppState,
+    *,
+    upload_id: str,
+    owner_id: str,
+    filename: str,
+    req: _FinalizeRequest,
+    total_bytes: int,
+):
+    """Run the commit in a worker thread and map outcomes to a response.
+
+    Returns the success ``{"file_id": ...}`` 201 tuple, or the mapped
+    error tuple (413 quota / 409 collision / 500 unexpected) — identical to
+    the original inline handling.
+    """
+    try:
+        await asyncio.to_thread(
+            _commit_finalized_blob,
+            state,
+            upload_id=upload_id,
+            owner_id=owner_id,
+            filename=filename,
+            req=req,
+            total_bytes=total_bytes,
+        )
+    except QuotaExceededError:
+        return jsonify({"error": "Quota exceeded"}), 413
+    except StorageError as exc:
+        # Known collision — surfaced as 409.
+        logger.info("Finalize rejected: %s (upload_id=%s)", exc, upload_id)
+        return jsonify({"error": "Invalid request"}), 409
+    except Exception:
+        logger.exception(
+            "Finalize failed for upload_id=%s file_id=%s", upload_id, req.file_id
+        )
+        return jsonify({"error": "Upload failed"}), 500
+    return jsonify({"file_id": req.file_id}), 201
+
+
 @storage_bp.route("/upload/<upload_id>/finalize", methods=["POST"])
 @require_auth
 async def upload_finalize(upload_id: str):
     """Finalize an upload: verify integrity, check quota, commit.
 
-    Request: {
-        "file_id": str,
-        "total_chunks": int,
-        "file_header": str (hex),
-        "encrypted_metadata": str (hex),
-        "visibility": int,
-        "expected_hashes": [str]
-    }
-    Response: {"file_id": str} on success
+    Request: {file_id, total_chunks, file_header (hex),
+    encrypted_metadata (hex), visibility, expected_hashes: [str]}.
+    Response: {"file_id": str} on success.
     """
     state = app_state()
     identity = current_identity()
 
-    # Validate upload_id
     try:
         upload_id = _validate_id(upload_id, "upload_id")
     except ValueError:
@@ -524,205 +798,43 @@ async def upload_finalize(upload_id: str):
     if not data:
         return jsonify({"error": "Invalid request"}), 400
 
-    # Verify upload exists and belongs to this user
     upload = await asyncio.to_thread(state.db.get_staging_upload, upload_id)
     if upload is None or upload["owner_id"] != identity.user_id:
         return jsonify({"error": "Invalid request"}), 400
 
-    # #5: Enforce upload expiry at request time
+    # #5: Enforce upload expiry at request time.
     if time.time() > upload["expires_at"]:
         await asyncio.to_thread(_cleanup_staging, upload_id)
         return jsonify({"error": "Upload expired"}), 410
 
-    # Strict type-check each field rather than relying on int()/str()
-    # coercion (which would accept ints-as-strings, bools-as-ints,
-    # etc.). (Round-3 H4 / H5)
-    raw_file_id = data.get("file_id")
-    if not isinstance(raw_file_id, str):
-        return jsonify({"error": "Invalid request"}), 400
-    file_id = raw_file_id
-    try:
-        file_id = _validate_id(file_id, "file_id")
-    except ValueError:
+    req = _validate_finalize_request(data, upload["expected_chunks"])
+    if req is None:
         return jsonify({"error": "Invalid request"}), 400
 
-    raw_total_chunks = data.get("total_chunks")
-    if not isinstance(raw_total_chunks, int) or isinstance(raw_total_chunks, bool):
-        return jsonify({"error": "Invalid request"}), 400
-    total_chunks = raw_total_chunks
-    if total_chunks < 1 or total_chunks > MAX_CHUNKS_PER_FILE:
-        return jsonify({"error": "Invalid request"}), 400
-
-    raw_visibility = data.get("visibility", 0)
-    if not isinstance(raw_visibility, int) or isinstance(raw_visibility, bool):
-        return jsonify({"error": "Invalid request"}), 400
-    visibility = raw_visibility
-    if visibility < 0 or visibility > _MAX_VISIBILITY:
-        return jsonify({"error": "Invalid request"}), 400
-
-    try:
-        file_header = bytes.fromhex(data.get("file_header", ""))
-        encrypted_metadata = bytes.fromhex(data.get("encrypted_metadata", ""))
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid request"}), 400
-
-    if not file_header or not encrypted_metadata:
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Per-field size caps. MAX_CONTENT_LENGTH (5 MiB) bounds the whole
-    # request, but without per-field caps an attacker could store a
-    # 2.5 MiB file_header + 2.5 MiB encrypted_metadata BLOB in the DB.
-    # The wire-format contract is MAX_HEADER_BYTES=4096 and
-    # MAX_METADATA_BYTES=65536. (Round-4 H1)
-    if len(file_header) > MAX_HEADER_BYTES:
-        return jsonify({"error": "Invalid request"}), 400
-    if len(encrypted_metadata) > MAX_METADATA_BYTES:
-        return jsonify({"error": "Invalid request"}), 400
-
-    if (
-        upload["expected_chunks"] is not None
-        and total_chunks != upload["expected_chunks"]
-    ):
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Claim the staging row before reading chunks — wire H19 protection
-    # that was previously dead code. Until this transaction commits, the
-    # background cleanup task cannot delete the staging row out from under
-    # us. The `finalizing = 1` flag remains set if we fail; _cleanup_staging
-    # deletes by upload_id regardless of the flag so a failed finalize
-    # still releases the row.
-    def _claim_finalizing() -> bool:
-        with state.db.transaction():
-            return state.db.mark_upload_finalizing(upload_id)
-
-    try:
-        claimed = await asyncio.to_thread(_claim_finalizing)
-    except Exception:
-        logger.exception("Failed to claim staging upload for finalize")
+    claimed = await _claim_finalizing(state, upload_id)
+    if claimed is None:
         return jsonify({"error": "Upload failed"}), 500
     if not claimed:
-        # Already finalizing in another request, or row was deleted by
-        # an earlier expiry sweep that won the race.
+        # Already finalizing in another request, or row was deleted by an
+        # earlier expiry sweep that won the race.
         return jsonify({"error": "Upload expired"}), 410
 
-    # Verify chunk count matches
     staged_chunks = await asyncio.to_thread(state.db.get_staging_chunks, upload_id)
-    if len(staged_chunks) != total_chunks:
+    if not _verify_staged_chunks(staged_chunks, req):
         await asyncio.to_thread(_cleanup_staging, upload_id)
         return jsonify({"error": "Invalid request"}), 400
-
-    # Verify chunk indices are contiguous 0..total_chunks-1
-    chunk_indices = {c["chunk_index"] for c in staged_chunks}
-    if chunk_indices != set(range(total_chunks)):
-        await asyncio.to_thread(_cleanup_staging, upload_id)
-        return jsonify({"error": "Invalid request"}), 400
-
-    expected_hashes = data.get("expected_hashes")
-    if not expected_hashes or not isinstance(expected_hashes, list):
-        await asyncio.to_thread(_cleanup_staging, upload_id)
-        return jsonify({"error": "Invalid request"}), 400
-
-    if len(expected_hashes) != total_chunks:
-        await asyncio.to_thread(_cleanup_staging, upload_id)
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Constant-time per-chunk hash comparison. The hashes are public to
-    # both ends so a naive `!=` is not catastrophic — but using
-    # compare_digest closes a latent timing channel that could probe a
-    # known-plaintext exfiltration in a hostile-client scenario.
-    for chunk, expected in zip(staged_chunks, expected_hashes, strict=True):
-        if not isinstance(expected, str) or len(expected) != len(chunk["chunk_hash"]):
-            await asyncio.to_thread(_cleanup_staging, upload_id)
-            return jsonify({"error": "Invalid request"}), 400
-        if not hmac.compare_digest(chunk["chunk_hash"], expected):
-            await asyncio.to_thread(_cleanup_staging, upload_id)
-            return jsonify({"error": "Invalid request"}), 400
-
-    # Atomic-commit finalize using directory rename.
-    #
-    # The staging directory has filename `<upload_id>` and holds all
-    # chunks indexed by `<i>.bin`. The blob directory will be
-    # `<file_id>`. Since blob_dir and staging_dir are required to be on
-    # the same filesystem (asserted in init_storage), renaming the whole
-    # directory is a single atomic FS operation — replacing the per-
-    # chunk move loop, which left partial state on crash or partial-
-    # write failure.
-    blob_path = _safe_path(state.blob_dir, file_id)
-    src_dir = _safe_path(state.staging_dir, upload_id)
 
     total_bytes = sum(c["chunk_size"] for c in staged_chunks)
-    total_bytes += len(encrypted_metadata) + len(file_header)
+    total_bytes += len(req.encrypted_metadata) + len(req.file_header)
 
-    def _commit_finalize():
-        # Phase 1: atomic directory rename. os.rename refuses to clobber
-        # an existing directory destination (errno=ENOTEMPTY/EEXIST on
-        # Linux), so a file_id collision fails here without ever touching
-        # the existing blob.
-        try:
-            os.rename(src_dir, blob_path)
-        except FileExistsError as exc:
-            raise StorageError("file_id collision") from exc
-        except OSError as exc:
-            # Linux returns ENOTEMPTY for rename-onto-existing-non-empty
-            # directory, surfaced as OSError; treat both as collision.
-            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.EXDEV):
-                raise StorageError("file_id collision") from exc
-            raise
-
-        # Phase 2: DB commit. We do create_file + commit_usage + the
-        # staging-row delete in ONE transaction so a crash anywhere
-        # in between leaves the DB consistent. Previously
-        # delete_staging_upload was outside the transaction, leaving
-        # a finalizing=1 row wedged for 1 hour if anything went wrong
-        # between commit and that call. (Round-3 H2)
-        try:
-            with state.db.transaction() as _conn:
-                check_quota(state.db, identity.user_id, total_bytes)
-                state.db.create_file(
-                    file_id=file_id,
-                    owner_id=identity.user_id,
-                    filename=upload["filename"],
-                    visibility=visibility,
-                    total_chunks=total_chunks,
-                    total_bytes=total_bytes,
-                    encrypted_metadata=encrypted_metadata,
-                    file_header=file_header,
-                )
-                commit_usage(state.db, identity.user_id, total_bytes)
-                _conn.execute(
-                    "DELETE FROM staging_uploads WHERE upload_id = ?",
-                    (upload_id,),
-                )
-        except Exception:
-            # Undo the rename: move blob_path back. If THIS fails we
-            # have a real orphan — log it loudly.
-            try:
-                os.rename(blob_path, src_dir)
-            except OSError:
-                logger.error(
-                    "ORPHAN BLOB: rolled-back finalize left "
-                    "blob_path=%s with no DB record",
-                    blob_path,
-                )
-            raise
-
-    try:
-        await asyncio.to_thread(_commit_finalize)
-    except QuotaExceededError:
-        return jsonify({"error": "Quota exceeded"}), 413
-    except StorageError as exc:
-        # Known collision — surfaced as 409.
-        logger.info("Finalize rejected: %s (upload_id=%s)", exc, upload_id)
-        return jsonify({"error": "Invalid request"}), 409
-    except Exception:
-        logger.exception(
-            "Finalize failed for upload_id=%s file_id=%s",
-            upload_id,
-            file_id,
-        )
-        return jsonify({"error": "Upload failed"}), 500
-
-    return jsonify({"file_id": file_id}), 201
+    return await _run_finalize_commit(
+        state,
+        upload_id=upload_id,
+        owner_id=identity.user_id,
+        filename=upload["filename"],
+        req=req,
+        total_bytes=total_bytes,
+    )
 
 
 # ──────────────────────────── Download API ────────────────────────────
@@ -987,6 +1099,142 @@ async def list_files():
 # ──────────────────────────── Sharing ────────────────────────────
 
 
+def _timing_dummy_write(conn: sqlite3.Connection, file_id: str, user_id: str) -> None:
+    """Idempotent no-op write matching the real share/unshare tx shape.
+
+    The "no real recipient" branch of the timing-equalized share/unshare
+    endpoints must still take Database._lock + the SQLite reserved lock and
+    commit a WAL frame, so its latency matches the real branch. ``SET col =
+    col`` is NOT short-circuited by SQLite (verified empirically — it still
+    emits a WAL frame), so these two updates against the same hot rows give
+    the dummy path the same lock + fsync cost. The constant-deadline sleep
+    at the call site caps the remaining sub-millisecond variance. (Round-7
+    H1/H2)
+    """
+    conn.execute("UPDATE files SET file_id = file_id WHERE file_id = ?", (file_id,))
+    conn.execute("UPDATE users SET user_id = user_id WHERE user_id = ?", (user_id,))
+
+
+def _apply_share(
+    state: AppState,
+    *,
+    file_id: str,
+    caller_id: str,
+    target_user: dict | None,
+    wrapped_keys: bytes,
+) -> None:
+    """Add the share row (or run equivalent dummy work) in ONE write tx.
+
+    Three mutually-exclusive cases, all entering an identical-shape write
+    transaction so the timing-equalized endpoint cannot leak which one ran:
+
+    * Real share (an existing OTHER user): insert the wrapped-keys row and
+      promote PRIVATE→SHARED.
+    * Self-share (target IS the caller) — an EXPLICIT success no-op: the
+      owner already has access, so we never write a self share-row here
+      (the dedicated POST /self_keys path owns owner bundles). We still run
+      the dummy write so a self-share is timing-indistinguishable from an
+      unknown target. (SEC-L1)
+    * Unknown / non-canonicalizable target (``target_user is None``): dummy
+      write only.
+
+    Both blank branches contend on Database._lock + the SQLite reserved
+    lock and commit a WAL frame identically to the real branch.
+    """
+    # Real share only for an existing user that is NOT the caller; a
+    # self-share falls through to the dummy write (explicit no-op).
+    real_target = (
+        target_user
+        if target_user is not None and target_user["user_id"] != caller_id
+        else None
+    )
+
+    with state.db.transaction() as conn:
+        if real_target is not None:
+            state.db.add_file_share(
+                file_id=file_id,
+                shared_with_id=real_target["user_id"],
+                wrapped_keys=wrapped_keys,
+            )
+            # Promote PRIVATE -> SHARED; MAX keeps PUBLIC unchanged.
+            conn.execute(
+                "UPDATE files SET visibility = MAX(visibility, ?) "
+                "WHERE file_id = ? AND visibility = ?",
+                (int(Visibility.SHARED), file_id, int(Visibility.PRIVATE)),
+            )
+        else:
+            # Self-share no-op OR unknown target: equivalent dummy write.
+            _timing_dummy_write(conn, file_id, caller_id)
+
+
+def _apply_unshare(
+    state: AppState,
+    *,
+    file_id: str,
+    caller_id: str,
+    target_user: dict | None,
+) -> None:
+    """Remove a share row (or run equivalent dummy work) in ONE write tx.
+
+    Real branch (existing target user): delete the wrapped-keys row and, if
+    no shares remain and the file isn't PUBLIC, downgrade SHARED→PRIVATE so
+    the server access policy matches the absence of share rows. Unknown /
+    non-canonicalizable target: an equivalent dummy write that contends on
+    the same locks and commits a WAL frame, so timing does not leak
+    existence. (Round-7 H1/H2)
+    """
+    with state.db.transaction() as conn:
+        if target_user is not None:
+            state.db.remove_file_share(
+                file_id=file_id,
+                shared_with_id=target_user["user_id"],
+            )
+            remaining_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM file_shares WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            if remaining_row and remaining_row["cnt"] == 0:
+                # Downgrade SHARED -> PRIVATE only (PUBLIC is left as-is).
+                conn.execute(
+                    "UPDATE files SET visibility = ? "
+                    "WHERE file_id = ? AND visibility = ?",
+                    (int(Visibility.PRIVATE), file_id, int(Visibility.SHARED)),
+                )
+        else:
+            _timing_dummy_write(conn, file_id, caller_id)
+
+
+def _parse_share_body(data) -> tuple[str | None, bytes] | None:
+    """Validate the /share JSON body; return (canonical_target, wrapped_keys).
+
+    Returns ``None`` for a structurally invalid body (caller maps to 400).
+    The canonical target is ``None`` when the username fails to canonicalize
+    — a VALID body whose target simply doesn't resolve, which the caller
+    routes through the uniform timing-equalized dummy path (no 400, no
+    enumeration). Canonicalizing here lets a share aimed at "Alice" or
+    fullwidth "ＡＬＩＣＥ" land on the canonical "alice" row. (Round-4 H2)
+    """
+    if not data or "shared_with" not in data or "wrapped_keys" not in data:
+        return None
+    raw_target = data["shared_with"]
+    if not isinstance(raw_target, str):
+        return None
+    if not raw_target or len(raw_target) > MAX_USERNAME_LEN:
+        return None
+    try:
+        target_username: str | None = _canonicalize_username(raw_target)
+    except AuthError:
+        target_username = None
+
+    try:
+        wrapped_keys = bytes.fromhex(data["wrapped_keys"])
+    except (ValueError, TypeError):
+        return None
+    if not (MIN_WRAPPED_KEYS_BYTES <= len(wrapped_keys) <= MAX_WRAPPED_KEYS_BYTES):
+        return None
+    return target_username, wrapped_keys
+
+
 @storage_bp.route("/<file_id>/share", methods=["POST"])
 @require_auth
 async def share_file(file_id: str):
@@ -1013,104 +1261,40 @@ async def share_file(file_id: str):
     except AuthError:
         return jsonify({"error": "Not found"}), 404
 
-    data = await request.get_json(silent=True)
-    if not data or "shared_with" not in data or "wrapped_keys" not in data:
+    parsed = _parse_share_body(await request.get_json(silent=True))
+    if parsed is None:
         return jsonify({"error": "Invalid request"}), 400
+    target_username, wrapped_keys = parsed
 
-    raw_target = data["shared_with"]
-    if not isinstance(raw_target, str):
-        return jsonify({"error": "Invalid request"}), 400
-    if not raw_target or len(raw_target) > MAX_USERNAME_LEN:
-        return jsonify({"error": "Invalid request"}), 400
-    # Canonicalize the target so a share targeted at "Alice" or
-    # fullwidth "ＡＬＩＣＥ" lands on the same row as the canonical
-    # "alice". Otherwise the operator could see a 200 status but the
-    # DB lookup would silently miss (and the dummy timing path would
-    # run), giving a false success signal. (Round-4 H2)
-    try:
-        target_username = _canonicalize_username(raw_target)
-    except Exception:
-        # Canonicalize raised — treat as not-found (uniform timing-
-        # equalized path).
-        target_username = None
-
-    try:
-        wrapped_keys = bytes.fromhex(data["wrapped_keys"])
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid request"}), 400
-    if not (MIN_WRAPPED_KEYS_BYTES <= len(wrapped_keys) <= MAX_WRAPPED_KEYS_BYTES):
-        return jsonify({"error": "Invalid request"}), 400
-
-    # Start the timing budget BEFORE the username lookup so its latency
-    # is also inside the constant-deadline envelope. The user-row fetch
-    # touches BLOB columns (ed25519_pubkey, password_hash) for existing
-    # users vs an empty index probe for unknown users — otherwise that
-    # delta leaks outside the budget. (Round-7 M3)
+    # Start the timing budget BEFORE the username lookup so its latency is
+    # also inside the constant-deadline envelope. The user-row fetch touches
+    # BLOB columns (ed25519_pubkey, password_hash) for existing users vs an
+    # empty index probe for unknown users — otherwise that delta leaks
+    # outside the budget. (Round-7 M3)
     started = time.monotonic()
 
-    # Look up target — but if missing, run an EQUIVALENT amount of DB
-    # work in the same shape (BEGIN IMMEDIATE + write tx + lock-take)
-    # so an attacker can't enumerate via lock contention or fsync tail.
-    # (Round-7 H1/H2)
+    # Look up target — if missing, _apply_share runs an EQUIVALENT amount of
+    # DB work in the same shape so an attacker can't enumerate via lock
+    # contention or fsync tail. (Round-7 H1/H2)
     target_user = (
         await asyncio.to_thread(state.db.get_user_by_username, target_username)
         if target_username is not None
         else None
     )
-    is_self_share = (
-        target_user is not None and target_user["user_id"] == identity.user_id
+
+    await asyncio.to_thread(
+        _apply_share,
+        state,
+        file_id=file_id,
+        caller_id=identity.user_id,
+        target_user=target_user,
+        wrapped_keys=wrapped_keys,
     )
-    do_real_work = target_user is not None and not is_self_share
-    # Snapshot the share target's id while the None-narrowing is visible
-    # to the type checker; the closure below only reads it on the
-    # do_real_work branch (which implies target_user is not None).
-    target_user_id = target_user["user_id"] if target_user is not None else ""
-
-    def _db_share_or_dummy():
-        # Both branches enter a write transaction so they contend on
-        # Database._lock + SQLite reserved-lock identically, AND both
-        # commit a WAL frame so fsync tail latency hits both alike.
-        # The constant-deadline sleep at the end caps any residual
-        # variance.
-        with state.db.transaction() as conn:
-            if do_real_work:
-                state.db.add_file_share(
-                    file_id=file_id,
-                    shared_with_id=target_user_id,
-                    wrapped_keys=wrapped_keys,
-                )
-                conn.execute(
-                    "UPDATE files SET visibility = MAX(visibility, 1) "
-                    "WHERE file_id = ? AND visibility = 0",
-                    (file_id,),
-                )
-            else:
-                # Idempotent no-op UPDATEs against the same hot rows.
-                # SQLite still emits a WAL frame for these (verified
-                # empirically — `SET col = col` is NOT short-circuited).
-                # Lock acquisition + fsync therefore happens in both
-                # branches; subsequent constant-deadline sleep caps the
-                # remaining sub-millisecond variance.
-                conn.execute(
-                    "UPDATE files SET file_id = file_id WHERE file_id = ?",
-                    (file_id,),
-                )
-                conn.execute(
-                    "UPDATE users SET user_id = user_id WHERE user_id = ?",
-                    (identity.user_id,),
-                )
-
-    await asyncio.to_thread(_db_share_or_dummy)
-    # Constant-deadline sleep: response time is dominated by the
-    # 150 ms wall-clock budget. The combination of (a) identical
-    # write-transaction shape between branches and (b) this constant
-    # cap is what closes the timing oracle even under WAL fsync tail
-    # or lock contention. (Round-7 H1)
-    _SHARE_TIMING_BUDGET_S = 0.150
-    elapsed = time.monotonic() - started
-    remaining = _SHARE_TIMING_BUDGET_S - elapsed
-    if remaining > 0:
-        await asyncio.sleep(remaining)
+    # Constant-deadline sleep: the combination of (a) identical
+    # write-transaction shape between branches and (b) this constant cap is
+    # what closes the timing oracle even under WAL fsync tail or lock
+    # contention. (Round-7 H1)
+    await sleep_until_deadline(started)
     return jsonify({"status": "shared"}), 200
 
 
@@ -1155,11 +1339,11 @@ async def unshare_file(file_id: str, recipient_username: str):
     # "alice" and the dummy path would run unnoticed. (Round-4 H2)
     try:
         canon_recipient = _canonicalize_username(recipient_username)
-    except Exception:
+    except AuthError:
         canon_recipient = None
 
-    # Start the timing budget BEFORE the username lookup so its
-    # latency is inside the constant-deadline envelope. (Round-7 M3)
+    # Start the timing budget BEFORE the username lookup so its latency is
+    # inside the constant-deadline envelope. (Round-7 M3)
     started = time.monotonic()
 
     target_user = (
@@ -1167,50 +1351,15 @@ async def unshare_file(file_id: str, recipient_username: str):
         if canon_recipient is not None
         else None
     )
-    # Snapshot the recipient id while None-narrowing is visible to the
-    # type checker; the closure's real branch implies target_user is set.
-    target_user_id = target_user["user_id"] if target_user is not None else ""
 
-    def _db_unshare_or_dummy():
-        # Both branches enter a write transaction (BEGIN IMMEDIATE) so
-        # they contend on Database._lock + SQLite reserved-lock
-        # identically, and both commit a WAL frame so fsync tail hits
-        # both. (Round-7 H1/H2)
-        with state.db.transaction() as conn:
-            if target_user is not None:
-                state.db.remove_file_share(
-                    file_id=file_id,
-                    shared_with_id=target_user_id,
-                )
-                # If no shares remain AND the file isn't public,
-                # downgrade visibility back to PRIVATE so the server
-                # access policy matches the lack of share rows.
-                remaining_row = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM file_shares " "WHERE file_id = ?",
-                    (file_id,),
-                ).fetchone()
-                if remaining_row and remaining_row["cnt"] == 0:
-                    conn.execute(
-                        "UPDATE files SET visibility = 0 "
-                        "WHERE file_id = ? AND visibility = 1",
-                        (file_id,),
-                    )
-            else:
-                conn.execute(
-                    "UPDATE files SET file_id = file_id WHERE file_id = ?",
-                    (file_id,),
-                )
-                conn.execute(
-                    "UPDATE users SET user_id = user_id WHERE user_id = ?",
-                    (identity.user_id,),
-                )
-
-    await asyncio.to_thread(_db_unshare_or_dummy)
-    _SHARE_TIMING_BUDGET_S = 0.150
-    elapsed = time.monotonic() - started
-    remaining = _SHARE_TIMING_BUDGET_S - elapsed
-    if remaining > 0:
-        await asyncio.sleep(remaining)
+    await asyncio.to_thread(
+        _apply_unshare,
+        state,
+        file_id=file_id,
+        caller_id=identity.user_id,
+        target_user=target_user,
+    )
+    await sleep_until_deadline(started)
     return jsonify({"status": "unshared"}), 200
 
 
@@ -1457,7 +1606,7 @@ def cleanup_orphan_staging_dirs() -> int:
     for name in entries:
         # Only treat strictly-validated UUIDs as upload IDs; ignore
         # everything else (foreign files an operator may have placed).
-        if not (_SAFE_ID_RE.match(name) or _SAFE_HEX_ID_RE.match(name)):
+        if not is_canonical_id(name):
             continue
         upload = None
         try:

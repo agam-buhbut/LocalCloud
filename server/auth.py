@@ -21,6 +21,7 @@ from quart import Blueprint, g, jsonify, request
 
 from server.database import Database
 from server.state import Identity, app_state
+from server.timing import TIMING_BUDGET_S
 from shared.crypto import hash_password, verify_password
 from shared.exceptions import AuthError, RateLimitError, SessionExpiredError
 from shared.usernames import canonicalize_username as _canonicalize_username
@@ -37,9 +38,10 @@ _LOGIN_MAX_CONTENT_LENGTH = 4096
 
 # Constant sleep budget when rate-limited. Keeps the response timing
 # of a rate-limit reject indistinguishable from an auth-failure path
-# that ran Argon2id + DB lookup. ~150ms is in the same ballpark as an
-# Argon2id verify on commodity hardware.
-_RATE_LIMIT_SLEEP_SECONDS = 0.150
+# that ran Argon2id + DB lookup. Sourced from the shared TIMING_BUDGET_S
+# (~150 ms — the same constant the share/unshare/directory equalized
+# paths use) so all equalized endpoints share one budget value.
+_RATE_LIMIT_SLEEP_SECONDS = TIMING_BUDGET_S
 
 # Dummy Argon2id hash used to equalize timing on unknown-username
 # logins. Computed lazily on first use so that importing this module is

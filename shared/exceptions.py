@@ -37,6 +37,18 @@ class NonceReuseError(CryptoError):
     pass
 
 
+class PaddingError(CryptoError, ValueError):
+    """Length-prefixed padding is malformed (bad length prefix).
+
+    Subclasses ``ValueError`` as well as ``CryptoError`` so that callers
+    (and tests) which catch the broad ``ValueError`` raised historically by
+    ``unpad`` keep working unchanged, while the error is now a typed member
+    of the package crypto hierarchy.
+    """
+
+    pass
+
+
 # ──────────────────────────── Auth Errors ────────────────────────────
 
 
