@@ -303,6 +303,21 @@ at startup and covered by tests; per-peer attempt-row flood is bounded.
 
 ## Phase 1 — Testability & verification tier (unblocks safe change)
 
+> **✅ EXECUTED 2026-05-30** — commits `c98d3b8..09a8db7`. **238 Python + 27 Rust
+> tests green**; full toolchain clean (black, isort, ruff, pylint ≥9.8, pyright
+> 0-errors, cargo fmt, clippy `-D warnings`, pip-audit, cargo audit) and wired into
+> a committed GitHub Actions CI (1D). Order followed 1B-smoke → 1A → 1B-full/1C/1D.
+> 1A landed the typed `AppState` + `g.identity`, dropping storage.py `# type: ignore`
+> 40→0 — reviewed behavior-preserving. 1B added the full route-integration suite;
+> 1C added hypothesis property/fuzz tests (pad round-trip, parser-never-crashes incl.
+> the depth-64 recursion guard, nonce uniqueness, key isolation, fail-on-corruption,
+> AAD-binding) + Rust nonce-uniqueness tests. **The integration suite surfaced and we
+> fixed a blocking production bug** — `upload_init` keyed staging on a hyphenated
+> `upload_id` while `_validate_id` canonicalized to hyphen-free hex, so no upload
+> could ever complete (commit `560d8f9`). pyright now uses the venv; remaining
+> false positives (keycore native ext, click group) carry targeted suppressions;
+> pylint complexity checks are deferred to Phase 3 (ARCH-H3) with annotations.
+
 **Objective:** Build the test infrastructure that lets every later phase refactor
 and extend safely. This is the prerequisite for Phases 2–4.
 
