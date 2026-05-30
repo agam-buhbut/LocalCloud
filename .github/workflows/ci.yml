@@ -1,0 +1,100 @@
+name: CI
+
+# Runs the full project toolchain. Merges are gated on every job/step
+# passing. The exact commands here mirror what is run locally and were
+# verified green before this workflow was committed.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (lint, types, tests, audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # keycore is a Rust extension built with maturin; the Python suite
+      # imports it, so the Rust toolchain must be present in this job too.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (keycore build)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/keycore
+
+      - name: Install project (dev extras) + maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install maturin
+
+      - name: Build keycore extension
+        run: maturin develop --release -m rust/keycore/Cargo.toml
+
+      - name: black (format check)
+        run: black --check .
+
+      - name: isort (import order check)
+        run: isort --check --profile black .
+
+      - name: ruff (lint)
+        run: ruff check .
+
+      - name: pylint
+        run: pylint client server shared
+
+      - name: pyright (type check)
+        run: pyright
+
+      - name: pytest
+        run: pytest -q
+
+      - name: pip-audit (Python supply chain)
+        run: pip-audit
+
+  rust:
+    name: Rust (fmt, clippy, tests, audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/keycore
+
+      - name: rustfmt (format check)
+        run: cargo fmt --manifest-path rust/keycore/Cargo.toml --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --manifest-path rust/keycore/Cargo.toml --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path rust/keycore/Cargo.toml
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit (Rust supply chain)
+        run: cargo audit --file rust/keycore/Cargo.lock
