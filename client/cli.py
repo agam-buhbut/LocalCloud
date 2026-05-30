@@ -630,7 +630,11 @@ def _format_size(bytes_val: int) -> str:
 
 
 def main():
-    cli()
+    # `cli` is a click.Group; calling it dispatches via click's __call__,
+    # which reads sys.argv and supplies ctx/params itself. pylint (astroid)
+    # doesn't model the @click.group decorator transform, so it sees the
+    # undecorated cli(ctx, key_file, server) signature — a false positive.
+    cli()  # pylint: disable=no-value-for-parameter
 
 
 if __name__ == "__main__":

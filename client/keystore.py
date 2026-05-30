@@ -72,7 +72,10 @@ class KeyStore:
             )
 
         with self._lock:
-            kp = keycore.KeyPair.generate()
+            # keycore is a compiled Rust extension (maturin) with no .pyi
+            # stub, so the type checker can't see its exports. KeyPair is
+            # present at runtime (exercised by the full test suite).
+            kp = keycore.KeyPair.generate()  # type: ignore[reportAttributeAccessIssue]
             encrypted = kp.encrypt_to_store(password.encode())
 
             # Write atomically with secure mode applied AT creation time —
@@ -129,7 +132,8 @@ class KeyStore:
             except (ValueError, OSError) as e:
                 raise ValueError("Failed to read key store") from e
             try:
-                self._keypair = keycore.KeyPair.decrypt_from_store(
+                # keycore native extension: no stub, KeyPair exists at runtime.
+                self._keypair = keycore.KeyPair.decrypt_from_store(  # type: ignore[reportAttributeAccessIssue]
                     data, password.encode()
                 )
             except Exception as e:

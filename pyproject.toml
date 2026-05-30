@@ -81,6 +81,24 @@ ignore = [
 
 [tool.pylint.main]
 ignore-paths = ["rust/", "build/", "dist/"]
+# CI gate: pylint exits non-zero below this score. The remaining ~9.8
+# delta is intentional-pattern noise (mutable module singletons named
+# lowercase, callback signatures with interface-mandated unused args, the
+# module-init `global` pattern, exception-body `pass`, intentional adjacent
+# string literals) plus the Phase 3 complexity items disabled below.
+# Phase 3 (ARCH-H3) cleanup will let this ratchet upward — never lower it.
+fail-under = 9.8
+
+[tool.pylint.format]
+# Match black; the actual line-length enforcement lives with ruff/black
+# (line-too-long is disabled below), but keep pylint's notion consistent.
+max-line-length = 88
+
+[tool.pylint.typecheck]
+# keycore is a compiled Rust extension (maturin) that pylint's static
+# analyzer cannot import to introspect; its members (KeyPair,
+# verify_signature) exist at runtime and are exercised by the test suite.
+ignored-modules = ["keycore"]
 
 [tool.pylint."messages control"]
 disable = [
@@ -98,11 +116,25 @@ disable = [
     "fixme",  # explicit policy: no TODOs in delivered code, but we audit those separately
     "import-outside-toplevel",
     "broad-exception-caught",
+    # ── Complexity checks deferred to Phase 3 (ARCH-H3) ──
+    # ARCH-H3 will decompose the known god-functions/modules (server
+    # storage/auth/database). Until then these would fail CI on code we
+    # have already scheduled for restructuring; they are NOT permanently
+    # waived — re-enable as ARCH-H3 lands and raise fail-under accordingly.
+    "too-many-return-statements",   # R0911 — storage/auth dispatch funcs
+    "too-many-positional-arguments",  # R0917 — wide ctor/seal signatures
+    "too-many-public-methods",      # R0904 — Database facade (Phase 3 split)
+    "too-many-lines",               # C0302 — storage.py (1377 LOC)
 ]
 
 [tool.pyright]
 include = ["client", "server", "shared"]
 exclude = ["rust/**", "**/__pycache__", "**/.venv", "**/target"]
+# Point pyright at the project virtualenv so it resolves third-party
+# stubs (quart, cbor2, argon2, nacl) and loads click's real types
+# instead of treating decorated functions as bare FunctionType.
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 reportMissingImports = "warning"

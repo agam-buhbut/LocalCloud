@@ -329,7 +329,9 @@ class FileEncryptor:
             protocol_version=header.version,
         )
         try:
-            ok = keycore.verify_signature(
+            # keycore native extension: no stub, verify_signature exists
+            # at runtime (exercised by the full test suite).
+            ok = keycore.verify_signature(  # type: ignore[reportAttributeAccessIssue]
                 signer_pubkey, signing_input, header.signature
             )
         except ValueError as e:

@@ -24,6 +24,7 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path
+from typing import cast
 
 from quart import Blueprint, Response, jsonify, request
 
@@ -76,6 +77,12 @@ _MAX_VISIBILITY = 2
 # rejected because they let an attacker spoof filename rendering in a
 # client UI. Filenames are server-visible plaintext (README §4.2) but
 # must remain non-deceptive.
+# These exact codepoints MUST appear literally in source: they are the
+# denylist itself. pylint's bidi/zero-width guards (designed to catch
+# *hidden* malicious code) fire on this intentional security data, so we
+# disable them for this block only — keeping the guards active everywhere
+# else in the file.
+# pylint: disable=bidirectional-unicode,invalid-character-zero-width-space
 _FILENAME_REJECT_CODEPOINTS = frozenset(
     {
         "​",
@@ -95,6 +102,7 @@ _FILENAME_REJECT_CODEPOINTS = frozenset(
         "﻿",  # BOM / ZWNBSP
     }
 )
+# pylint: enable=bidirectional-unicode,invalid-character-zero-width-space
 
 # Per-user staging caps (K3): bound the disk that any one user can hold
 # in the staging area before finalize, and the number of concurrent
@@ -406,7 +414,12 @@ async def upload_chunk(upload_id: str, chunk_index: int):
         return jsonify({"error": "Upload expired"}), 410
 
     # Read chunk data
-    chunk_data = await request.get_data(as_text=False)
+    # quart's Request.get_data is annotated `-> str | bytes` with no
+    # @overload on `as_text`, so the type checker can't narrow on the
+    # literal. With as_text=False the runtime contract is always bytes;
+    # cast is a no-op at runtime and documents that invariant for the
+    # downstream blake2b_hash / _write_file_bytes calls (both want bytes).
+    chunk_data = cast(bytes, await request.get_data(as_text=False))
     if not chunk_data:
         return jsonify({"error": "Empty chunk"}), 400
 
