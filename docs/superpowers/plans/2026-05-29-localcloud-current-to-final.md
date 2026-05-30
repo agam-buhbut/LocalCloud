@@ -391,6 +391,21 @@ type-ignore count materially reduced; later phases can refactor under test.
 **Objective:** Make sharing/visibility match the spec and remove the plaintext
 owner key cache.
 
+> **✅ EXECUTED 2026-05-30 (2A + 2C + 2D; 2B deferred)** — commits `7bf8896..c1c5519`.
+> **307 Python tests green**; full toolchain clean; a 3-reviewer audit (crypto/security,
+> spec, behavior) returned **sound**. Design doc:
+> `docs/superpowers/plans/2026-05-30-phase2-e2ee-design.md`. Landed: **2A** owner-self-wrap
+> (file/meta keys wrapped to the owner's own X25519, stored as an exactly-136-byte self-share
+> row via `POST /self_keys`; the plaintext `keys.json` cache removed; one fail-closed
+> `acquire_file_keys` path for owner+shared; a fail-closed `migrate-keys` retires legacy
+> caches); **2C** schema v6 + X25519 enrollment authenticated by an Ed25519 self-signature over
+> a domain-separated, username-bound input, an authenticated pubkey directory (`/api/users/*`)
+> that is fixed-shape + fixed-length + constant-deadline (no enumeration oracle), and
+> share-via-directory with mandatory self-sig verification; **2D** metadata bound to
+> `merkle_root` under a dedicated AAD with `PROTOCOL_VERSION` 1→2 as a HARD CUTOVER (no v1
+> branch → no downgrade oracle). `canonicalize_username` moved to `shared/`. **2B (public
+> visibility) DEFERRED** — see Accepted limitations.
+
 > **Split into 2-design then 2-impl (rev).** Phase 2 contains unresolved protocol
 > design (2B model choice, 2C key-authenticity binding). **Phase 2-design is a
 > blocking deliverable**: produce a public-wrapping decision doc + a security
@@ -724,6 +739,16 @@ box with backups). **M4** = Phase 3+4+7 (clean, fast, released).
 The Definition of Done requires every README §11 gap to be closed OR explicitly
 accepted. These two are accepted as out-of-scope unless a future requirement
 revisits them — recording them here so the DoD can be honestly checked:
+
+- **Public visibility / on-demand public wrapping (2B)** — **deferred (owner decision,
+  2026-05-30)**. Public visibility will ship only via a *key-committing AEAD* single-bundle
+  scheme delivered as its own security-reviewed design. The weak alternatives were rejected: a
+  publish-time per-recipient fan-out is not confidential against the hostile server (the server
+  can mint synthetic enrolled identities and harvest the wrapped keys), and a pinned-allow-list
+  is not truly "public." Until that design lands, files are private/shared/owner-only;
+  `Visibility.PUBLIC` exists as a flag but delivers no keys. A committing AEAD can be composed
+  from audited primitives (e.g. a BLAKE2b key commitment + XChaCha20-Poly1305), so reviving 2B
+  need not introduce a custom primitive.
 
 - **File version history (`MetadataBlob.version_number` / `blob_ids`)** — these
   fields exist but are placeholders (`version_number=1`, `blob_ids=[]` always).
