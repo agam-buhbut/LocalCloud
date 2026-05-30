@@ -577,6 +577,7 @@ def seed_file(
         *,
         filename: str | None = None,
         visibility: int = 0,
+        self_share: bool = False,
     ) -> UploadedFile:
         enc = encrypt_file(keystore, data, filename=filename, visibility=visibility)
         file_id = enc.file_id_hex  # already canonical 32-hex
@@ -589,6 +590,18 @@ def seed_file(
         for idx, blob in enumerate(enc.chunk_blobs):
             (blob_path / f"{idx}.bin").write_bytes(blob)
             os.chmod(blob_path / f"{idx}.bin", 0o600)
+
+        # Optionally install the owner's self-share row (item 2A) so route
+        # tests can exercise the unified /wrapped_keys acquisition path for
+        # the owner exactly as a real upload (which POSTs /self_keys) would.
+        self_bundle: bytes | None = None
+        if self_share:
+            self_bundle = keystore.wrap_file_keys(  # type: ignore[attr-defined]
+                enc.file_key,
+                enc.meta_key,
+                bytes.fromhex(file_id),
+                keystore.x25519_public_key(),  # type: ignore[attr-defined]
+            )
 
         # DB row + quota commit in one transaction, mirroring finalize.
         with db.transaction():
@@ -603,6 +616,12 @@ def seed_file(
                 file_header=enc.header_bytes,
             )
             db.increment_usage(owner_id, total_bytes)
+            if self_bundle is not None:
+                db.add_file_share(
+                    file_id=file_id,
+                    shared_with_id=owner_id,
+                    wrapped_keys=self_bundle,
+                )
 
         return UploadedFile(
             file_id=file_id,

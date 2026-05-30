@@ -440,3 +440,158 @@ async def test_unshare_then_revoked_file_downgrades_to_private(
     )
     downgraded = await owner.authed.get(f"/api/files/{uploaded.file_id}")
     assert (await downgraded.get_json())["visibility"] == 0
+
+
+# ──────────────────────────── self_keys (item 2A) ────────────────────────────
+
+
+def _wrap_self(owner: KeyedClient, uploaded: UploadedFile) -> bytes:
+    """Wrap the file's keys to the OWNER's own X25519 (a self-share bundle)."""
+    file_id_bytes = bytes.fromhex(uploaded.file_id)
+    own_x = owner.keystore.x25519_public_key()  # type: ignore[attr-defined]
+    return owner.keystore.wrap_file_keys(  # type: ignore[attr-defined]
+        uploaded.file_key, uploaded.meta_key, file_id_bytes, own_x
+    )
+
+
+async def test_self_keys_stored_and_fetchable_by_owner(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    """POST /self_keys stores the owner's bundle; /wrapped_keys returns it.
+
+    This is the unified key path: the owner registers a self-share and then
+    reads it back through the SAME endpoint a recipient uses.
+    """
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+    bundle = _wrap_self(owner, uploaded)
+
+    resp = await owner.authed.post(
+        f"/api/files/{uploaded.file_id}/self_keys",
+        json={"wrapped_keys": bundle.hex()},
+    )
+    assert resp.status_code == 200
+    assert (await resp.get_json())["status"] == "stored"
+
+    keys = await owner.authed.get(f"/api/files/{uploaded.file_id}/wrapped_keys")
+    assert keys.status_code == 200
+    returned = bytes.fromhex((await keys.get_json())["wrapped_keys"])
+    assert returned == bundle
+
+
+async def test_self_keys_round_trip_unwraps_to_original(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    """The owner recovers the exact file_key/meta_key from the self-share."""
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+    bundle = _wrap_self(owner, uploaded)
+    await owner.authed.post(
+        f"/api/files/{uploaded.file_id}/self_keys",
+        json={"wrapped_keys": bundle.hex()},
+    )
+
+    keys = await owner.authed.get(f"/api/files/{uploaded.file_id}/wrapped_keys")
+    returned = bytes.fromhex((await keys.get_json())["wrapped_keys"])
+    fk, mk = owner.keystore.unwrap_file_keys(  # type: ignore[attr-defined]
+        returned,
+        bytes.fromhex(uploaded.file_id),
+        owner.keystore.ed25519_public_key(),  # type: ignore[attr-defined]
+    )
+    assert fk == uploaded.file_key
+    assert mk == uploaded.meta_key
+
+
+async def test_self_keys_is_idempotent(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    """Re-registering the self-share (INSERT OR REPLACE) stays 200."""
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+    bundle = _wrap_self(owner, uploaded)
+    for _ in range(2):
+        resp = await owner.authed.post(
+            f"/api/files/{uploaded.file_id}/self_keys",
+            json={"wrapped_keys": bundle.hex()},
+        )
+        assert resp.status_code == 200
+
+
+async def test_self_keys_rejects_wrong_length(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    """A bundle whose length != 136 is rejected (exact-length guard).
+
+    Both a too-short (135) and a too-long (137) bundle must 400 — the loose
+    136..4096 /share range is intentionally NOT applied to /self_keys.
+    """
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+
+    for bad in (b"\x00" * 135, b"\x00" * 137, b"\x00" * 200):
+        resp = await owner.authed.post(
+            f"/api/files/{uploaded.file_id}/self_keys",
+            json={"wrapped_keys": bad.hex()},
+        )
+        assert resp.status_code == 400, len(bad)
+        # No row was written by a rejected POST.
+        keys = await owner.authed.get(f"/api/files/{uploaded.file_id}/wrapped_keys")
+        assert (await keys.get_json())["wrapped_keys"] is None
+
+
+async def test_self_keys_rejects_bad_hex(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+    resp = await owner.authed.post(
+        f"/api/files/{uploaded.file_id}/self_keys",
+        json={"wrapped_keys": "not-hex!!"},
+    )
+    assert resp.status_code == 400
+
+
+async def test_self_keys_missing_field_is_400(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+    resp = await owner.authed.post(f"/api/files/{uploaded.file_id}/self_keys", json={})
+    assert resp.status_code == 400
+
+
+async def test_self_keys_non_owner_rejected(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    """A non-owner cannot register self-keys for someone else's file (404).
+
+    404 (not 403): the route must not reveal the file exists.
+    """
+    owner = await make_keyed_client()
+    stranger = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=2)
+    bundle = b"\x00" * 136
+    resp = await stranger.authed.post(
+        f"/api/files/{uploaded.file_id}/self_keys",
+        json={"wrapped_keys": bundle.hex()},
+    )
+    assert resp.status_code == 404
+
+
+async def test_self_keys_unknown_file_is_404(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+) -> None:
+    owner = await make_keyed_client()
+    bundle = b"\x00" * 136
+    resp = await owner.authed.post(
+        f"/api/files/{'ab' * 16}/self_keys",
+        json={"wrapped_keys": bundle.hex()},
+    )
+    assert resp.status_code == 404

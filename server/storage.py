@@ -127,6 +127,13 @@ MAX_USERNAME_LEN = 64
 MIN_WRAPPED_KEYS_BYTES = 136
 MAX_WRAPPED_KEYS_BYTES = 4096
 
+# Exact length of the v2 owner self-share bundle accepted by /self_keys
+# (item 2A): PUBKEY(32) + NONCE(24) + PAYLOAD(64) + TAG(16) = 136. Unlike
+# share_file's loose MIN..MAX range, the self-share endpoint validates the
+# bundle is EXACTLY this size — there is no protocol-evolution headroom to
+# leave for an ephemeral-static bundle of fixed shape.
+SELF_KEYS_BUNDLE_BYTES = 136
+
 # Pagination defaults / caps for list_files (medium fix).
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
@@ -1207,10 +1214,90 @@ async def unshare_file(file_id: str, recipient_username: str):
     return jsonify({"status": "unshared"}), 200
 
 
+@storage_bp.route("/<file_id>/self_keys", methods=["POST"])
+@require_auth
+async def self_keys(file_id: str):
+    """Register the OWNER's self-wrapped key bundle (item 2A).
+
+    The owner wraps ``file_key``+``meta_key`` to their OWN X25519 key and
+    POSTs the bundle here; it is stored as a self-share row in
+    ``file_shares`` with ``shared_with_id == owner_id``. ``get_wrapped_keys``
+    then returns this row to the owner exactly as for any recipient, so the
+    owner and every recipient acquire keys through ONE fail-closed server
+    path and no plaintext key ever touches disk (the old
+    ``<file_id>.keys.json`` cache is removed).
+
+    Distinct from ``POST /share``: ``/share`` is timing-equalized against an
+    external username-enumeration oracle and deliberately routes a
+    self-share to a no-op (it never writes a row for yourself). Registering
+    a bundle to *yourself* has no username to enumerate, so this endpoint
+    carries NO timing budget and NO username branch.
+
+    The bundle is opaque AEAD to the server (it cannot unwrap it). The
+    length is validated to be EXACTLY 136 bytes (PUBKEY 32 + NONCE 24 +
+    PAYLOAD 64 + TAG 16) for this v2 ephemeral-static bundle — the loose
+    136..4096 range used by ``/share`` is intentionally NOT applied here.
+
+    Response is uniform with the other file endpoints: 404 for unknown /
+    non-owned files (no existence oracle), 400 for a malformed body.
+    """
+    state = app_state()
+    identity = current_identity()
+
+    try:
+        file_id = _validate_id(file_id, "file_id")
+    except ValueError:
+        return jsonify({"error": "Not found"}), 404
+
+    try:
+        await asyncio.to_thread(
+            check_file_ownership, state.db, file_id, identity.user_id
+        )
+    except AuthError:
+        return jsonify({"error": "Not found"}), 404
+
+    data = await request.get_json(silent=True)
+    if not data or "wrapped_keys" not in data:
+        return jsonify({"error": "Invalid request"}), 400
+
+    raw = data["wrapped_keys"]
+    if not isinstance(raw, str):
+        return jsonify({"error": "Invalid request"}), 400
+    try:
+        wrapped_keys = bytes.fromhex(raw)
+    except ValueError:
+        return jsonify({"error": "Invalid request"}), 400
+    # Exact length for the v2 ephemeral-static bundle — NOT the loose
+    # /share range. A truncated or padded bundle is rejected before the DB.
+    if len(wrapped_keys) != SELF_KEYS_BUNDLE_BYTES:
+        return jsonify({"error": "Invalid request"}), 400
+
+    def _db_store() -> None:
+        with state.db.transaction():
+            # shared_with == owner: the self-share row. INSERT OR REPLACE
+            # makes re-registration (upload repair / migrate-keys) idempotent.
+            state.db.add_file_share(
+                file_id=file_id,
+                shared_with_id=identity.user_id,
+                wrapped_keys=wrapped_keys,
+            )
+
+    await asyncio.to_thread(_db_store)
+    return jsonify({"status": "stored"}), 200
+
+
 @storage_bp.route("/<file_id>/wrapped_keys", methods=["GET"])
 @require_auth
 async def get_wrapped_keys(file_id: str):
-    """Get wrapped keys for the authenticated user."""
+    """Get wrapped keys for the authenticated user.
+
+    Returns the share row keyed on (file_id, caller). This is the SINGLE
+    key-acquisition path: for a recipient it returns the per-recipient
+    bundle; for the owner it returns the owner's self-share row registered
+    via ``POST /self_keys`` (item 2A). There is NO owner special-casing —
+    a plain (file_id, user_id) lookup serves both. ``null`` when no row
+    exists (e.g. an owner who has not yet registered a self-share).
+    """
     state = app_state()
     identity = current_identity()
 

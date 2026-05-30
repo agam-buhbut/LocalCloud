@@ -266,6 +266,22 @@ class CloudClient:
         )
         self._check_response(resp)
 
+    def post_self_keys(self, file_id: str, bundle: bytes) -> None:
+        """Register the owner's self-wrapped key bundle (item 2A).
+
+        Uploads the owner's ``file_key``+``meta_key`` wrapped to the owner's
+        OWN X25519 key. The server stores it as a self-share row so the
+        owner later acquires keys through the same ``/wrapped_keys`` path as
+        any recipient — no plaintext key cache on disk. Raises StorageError
+        / AuthError on a non-2xx response.
+        """
+        resp = self._client.post(
+            f"{self.server_url}/api/files/{file_id}/self_keys",
+            json={"wrapped_keys": bundle.hex()},
+            headers=self._headers(),
+        )
+        self._check_response(resp)
+
     def unshare_file(self, file_id: str, username: str) -> None:
         """Revoke a previously-granted share for a recipient.
 

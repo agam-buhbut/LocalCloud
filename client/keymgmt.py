@@ -28,11 +28,85 @@ __all__ = [
     "build_enroll_signing_input",
     "verify_x25519_self_sig",
     "resolve_recipient",
+    "acquire_file_keys",
 ]
 
 _X25519_LEN = 32
 _ED25519_LEN = 32
 _SELF_SIG_LEN = 64
+_FILE_ID_LEN = 16
+
+
+def acquire_file_keys(
+    api_client: object, keystore: object, file_id: str
+) -> tuple[bytes, bytes]:
+    """Acquire (file_key, meta_key) for a file via the server (item 2A).
+
+    The SINGLE key-acquisition path for both the owner and any shared
+    recipient: fetch the wrapped bundle from ``GET /wrapped_keys`` and
+    unwrap it with the local keystore's X25519 PRIVATE key (the keystore
+    re-derives its own X25519 public key from that private key — the wrap's
+    recipient binding). The wrap also binds the SENDER's Ed25519 identity,
+    which for both an owner self-share and a recipient share is the FILE
+    OWNER's Ed25519 key, so it is resolved here from ``/owner_pubkey``.
+
+    Fail-closed: raises ``CryptoError`` if the server has no bundle for this
+    (file, caller), if the owner has no registered identity key, or if the
+    unwrap fails (a hostile-server tamper surfaces as an AEAD failure).
+    No plaintext key is ever read from disk.
+
+    Note: the wrap AAD binds the recipient X25519 public key, so a future
+    X25519 rotation would orphan existing self-share/recipient bundles
+    wrapped to the old key — that is a Phase 7 key-rotation concern, out of
+    scope here.
+
+    Args:
+        api_client: A ``CloudClient`` exposing ``get_wrapped_keys(file_id)``
+            and ``get_owner_pubkey(file_id)``.
+        keystore: An unlocked ``KeyStore`` whose X25519 private key wraps
+            the bundle (its public key is the bundle's recipient).
+        file_id: The file id as a hex string (with or without hyphens); the
+            16-byte form is bound into the unwrap AAD.
+
+    Returns:
+        ``(file_key, meta_key)`` — both 32 bytes.
+
+    Raises:
+        CryptoError: no bundle, no owner identity key, malformed file_id, or
+            an unwrap/AEAD failure.
+    """
+    try:
+        file_id_bytes = bytes.fromhex(file_id.replace("-", ""))
+    except ValueError as exc:
+        raise CryptoError("file_id is not valid hex") from exc
+    if len(file_id_bytes) != _FILE_ID_LEN:
+        raise CryptoError("file_id must encode 16 bytes")
+
+    wrapped = api_client.get_wrapped_keys(file_id)  # type: ignore[attr-defined]
+    if not wrapped:
+        # Fail-closed: an owner who never registered a self-share row, or a
+        # recipient with no share, gets nothing — never a silent fallback.
+        raise CryptoError(
+            "No wrapped keys for this file and user; the owner must register "
+            "self-keys (upload / migrate-keys) or share with this recipient"
+        )
+
+    sender_ed25519 = api_client.get_owner_pubkey(file_id)  # type: ignore[attr-defined]
+    if sender_ed25519 is None or len(sender_ed25519) != _ED25519_LEN:
+        raise CryptoError(
+            "Server has no registered identity key for this file's owner; "
+            "cannot verify the wrapped-key sender binding"
+        )
+
+    try:
+        file_key, meta_key = keystore.unwrap_file_keys(  # type: ignore[attr-defined]
+            wrapped, file_id_bytes, sender_pubkey=sender_ed25519
+        )
+    except Exception as exc:
+        # A tampered bundle / wrong recipient surfaces as an AEAD failure
+        # from keycore; collapse to a fail-closed CryptoError.
+        raise CryptoError("Failed to unwrap file keys (bundle invalid)") from exc
+    return file_key, meta_key
 
 
 def verify_x25519_self_sig(

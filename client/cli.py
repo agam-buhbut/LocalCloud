@@ -222,18 +222,15 @@ def _resolve_owner_pubkey(
     type=click.Choice(["private", "shared", "public"]),
     default="private",
 )
-@click.option(
-    "--key-cache",
-    default=None,
-    help=(
-        "Where to save the owner's file_key/meta_key as a local JSON "
-        "cache (so the owner can decrypt their own file). Default: "
-        "next to the encrypted key file, named <file_id>.keys.json"
-    ),
-)
 @click.pass_context
-def upload(ctx, filepath: str, visibility: str, key_cache: str | None):
-    """Encrypt and upload a file (streaming)."""
+def upload(ctx, filepath: str, visibility: str):
+    """Encrypt and upload a file (streaming).
+
+    After upload the owner's file_key/meta_key are wrapped to the owner's
+    OWN X25519 key and registered server-side as a self-share (item 2A);
+    no plaintext key is written to disk. The owner later acquires the keys
+    through the same server path as any recipient.
+    """
     ks = _get_keystore(ctx.obj["key_file"])
     if not ks.has_keys:
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
@@ -307,25 +304,20 @@ def upload(ctx, filepath: str, visibility: str, key_cache: str | None):
             expected_hashes=client_hashes,
         )
 
-        # Persist owner key cache so the owner can later decrypt their
-        # own file. Cache file is mode 0o600. Validate file_id locally
-        # before using it as part of a filesystem name. (Round-10 M5)
-        safe_id = _validate_file_id_local(file_id)
-        cache_path = (
-            Path(key_cache)
-            if key_cache
-            else Path(ctx.obj["key_file"]).parent / f"{safe_id}.keys.json"
+        # 2A: wrap file_key/meta_key to the OWNER'S OWN X25519 key and
+        # register the bundle server-side as a self-share. The wrap uses
+        # the LOCAL keypair (own X25519 as recipient, own Ed25519 as the
+        # internal sender binding) — it does NOT depend on directory
+        # enrollment. No plaintext key is written to disk.
+        own_x25519 = ks.x25519_public_key()
+        self_bundle = ks.wrap_file_keys(
+            file_key=encrypted.file_key,
+            meta_key=encrypted.meta_key,
+            file_id=encrypted.header.file_id,
+            recipient_pubkey=own_x25519,
         )
-        cache_payload = json.dumps(
-            {
-                "file_id": file_id,
-                "file_key": encrypted.file_key.hex(),
-                "meta_key": encrypted.meta_key.hex(),
-            }
-        )
-        _atomic_write_secret(cache_path, cache_payload)
+        client.post_self_keys(file_id, self_bundle)
         click.echo(f"Upload complete. File ID: {file_id}")
-        click.echo(f"Owner key cache: {cache_path}")
     except (StorageError, CryptoError, AuthError) as e:
         click.echo(f"Upload failed: {e}", err=True)
         sys.exit(1)
@@ -345,11 +337,6 @@ def upload(ctx, filepath: str, visibility: str, key_cache: str | None):
 @click.argument("file_id")
 @click.argument("output", type=click.Path(dir_okay=False))
 @click.option(
-    "--key-cache",
-    default=None,
-    help="Owner key cache (for files you uploaded). JSON with file_key/meta_key.",
-)
-@click.option(
     "--sender-pubkey",
     default=None,
     help="Hex-encoded Ed25519 public key of the file owner (overrides server lookup).",
@@ -359,10 +346,15 @@ def download(
     ctx,
     file_id: str,
     output: str,
-    key_cache: str | None,
     sender_pubkey: str | None,
 ):
-    """Download and decrypt a file (streaming)."""
+    """Download and decrypt a file (streaming).
+
+    Keys are acquired through the unified server path (item 2A): the
+    wrapped bundle is fetched and unwrapped with the local X25519 key — the
+    same path for an owner (self-share) and a recipient. There is no
+    plaintext key cache on disk.
+    """
     ks = _get_keystore(ctx.obj["key_file"])
     key_password = click.prompt("Key password", hide_input=True)
     ks.unlock(key_password)
@@ -388,38 +380,17 @@ def download(
         if header.file_id.hex() != url_canon:
             raise CryptoError("Header file_id does not match requested file_id")
 
-        wrapped = client.get_wrapped_keys(file_id)
-        file_key: bytes | None = None
-        meta_key: bytes | None = None
+        # 2A unified acquisition: fetch + unwrap the bundle for THIS caller
+        # (owner self-share or recipient share alike). The Merkle signature
+        # is verified against the file OWNER's Ed25519 key, which is also
+        # the wrap's sender binding; _resolve_owner_pubkey honors an
+        # explicit --sender-pubkey override and otherwise pins the
+        # server-returned key (TOFU). One path, fail-closed.
+        from client.keymgmt import acquire_file_keys
 
-        if wrapped is not None:
-            # Shared / public file delivered with a wrapped-keys bundle.
-            # Look up the sender's pinned pubkey (or use override).
-            sender_pk = _resolve_owner_pubkey(client, file_id, sender_pubkey)
-            click.echo("Unwrapping shared file keys...")
-            file_key, meta_key = ks.unwrap_file_keys(
-                wrapped,
-                header.file_id,
-                sender_pubkey=sender_pk,
-            )
-            sig_pubkey = sender_pk
-        else:
-            # Owner case — load file_key + meta_key from local cache.
-            safe_id = _validate_file_id_local(file_id)
-            cache_path = (
-                Path(key_cache)
-                if key_cache
-                else Path(ctx.obj["key_file"]).parent / f"{safe_id}.keys.json"
-            )
-            if not cache_path.exists():
-                raise CryptoError(
-                    f"No wrapped keys from server and no key cache at "
-                    f"{cache_path}. For owned files, supply --key-cache."
-                )
-            cache = _load_owner_key_cache(cache_path)
-            file_key = bytes.fromhex(cache["file_key"])
-            meta_key = bytes.fromhex(cache["meta_key"])
-            sig_pubkey = ks.ed25519_public_key()
+        click.echo("Acquiring and unwrapping file keys...")
+        file_key, meta_key = acquire_file_keys(client, ks, file_id)
+        sig_pubkey = _resolve_owner_pubkey(client, file_id, sender_pubkey)
 
         click.echo("Decrypting and verifying...")
         encryptor = FileEncryptor(ks)
@@ -527,18 +498,12 @@ def quota(ctx):
         "key is resolved AND verified via the server directory."
     ),
 )
-@click.option(
-    "--key-cache",
-    default=None,
-    help="Local owner key cache for this file (defaults next to key file).",
-)
 @click.pass_context
 def share(
     ctx,
     file_id: str,
     recipient: str,
     recipient_pubkey: str | None,
-    key_cache: str | None,
 ):
     """Share a file with another user.
 
@@ -552,7 +517,7 @@ def share(
     out-of-band key (explicit trust; the self-signature check is skipped
     because there is no directory entry to verify).
     """
-    from client.keymgmt import resolve_recipient
+    from client.keymgmt import acquire_file_keys, resolve_recipient
 
     ks = _get_keystore(ctx.obj["key_file"])
     if not ks.has_keys:
@@ -578,20 +543,11 @@ def share(
             # resolve_recipient fails closed on a missing/invalid self-sig.
             recipient_pk = resolve_recipient(client, recipient)
 
-        safe_id = _validate_file_id_local(file_id)
-        cache_path = (
-            Path(key_cache)
-            if key_cache
-            else Path(ctx.obj["key_file"]).parent / f"{safe_id}.keys.json"
-        )
-        if not cache_path.exists():
-            raise CryptoError(
-                f"Owner key cache not found: {cache_path}. "
-                f"Only the owner can share their own files."
-            )
-        cache = _load_owner_key_cache(cache_path)
-        file_key = bytes.fromhex(cache["file_key"])
-        meta_key = bytes.fromhex(cache["meta_key"])
+        # 2A: the owner re-acquires their own file_key/meta_key through the
+        # unified server path (own self-share row) — no plaintext cache.
+        # Only the owner has a self-share bundle, so a non-owner fails
+        # closed here.
+        file_key, meta_key = acquire_file_keys(client, ks, file_id)
 
         try:
             raw_id = bytes.fromhex(file_id.replace("-", ""))
@@ -639,7 +595,108 @@ def unshare(ctx, file_id: str, recipient: str):
         client.close()
 
 
+@cli.command("migrate-keys")
+@click.option(
+    "--key-cache",
+    default=None,
+    help=(
+        "Extra directory or single <file_id>.keys.json to migrate, in "
+        "addition to the default key-file directory."
+    ),
+)
+@click.pass_context
+def migrate_keys(ctx, key_cache: str | None):
+    """Retire legacy plaintext <file_id>.keys.json caches (item 2A).
+
+    For each cached file, wrap the cached file_key/meta_key to your OWN
+    X25519 key and register it server-side as a self-share, then delete the
+    JSON. This converts the only plaintext-key-at-rest path into the
+    unified server-delivered bundle.
+
+    Fail-closed: a cache whose self-keys POST fails is LEFT INTACT (never
+    deleted). Each file_id is validated BEFORE it is used in a URL.
+
+    SECURITY: deletion is a plain ``os.unlink`` — NOT a secure wipe. An
+    in-place overwrite is not reliable on copy-on-write / SSD / journaled
+    filesystems, so any keys.json that ever existed should be treated as
+    potentially already compromised (e.g. captured in a backup or by a
+    second local user). Migration removes the live file; it cannot
+    guarantee no copy survives elsewhere.
+    """
+    ks = _get_keystore(ctx.obj["key_file"])
+    if not ks.has_keys:
+        click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
+        sys.exit(1)
+    key_password = click.prompt("Key password", hide_input=True)
+    ks.unlock(key_password)
+
+    client = _get_client(ctx.obj["server"])
+    _load_session(ctx, client)
+
+    try:
+        own_x25519 = ks.x25519_public_key()
+        caches = _discover_key_caches(Path(ctx.obj["key_file"]).parent, key_cache)
+        if not caches:
+            click.echo("No keys.json caches found to migrate.")
+            return
+
+        migrated = 0
+        failed = 0
+        for cache_path in caches:
+            try:
+                cache = _load_owner_key_cache(cache_path)
+                cached_id = cache["file_id"]
+                # Validate the file_id BEFORE building any /self_keys URL —
+                # the cache content is attacker-influenceable (it lived on
+                # disk) and feeds straight into a server path.
+                safe_id = _validate_file_id_local(cached_id)
+                raw_id = bytes.fromhex(safe_id)
+                file_key = bytes.fromhex(cache["file_key"])
+                meta_key = bytes.fromhex(cache["meta_key"])
+                bundle = ks.wrap_file_keys(
+                    file_key=file_key,
+                    meta_key=meta_key,
+                    file_id=raw_id,
+                    recipient_pubkey=own_x25519,
+                )
+                client.post_self_keys(safe_id, bundle)
+            except (StorageError, CryptoError, AuthError, ValueError, KeyError) as e:
+                # Fail-closed: leave the JSON intact so the keys are not lost.
+                failed += 1
+                click.echo(f"  SKIP {cache_path.name}: {e}", err=True)
+                continue
+            # POST succeeded — best-effort plain unlink (see docstring).
+            with contextlib.suppress(OSError):
+                os.unlink(cache_path)
+            migrated += 1
+            click.echo(f"  migrated + removed {cache_path.name}")
+
+        click.echo(f"Done. Migrated {migrated}, left {failed} intact.")
+    finally:
+        ks.lock()
+        client.close()
+
+
 # ──────────── Helpers ────────────
+
+
+def _discover_key_caches(key_dir: Path, extra: str | None) -> list[Path]:
+    """Collect legacy ``*.keys.json`` cache files to migrate.
+
+    Globs ``key_dir`` for ``*.keys.json`` and, if ``extra`` is given,
+    adds either that single file or every ``*.keys.json`` under that
+    directory. Returns a de-duplicated, sorted list of existing paths.
+    """
+    found: set[Path] = set()
+    if key_dir.is_dir():
+        found.update(p for p in key_dir.glob("*.keys.json") if p.is_file())
+    if extra:
+        extra_path = Path(extra)
+        if extra_path.is_dir():
+            found.update(p for p in extra_path.glob("*.keys.json") if p.is_file())
+        elif extra_path.is_file():
+            found.add(extra_path)
+    return sorted(found)
 
 
 _SAFE_FILE_ID_RE = __import__("re").compile(
