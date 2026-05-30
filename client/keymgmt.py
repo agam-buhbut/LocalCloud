@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import keycore
 
-from shared.exceptions import CryptoError
+from shared.exceptions import AuthError, CryptoError
 from shared.usernames import (
     ENROLL_SIG_CONTEXT,
     build_enroll_signing_input,
@@ -185,7 +185,10 @@ def resolve_recipient(api_client: object, username: str) -> bytes:
     """
     try:
         canonical = canonicalize_username(username)
-    except Exception as exc:
+    except AuthError as exc:
+        # canonicalize_username only ever raises AuthError; narrowing the
+        # catch here keeps any unexpected error type from being silently
+        # collapsed into "invalid username". Still fail-closed (CryptoError).
         raise CryptoError(f"Invalid recipient username: {username!r}") from exc
 
     # get_pubkeys returns a dict of raw bytes (empty/zero bytes for absent

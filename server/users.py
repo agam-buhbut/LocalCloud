@@ -136,11 +136,18 @@ async def enroll_x25519():
     if not ok:
         return jsonify({"error": "Invalid request"}), 400
 
-    def _store() -> None:
-        # set_user_x25519 opens its own write transaction.
-        state.db.set_user_x25519(canonical_username, x25519_pub, self_sig)
+    def _store() -> bool:
+        # set_user_x25519 opens its own write transaction; returns True iff
+        # the UPDATE matched a row.
+        return state.db.set_user_x25519(canonical_username, x25519_pub, self_sig)
 
-    await asyncio.to_thread(_store)
+    updated = await asyncio.to_thread(_store)
+    if not updated:
+        # The UPDATE matched 0 rows (e.g. the canonical username has no row,
+        # a race with account deletion). Do NOT falsely report "enrolled";
+        # fold into the generic 400 to keep the response uniform and close
+        # the latent fail-open.
+        return jsonify({"error": "Invalid request"}), 400
     return jsonify({"status": "enrolled"}), 200
 
 

@@ -86,6 +86,21 @@ def test_file_header_validate_bad_chunk_size():
         header.validate()
 
 
+@pytest.mark.parametrize("bad_version", [1, 3])
+def test_file_header_validate_rejects_unsupported_version(bad_version: int):
+    """validate() accepts ONLY PROTOCOL_VERSION (2) — item 2D hard cutover.
+
+    A future reintroduction of a v1 compat-read branch (the
+    version-downgrade oracle the cutover removed) must fail this suite.
+    v=1 covers a downgrade attempt; v=3 covers an unknown future version.
+    """
+    header = _valid_header()
+    assert header.version == PROTOCOL_VERSION  # guard the fixture's assumption
+    header.version = bad_version
+    with pytest.raises(ProtocolError, match="[Uu]nsupported protocol version"):
+        header.validate()
+
+
 # ──────────────────────────── ChunkAAD ────────────────────────────
 
 

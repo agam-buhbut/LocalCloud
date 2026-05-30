@@ -595,3 +595,55 @@ async def test_self_keys_unknown_file_is_404(
         json={"wrapped_keys": bundle.hex()},
     )
     assert resp.status_code == 404
+
+
+async def test_owner_self_decrypts_without_x25519_enrollment(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    seed_file: Callable[..., UploadedFile],
+) -> None:
+    """Self-wrap recovery depends only on the LOCAL keystore, never the dir.
+
+    Addendum-mandated acceptance test. The owner's Ed25519 IS registered
+    (make_keyed_client does that) but the owner has NOT enrolled their
+    X25519 in the directory. We assert:
+
+      1. GET /pubkeys reports the X25519 + self_sig as the all-zero "not
+         enrolled" sentinel (only ed25519 is present), proving self-wrap
+         does not require a directory entry.
+      2. The owner nonetheless self-wraps to their OWN X25519 (read from the
+         local keystore), POSTs /self_keys, fetches /wrapped_keys, and
+         unwraps to the EXACT original file_key/meta_key.
+
+    The unwrap binds the sender to the owner's own Ed25519 key (the same key
+    wrap() bound), so the round-trip closes purely on local key material.
+    """
+    owner = await make_keyed_client()
+    uploaded = seed_file(owner.user_id, owner.keystore, _DATA, visibility=0)
+
+    # 1. The owner is NOT X25519-enrolled: directory returns the all-zero
+    #    sentinel for x25519 + self_sig (ed25519 is present from signup).
+    look = await owner.authed.get(f"/api/users/{owner.username}/pubkeys")
+    assert look.status_code == 200
+    look_body = await look.get_json()
+    assert bytes.fromhex(look_body["x25519"]) == b"\x00" * 32
+    assert bytes.fromhex(look_body["self_sig"]) == b"\x00" * 64
+    assert bytes.fromhex(look_body["ed25519"]) == owner.keystore.ed25519_public_key()  # type: ignore[attr-defined]
+
+    # 2. Self-wrap to the OWN X25519 (local keystore only), register, recover.
+    bundle = _wrap_self(owner, uploaded)
+    store = await owner.authed.post(
+        f"/api/files/{uploaded.file_id}/self_keys",
+        json={"wrapped_keys": bundle.hex()},
+    )
+    assert store.status_code == 200
+
+    keys = await owner.authed.get(f"/api/files/{uploaded.file_id}/wrapped_keys")
+    assert keys.status_code == 200
+    returned = bytes.fromhex((await keys.get_json())["wrapped_keys"])
+    fk, mk = owner.keystore.unwrap_file_keys(  # type: ignore[attr-defined]
+        returned,
+        bytes.fromhex(uploaded.file_id),
+        owner.keystore.ed25519_public_key(),  # type: ignore[attr-defined]
+    )
+    assert fk == uploaded.file_key
+    assert mk == uploaded.meta_key

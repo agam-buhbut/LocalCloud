@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 import struct
 import unicodedata
 
@@ -21,7 +22,7 @@ from shared.exceptions import AuthError
 # Username canonicalization regex (post-NFKC + casefold + strip).
 # Anchored: full-string match. Charset is intentionally narrow so
 # confusable Unicode cannot impersonate an existing account.
-USERNAME_RE = __import__("re").compile(r"^[a-z0-9._-]{3,64}$")
+USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,64}$")
 
 # Domain separation tag for the Ed25519 self-signature a user makes over
 # their enrolled X25519 key. Distinct from MERKLE_SIG_CONTEXT

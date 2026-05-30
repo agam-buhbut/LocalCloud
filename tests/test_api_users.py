@@ -173,6 +173,33 @@ async def test_enroll_rejects_malformed_body(
     assert (await resp.get_json()) == {"error": "Invalid request"}
 
 
+async def test_enroll_row_not_updated_returns_generic_400(
+    app,
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    fast_directory: None,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """If the persist UPDATE matches 0 rows, enroll must 400 (not 200).
+
+    Every upstream gate passes (valid hex/lengths, a genuine self-sig that
+    verifies against the on-file Ed25519). Only the final ``set_user_x25519``
+    UPDATE matches no row — modelling a race with account deletion. The
+    handler must NOT falsely report ``enrolled``; it folds into the generic
+    400, closing the latent fail-open.
+    """
+    kc = await make_keyed_client()
+
+    # Force the persist to report "no row updated" without touching the DB.
+    def _no_row(*_a, **_k) -> bool:
+        return False
+
+    monkeypatch.setattr(app.db, "set_user_x25519", _no_row)
+
+    resp = await _enroll(kc.authed, kc.keystore, kc.username)
+    assert resp.status_code == 400
+    assert (await resp.get_json()) == {"error": "Invalid request"}
+
+
 # ──────────────────────── directory uniformity ────────────────────────
 
 
