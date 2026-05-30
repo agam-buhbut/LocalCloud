@@ -12,9 +12,7 @@ import base64
 import hashlib
 import hmac
 import json
-import re
 import time
-import unicodedata
 import uuid
 from collections import defaultdict, deque
 from functools import wraps
@@ -25,6 +23,7 @@ from server.database import Database
 from server.state import Identity, app_state
 from shared.crypto import hash_password, verify_password
 from shared.exceptions import AuthError, RateLimitError, SessionExpiredError
+from shared.usernames import canonicalize_username as _canonicalize_username
 
 # ──────────────────────────── Session Token ────────────────────────────
 
@@ -95,34 +94,11 @@ def _get_dummy_hash() -> str:
     return _DUMMY_PASSWORD_HASH
 
 
-# Username canonicalization regex (post-NFKC + casefold + strip).
-# Anchored: full-string match. Charset is intentionally narrow.
-_USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,64}$")
-
-
-def _canonicalize_username(raw: str) -> str:
-    """Normalize and validate a username.
-
-    Applies NFKC normalization, casefold, and surrounding-whitespace
-    strip, then enforces a narrow charset. This prevents confusable
-    Unicode (e.g. fullwidth "ＡＤＭＩＮ") from impersonating an existing
-    account and rejects control characters like NUL.
-
-    Raises:
-        AuthError: with a generic message on any rejection.
-    """
-    if not isinstance(raw, str):
-        raise AuthError("Authentication failed")
-    # NUL byte rejection BEFORE normalization — NFKC could otherwise
-    # collapse certain compositions and obscure the embedded NUL.
-    if "\x00" in raw:
-        raise AuthError("Authentication failed")
-    normalized = unicodedata.normalize("NFKC", raw).casefold().strip()
-    if "\x00" in normalized:
-        raise AuthError("Authentication failed")
-    if not _USERNAME_RE.match(normalized):
-        raise AuthError("Authentication failed")
-    return normalized
+# Username canonicalization (NFKC + casefold + strip + narrow charset)
+# now lives in shared.usernames so the client can sign over byte-identical
+# canonical bytes without importing server.*. Imported above as
+# ``_canonicalize_username`` to preserve the existing internal name and
+# the AuthError-raising contract every caller in this module relies on.
 
 
 def create_session_token(

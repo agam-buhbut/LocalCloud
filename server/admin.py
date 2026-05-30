@@ -24,29 +24,35 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import re
 import sys
 import time
-import unicodedata
 from collections.abc import Sequence
 
 from server.config import ServerConfig
 from server.database import Database
 from shared.crypto import hash_password
-
-_USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,64}$")
+from shared.exceptions import AuthError
+from shared.usernames import canonicalize_username as _shared_canonicalize_username
 
 
 def _canonicalize_username(raw: str) -> str:
     """Same normalization rules the login path uses. Reject up front
     so the operator can't accidentally create an unreachable user.
+
+    Delegates to the shared canonicalizer (byte-identical to the server
+    login path) but re-raises its ``AuthError`` as ``ValueError`` so the
+    operator-facing CLI error contract — every command catches a plain
+    ValueError and prints a usage hint — is unchanged.
+
+    Raises:
+        ValueError: if the username is invalid after NFKC+casefold.
     """
-    if "\x00" in raw:
-        raise ValueError("username contains NUL")
-    norm = unicodedata.normalize("NFKC", raw).casefold().strip()
-    if "\x00" in norm or not _USERNAME_RE.match(norm):
-        raise ValueError("username must match [a-z0-9._-]{3,64} after NFKC casefold")
-    return norm
+    try:
+        return _shared_canonicalize_username(raw)
+    except AuthError as exc:
+        raise ValueError(
+            "username must match [a-z0-9._-]{3,64} after NFKC casefold"
+        ) from exc
 
 
 def _open_db(config: ServerConfig) -> Database:

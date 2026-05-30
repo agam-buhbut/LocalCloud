@@ -24,6 +24,7 @@ from server.storage import (
     init_storage,
     storage_bp,
 )
+from server.users import users_bp
 
 # ──────────────────────────── Logging ────────────────────────────
 #
@@ -123,8 +124,12 @@ def create_app(config: ServerConfig | None = None) -> Quart:
     )
 
     # ── Register blueprints ──
+    # users_bp (the X25519 enrollment + pubkey directory, item 2C) is
+    # registered AFTER storage_bp and BEFORE the forwarded-header
+    # assertion below, which must remain the last thing create_app does.
     app.register_blueprint(auth_bp)
     app.register_blueprint(storage_bp)
+    app.register_blueprint(users_bp)
 
     # SEC-M2: fail closed if any forwarded-header / ProxyFix middleware is
     # registered. Peer identity must derive from request.remote_addr

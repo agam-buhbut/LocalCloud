@@ -144,6 +144,50 @@ def login(ctx, username: str):
         client.close()
 
 
+@cli.command()
+@click.argument("username")
+@click.pass_context
+def enroll(ctx, username: str):
+    """Enroll your X25519 key in the server directory (item 2C).
+
+    Derives the X25519 public key from your keystore, signs the
+    domain-separated, username-bound enroll input with your Ed25519 key,
+    and POSTs both to the server. After enrolling, other users can wrap
+    file keys to you via the directory (no out-of-band key exchange).
+
+    ``username`` must be the account name you log in as; it is bound into
+    the self-signature so the key cannot be lifted onto another account.
+    """
+    from client.keymgmt import build_enroll_signing_input
+    from shared.usernames import canonicalize_username
+
+    ks = _get_keystore(ctx.obj["key_file"])
+    if not ks.has_keys:
+        click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
+        sys.exit(1)
+    key_password = click.prompt("Key password", hide_input=True)
+    ks.unlock(key_password)
+
+    client = _get_client(ctx.obj["server"])
+    _load_session(ctx, client)
+    try:
+        try:
+            canonical = canonicalize_username(username)
+        except Exception as e:
+            raise CryptoError(f"Invalid username: {username!r}") from e
+        x25519_pub = ks.x25519_public_key()
+        signing_input = build_enroll_signing_input(canonical, x25519_pub)
+        self_sig = ks.sign(signing_input)
+        client.enroll_x25519(x25519_pub, self_sig)
+        click.echo(f"Enrolled X25519 key for {canonical}.")
+    except (StorageError, CryptoError, AuthError) as e:
+        click.echo(f"Enroll failed: {e}", err=True)
+        sys.exit(1)
+    finally:
+        ks.lock()
+        client.close()
+
+
 def _resolve_owner_pubkey(
     client: CloudClient, file_id: str, override_hex: str | None
 ) -> bytes:
@@ -475,8 +519,13 @@ def quota(ctx):
 @click.argument("recipient")
 @click.option(
     "--recipient-pubkey",
-    required=True,
-    help="Recipient's X25519 public key (hex). Obtain out-of-band or via a future directory.",
+    default=None,
+    help=(
+        "Optional out-of-band override of the recipient's X25519 public "
+        "key (hex). Skips the directory lookup — only use if you trust "
+        "this key from an out-of-band channel. By default the recipient's "
+        "key is resolved AND verified via the server directory."
+    ),
 )
 @click.option(
     "--key-cache",
@@ -488,15 +537,23 @@ def share(
     ctx,
     file_id: str,
     recipient: str,
-    recipient_pubkey: str,
+    recipient_pubkey: str | None,
     key_cache: str | None,
 ):
     """Share a file with another user.
 
-    Requires the recipient's X25519 public key. The client wraps the
-    file_key+meta_key for the recipient and uploads the wrapped bundle;
-    the server never sees plaintext keys.
+    Resolves the recipient's X25519 public key from the server directory
+    and verifies the recipient's Ed25519 self-signature over it before
+    wrapping (so a hostile server cannot substitute its own key). The
+    client wraps file_key+meta_key for the verified recipient and uploads
+    the wrapped bundle; the server never sees plaintext keys.
+
+    Pass ``--recipient-pubkey`` to override the directory with an
+    out-of-band key (explicit trust; the self-signature check is skipped
+    because there is no directory entry to verify).
     """
+    from client.keymgmt import resolve_recipient
+
     ks = _get_keystore(ctx.obj["key_file"])
     if not ks.has_keys:
         click.echo("Error: No keys found.", err=True)
@@ -507,12 +564,19 @@ def share(
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
     try:
-        try:
-            recipient_pk = bytes.fromhex(recipient_pubkey)
-        except ValueError as e:
-            raise CryptoError("--recipient-pubkey is not valid hex") from e
-        if len(recipient_pk) != 32:
-            raise CryptoError("--recipient-pubkey must be 32 bytes")
+        if recipient_pubkey is not None:
+            # Explicit out-of-band override: the operator vouches for this
+            # key directly, so we do not consult (or trust) the directory.
+            try:
+                recipient_pk = bytes.fromhex(recipient_pubkey)
+            except ValueError as e:
+                raise CryptoError("--recipient-pubkey is not valid hex") from e
+            if len(recipient_pk) != 32:
+                raise CryptoError("--recipient-pubkey must be 32 bytes")
+        else:
+            # Default: resolve + MANDATORILY verify via the directory.
+            # resolve_recipient fails closed on a missing/invalid self-sig.
+            recipient_pk = resolve_recipient(client, recipient)
 
         safe_id = _validate_file_id_local(file_id)
         cache_path = (

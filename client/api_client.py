@@ -288,3 +288,70 @@ class CloudClient:
         data = self._check_response(resp)
         wk = data.get("wrapped_keys")
         return bytes.fromhex(wk) if wk else None
+
+    # ──────────────────────── Directory (2C) ────────────────────────
+
+    def enroll_x25519(self, x25519_pubkey: bytes, self_sig: bytes) -> None:
+        """Enroll the caller's X25519 public key + Ed25519 self-signature.
+
+        The server re-verifies the self-signature against the caller's
+        registered Ed25519 key before storing it.
+        """
+        resp = self._client.post(
+            f"{self.server_url}/api/users/enroll_x25519",
+            json={
+                "x25519_pubkey": x25519_pubkey.hex(),
+                "self_sig": self_sig.hex(),
+            },
+            headers=self._headers(),
+        )
+        self._check_response(resp)
+
+    def get_pubkeys(self, username: str) -> dict[str, bytes]:
+        """Fetch a user's directory entry: ed25519 + x25519 + self_sig.
+
+        The directory is a uniform, fixed-size response: absent fields
+        come back as all-zero hex. Those are normalized here to empty
+        ``bytes`` so callers (resolve_recipient) can treat "not enrolled"
+        distinctly and fail closed. Raises StorageError on a malformed
+        (non-hex) field.
+
+        Returns:
+            ``{"ed25519": bytes, "x25519": bytes, "self_sig": bytes}`` with
+            empty bytes for any field the server reported as absent.
+        """
+        resp = self._client.get(
+            f"{self.server_url}/api/users/{username}/pubkeys",
+            headers=self._headers(),
+        )
+        data = self._check_response(resp)
+        out: dict[str, bytes] = {}
+        for field in ("ed25519", "x25519", "self_sig"):
+            raw = data.get(field, "")
+            if not isinstance(raw, str) or not raw:
+                out[field] = b""
+                continue
+            try:
+                decoded = bytes.fromhex(raw)
+            except ValueError as e:
+                raise StorageError(f"Invalid {field} in directory response") from e
+            # All-zero is the server's "absent" sentinel for the
+            # fixed-size response — treat it as empty.
+            out[field] = b"" if not any(decoded) else decoded
+        return out
+
+    def get_enrolled(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        """List enrolled users for share-target discovery (paginated).
+
+        Returns the raw list of ``{"username", "ed25519", "x25519",
+        "self_sig"}`` dicts (hex strings) as returned by the server; the
+        caller is responsible for verifying each self-signature before
+        wrapping.
+        """
+        resp = self._client.get(
+            f"{self.server_url}/api/users/enrolled",
+            params={"limit": limit, "offset": offset},
+            headers=self._headers(),
+        )
+        data = self._check_response(resp)
+        return data["users"]
