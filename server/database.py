@@ -16,7 +16,7 @@ from contextlib import contextmanager
 
 # ──────────────────────────── Schema Version ────────────────────────────
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Grace window for finalizing-flagged rows that have already passed
 # their normal expiry. A finalize handler that crashed mid-commit
@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS users (
     -- user registers a key; clients use this for pinned signature
     -- verification of files owned by this user (H17).
     ed25519_pubkey BLOB NOT NULL DEFAULT x'',
+    -- Long-term X25519 key-agreement public key (32 bytes). Empty until the
+    -- user enrolls. Used by sharers/publishers to wrap file keys to this
+    -- user (2C / FEAT-1).
+    x25519_pubkey BLOB NOT NULL DEFAULT x'',
+    -- Ed25519 self-signature (64 bytes) over enroll_signing_input(x25519_pubkey).
+    -- Lets a sharer who pinned this user's Ed25519 fingerprint verify the
+    -- X25519 key transitively. Empty until enrollment (2C / FEAT-1).
+    x25519_self_sig BLOB NOT NULL DEFAULT x'',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -161,6 +169,15 @@ CREATE INDEX IF NOT EXISTS idx_file_shares_user
     ON file_shares(shared_with_id);
 CREATE INDEX IF NOT EXISTS idx_staging_uploads_owner
     ON staging_uploads(owner_id, finalizing, expires_at);
+"""
+
+# Migration from schema v5 to v6: add the user's long-term X25519
+# key-agreement public key plus its Ed25519 self-signature (2C / FEAT-1).
+# Existing v5 rows migrate with empty key + empty self-sig — i.e. "not
+# enrolled". Idempotent via the duplicate-column catch in the runner.
+MIGRATION_V5_TO_V6 = """
+ALTER TABLE users ADD COLUMN x25519_pubkey BLOB NOT NULL DEFAULT x'';
+ALTER TABLE users ADD COLUMN x25519_self_sig BLOB NOT NULL DEFAULT x'';
 """
 
 
@@ -289,6 +306,13 @@ class Database:
                 # catch.
                 self._conn.executescript(MIGRATION_V4_TO_V5)
                 current = 5
+            if current < 6:
+                try:
+                    self._conn.executescript(MIGRATION_V5_TO_V6)
+                except sqlite3.OperationalError as exc:
+                    if not _is_duplicate_column_error(exc):
+                        raise
+                current = 6
             self._conn.execute(
                 "UPDATE schema_version SET version = ?",
                 (SCHEMA_VERSION,),
@@ -415,6 +439,88 @@ class Database:
                 (quota_bytes, time.time(), username),
             )
             return cursor.rowcount > 0
+
+    # ──────────────────────────── X25519 Enrollment ────────────────────────────
+
+    def set_user_x25519(
+        self,
+        username: str,
+        x25519_pubkey: bytes,
+        self_sig: bytes,
+    ) -> bool:
+        """Store a user's X25519 public key and its Ed25519 self-signature.
+
+        Enrollment for 2C key delivery. The caller is responsible for
+        canonicalizing ``username`` and for verifying ``self_sig`` against
+        the user's Ed25519 key before calling — this layer only persists.
+
+        Args:
+            username: Canonical username (caller-canonicalized, consistent
+                with the other user lookups in this layer).
+            x25519_pubkey: 32-byte X25519 key-agreement public key.
+            self_sig: 64-byte Ed25519 self-signature over the
+                domain-separated, username-bound enroll input.
+
+        Returns:
+            True if the user existed (a row was updated).
+        """
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE users SET x25519_pubkey = ?, x25519_self_sig = ?, "
+                "updated_at = ? WHERE username = ?",
+                (x25519_pubkey, self_sig, time.time(), username),
+            )
+            return cursor.rowcount > 0
+
+    def get_user_x25519(self, username: str) -> tuple[bytes, bytes] | None:
+        """Return ``(x25519_pubkey, self_sig)`` for an enrolled user.
+
+        Returns None when the user is unknown OR has not enrolled an
+        X25519 key (the columns are still empty). Note: the HTTP directory
+        layer — NOT this method — is responsible for the uniform,
+        non-enumerating response; here None genuinely means "no usable key".
+
+        Args:
+            username: Canonical username (caller-canonicalized).
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT x25519_pubkey, x25519_self_sig FROM users "
+                "WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if row is None:
+                return None
+            pubkey = bytes(row["x25519_pubkey"] or b"")
+            sig = bytes(row["x25519_self_sig"] or b"")
+            if not pubkey or not sig:
+                return None
+            return pubkey, sig
+
+    def list_enrolled_users(self) -> list[dict]:
+        """List users who have enrolled an X25519 key (non-empty columns).
+
+        Backs the publish-fanout directory. Each entry carries the
+        username plus the public Ed25519 / X25519 keys and the X25519
+        self-signature so a caller can verify the self-sig before wrapping.
+        All returned fields are public by definition.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT username, ed25519_pubkey, x25519_pubkey, "
+                "x25519_self_sig FROM users "
+                "WHERE x25519_pubkey != x'' AND x25519_self_sig != x'' "
+                "ORDER BY username",
+            ).fetchall()
+            return [
+                {
+                    "username": row["username"],
+                    "ed25519_pubkey": bytes(row["ed25519_pubkey"] or b""),
+                    "x25519_pubkey": bytes(row["x25519_pubkey"] or b""),
+                    "x25519_self_sig": bytes(row["x25519_self_sig"] or b""),
+                }
+                for row in rows
+            ]
 
     # ──────────────────────────── Rate Limiting ────────────────────────────
 

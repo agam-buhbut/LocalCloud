@@ -11,11 +11,50 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
+import time
 from pathlib import Path
 
 import pytest
 
-from server.database import Database
+from server.database import SCHEMA_VERSION, Database
+
+# A users table shaped exactly as it was at schema v5 — i.e. WITHOUT the
+# v6 x25519 columns — so a v6 migration applied over it exercises the real
+# ALTER path (rather than a no-op against an already-current SCHEMA_SQL).
+_V5_USERS_TABLE = """
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+CREATE TABLE users (
+    user_id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    quota_bytes INTEGER NOT NULL DEFAULT 1073741824,
+    used_bytes INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    session_version INTEGER NOT NULL DEFAULT 1,
+    ed25519_pubkey BLOB NOT NULL DEFAULT x'',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
+
+def _make_v5_db(path: str) -> None:
+    """Create a raw sqlite file at schema v5 (no x25519 columns, one row)."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_V5_USERS_TABLE)
+        conn.execute("INSERT INTO schema_version (version) VALUES (5)")
+        now = time.time()
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("legacy-uid", "legacy", "$argon2id$x", now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 # The `db` fixture now lives in tests/conftest.py (canonical, shared).
 
@@ -170,7 +209,7 @@ def test_list_user_files_rejects_bad_pagination(db: Database):
 
 def test_schema_version_set(db: Database):
     row = db.conn.execute("SELECT version FROM schema_version").fetchone()
-    assert row["version"] == 5
+    assert row["version"] == 6
 
 
 def test_double_connect_is_idempotent(tmp_path: Path):
@@ -182,7 +221,7 @@ def test_double_connect_is_idempotent(tmp_path: Path):
     d2 = Database(path)
     d2.connect()
     row = d2.conn.execute("SELECT version FROM schema_version").fetchone()
-    assert row["version"] == 5
+    assert row["version"] == 6
     d2.close()
 
 
@@ -202,3 +241,147 @@ def test_owner_pubkey_default_empty(db: Database):
         )
     pk = db.get_owner_ed25519_pubkey(fid)
     assert pk == b"", "default ed25519_pubkey should surface as empty bytes, not None"
+
+
+# ──────────────────────────── Schema v6 (2C) ────────────────────────────
+
+
+def test_fresh_db_reports_version_6(db: Database):
+    row = db.conn.execute("SELECT version FROM schema_version").fetchone()
+    assert row["version"] == 6
+    assert SCHEMA_VERSION == 6
+
+
+def test_fresh_db_has_x25519_columns(db: Database):
+    cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(users)").fetchall()}
+    assert "x25519_pubkey" in cols
+    assert "x25519_self_sig" in cols
+
+
+def test_v5_to_v6_migration_adds_columns(tmp_path: Path):
+    path = str(tmp_path / "v5.db")
+    _make_v5_db(path)
+
+    d = Database(path)
+    d.connect()
+    try:
+        row = d.conn.execute("SELECT version FROM schema_version").fetchone()
+        assert row["version"] == 6
+        cols = {
+            r["name"] for r in d.conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        assert "x25519_pubkey" in cols
+        assert "x25519_self_sig" in cols
+        # Pre-existing v5 row survives and is "not enrolled" (empty cols).
+        assert d.get_user_x25519("legacy") is None
+        legacy = d.get_user_by_username("legacy")
+        assert legacy is not None
+        assert legacy["x25519_pubkey"] == b""
+        assert legacy["x25519_self_sig"] == b""
+    finally:
+        d.close()
+
+
+def test_v5_to_v6_migration_is_idempotent(tmp_path: Path):
+    """Running connect() twice over the same file must not fail on the
+    duplicate ALTER (the duplicate-column catch in the runner)."""
+    path = str(tmp_path / "v5.db")
+    _make_v5_db(path)
+
+    d1 = Database(path)
+    d1.connect()
+    d1.close()
+
+    # Second open sees version == SCHEMA_VERSION and takes the no-op path;
+    # force the migration script to run twice as a direct check too.
+    d2 = Database(path)
+    d2.connect()
+    try:
+        # Re-running the migration script directly must be tolerated.
+        from server.database import MIGRATION_V5_TO_V6
+
+        try:
+            d2.conn.executescript(MIGRATION_V5_TO_V6)
+        except sqlite3.OperationalError as exc:
+            assert "duplicate column name" in str(exc).lower()
+        row = d2.conn.execute("SELECT version FROM schema_version").fetchone()
+        assert row["version"] == 6
+    finally:
+        d2.close()
+
+
+def test_db_at_version_6_does_not_fail_closed_guard(tmp_path: Path):
+    """A DB already at the current version opens cleanly (no mismatch)."""
+    path = str(tmp_path / "v6.db")
+    d1 = Database(path)
+    d1.connect()
+    d1.close()
+    d2 = Database(path)
+    d2.connect()  # must not raise
+    try:
+        row = d2.conn.execute("SELECT version FROM schema_version").fetchone()
+        assert row["version"] == 6
+    finally:
+        d2.close()
+
+
+def test_db_above_version_6_fails_closed(tmp_path: Path):
+    """A DB stamped above the known version fails the <6 / mismatch guard."""
+    path = str(tmp_path / "future.db")
+    d1 = Database(path)
+    d1.connect()
+    d1.conn.execute("UPDATE schema_version SET version = 7")
+    d1.close()
+
+    d2 = Database(path)
+    with pytest.raises(RuntimeError, match="Schema version mismatch"):
+        d2.connect()
+
+
+def test_set_and_get_user_x25519_round_trips(db: Database):
+    _create_user(db)
+    pubkey = bytes(range(32))
+    sig = bytes(range(64))
+    assert db.set_user_x25519("alice", pubkey, sig) is True
+
+    got = db.get_user_x25519("alice")
+    assert got is not None
+    out_pub, out_sig = got
+    assert out_pub == pubkey
+    assert isinstance(out_pub, bytes)
+    assert out_sig == sig
+    assert isinstance(out_sig, bytes)
+
+
+def test_set_user_x25519_unknown_user_returns_false(db: Database):
+    assert db.set_user_x25519("ghost", bytes(32), bytes(64)) is False
+
+
+def test_get_user_x25519_unenrolled_returns_none(db: Database):
+    _create_user(db)
+    assert db.get_user_x25519("alice") is None
+
+
+def test_get_user_x25519_unknown_returns_none(db: Database):
+    assert db.get_user_x25519("nobody") is None
+
+
+def test_list_enrolled_users_only_returns_enrolled(db: Database):
+    _create_user(db, "alice")
+    _create_user(db, "bob")
+    _create_user(db, "carol")
+    db.set_user_x25519("alice", bytes(range(32)), bytes(range(64)))
+    db.set_user_x25519("carol", bytes(range(32, 64)), bytes(range(64, 128)))
+
+    enrolled = db.list_enrolled_users()
+    names = [e["username"] for e in enrolled]
+    assert names == ["alice", "carol"], "bob is not enrolled; order is by username"
+    alice = enrolled[0]
+    assert alice["x25519_pubkey"] == bytes(range(32))
+    assert alice["x25519_self_sig"] == bytes(range(64))
+    assert isinstance(alice["ed25519_pubkey"], bytes)
+
+
+def test_list_enrolled_users_empty_when_none_enrolled(db: Database):
+    _create_user(db, "alice")
+    assert db.list_enrolled_users() == []
