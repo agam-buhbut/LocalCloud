@@ -16,6 +16,71 @@ This is a DESIGN document. It defines wire formats, schema, APIs, message flows,
 TDD task list for the Phase-2 implementer. It writes **no production code** and modifies no source
 file. Every decision is grounded in the code as it exists today (citations are `file:line`).
 
+## ⚖️ Execution decisions & review revisions (2026-05-30, owner-approved)
+
+This section OVERRIDES the body below where they conflict. It folds the owner's scope
+decisions and the two adversarial reviews (crypto/security + implementability — both
+verdict *sound-with-changes*).
+
+**Scope this round: implement 2A + 2C + 2D. DEFER 2B.**
+- **2B (public visibility) is DEFERRED** pending a *key-committing AEAD* single-bundle design
+  that is separately security-reviewed. The owner rejected both weak forms (the
+  "documented-limitation / not-confidential-against-the-server" model and the
+  "pinned-allow-list" model). Therefore: **do NOT implement** `PUT /visibility`, the
+  publish/fan-out flow, `share_bulk`, `MAX_PUBLISH_FANOUT`, or any "public" semantics in this
+  round. Record 2B in the master plan's Accepted-Limitations as "deferred — needs committing-AEAD
+  design". (A committing AEAD can be built from audited primitives — e.g. a BLAKE2b key
+  commitment composed with XChaCha20-Poly1305 — so a future design need not introduce a custom
+  primitive; that design is a separate deliverable.)
+
+**2D: HARD CUTOVER (no v1 compatibility-read).**
+- `PROTOCOL_VERSION` 1→2; `FileHeader.validate()` accepts **only** version 2 (NOT a
+  `SUPPORTED_VERSIONS` set). There is **no §6.6(A) v1 compatibility branch** — this deletes the
+  version-downgrade oracle the security review flagged. Existing v1 files (if any) must be
+  re-uploaded; there is no production data yet. Audit `tests/test_models.py` for any
+  `version == 1`/`== PROTOCOL_VERSION` assertions and update them to v2 (a legitimate test update,
+  not a weakening).
+- Corrected **2D negative test** (the doc's T-2D.6 as written trips the signature gate, not the
+  metadata AAD): build TWO genuine, correctly-signed v2 files of the same `file_id` (versions M
+  and N), then feed file-M's header+chunks with file-N's `encrypted_metadata` and assert a
+  `DecryptionError` from the **metadata AEAD** specifically. Keep T-2D.4 (root computed before
+  metadata; metadata never a Merkle leaf) as a hard gate.
+
+**Cross-cutting fixes to fold in (from the reviews — apply without further approval):**
+- **Blueprint wiring:** the `/api/users/*` endpoints (enroll, directory) have no home today
+  (`app.py` registers only `auth_bp` + `storage_bp`). Create `server/users.py` with
+  `users_bp = Blueprint("users", __name__, url_prefix="/api/users")` and register it in
+  `create_app` — and keep `assert_no_forwarded_header_middleware(app)` running LAST.
+- **New key-glue lives in a NEW module `client/keymgmt.py`** (NOT a revived `client/sharing.py`).
+  Phase 3C still deletes the dead `client/sharing.py` as planned — no cross-phase conflict.
+- **Directory lookup hardening is MANDATORY, not conditional:** `GET /api/users/<u>/pubkeys`
+  must use a constant-deadline envelope mirroring `_SHARE_TIMING_BUDGET_S` AND a fixed-size
+  response (pad present-vs-absent to identical length) so neither timing nor body length is an
+  enumeration oracle. Add equality assertions for both.
+- **`enroll_x25519`:** collapse the `409 "No identity key"` into the generic `400` (the client
+  knows its own Ed25519 state locally) to preserve uniform-response discipline.
+- **`self_keys` / any stored ephemeral-static bundle:** validate length is **exactly 136 bytes**
+  (PUBKEY 32 + NONCE 24 + PAYLOAD 64 + TAG 16), not the loose 136..4096 range.
+- **Self-wrap depends ONLY on the local keystore X25519** (`KeyStore.x25519_public_key()`), NOT on
+  directory enrollment. Add an acceptance test: an owner whose Ed25519 is registered but whose
+  X25519 is NOT yet enrolled can still self-decrypt. Note in the design that AAD binds
+  `recipient_pubkey`, so an X25519 rotation would orphan existing self-share/recipient bundles —
+  record as a future key-rotation item (Phase 7), out of scope here.
+- **`canonicalize_username` must be byte-identical on client and server** over the same input the
+  enroll signature covers. Put the single implementation in **`shared/`** (the client must not
+  import from `server.*`). This converges with Phase 3B's dedup — place it in `shared/` now.
+- **`migrate-keys`:** validate each cached `file_id` before building the `/self_keys` URL;
+  require/inject a session; downgrade "shred-and-unlink" to a plain best-effort `unlink` with a
+  comment that in-place overwrite is NOT a secure wipe on CoW/SSD/journaled FS and that a
+  `keys.json` which ever existed should be treated as potentially compromised; assert a failed
+  POST leaves the JSON intact (fail-closed).
+- **`enroll_x25519` self-signature** must bind the **canonical** username; add a test that a
+  self-sig over a non-canonical username is rejected, plus the client/server canonicalization
+  parity test.
+
+Everything below stands EXCEPT the 2B/public sections and the §6.6(A) compatibility path, which
+are out of scope this round per the decisions above.
+
 ## Master-plan invariants (held throughout)
 
 These are non-negotiable and gate every decision below. (README PART II §5, §10.)
