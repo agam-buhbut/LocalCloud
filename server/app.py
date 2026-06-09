@@ -91,6 +91,7 @@ def create_app(config: ServerConfig | None = None) -> Quart:
         session_lifetime=config.session_lifetime,
         rate_limit_max=config.rate_limit_max_attempts,
         rate_limit_window=config.rate_limit_window_seconds,
+        argon2_max_concurrent=config.argon2_max_concurrent,
     )
     init_storage(
         db=db,

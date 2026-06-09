@@ -60,6 +60,10 @@ _DUMMY_PASSWORD_HASH: str | None = None
 # configured memory footprint.
 _MAX_CONCURRENT_ARGON2 = 4
 
+# Effective ceiling; overridden by init_auth from ServerConfig (PERF-H3).
+# Kept as a module global so the lazy semaphore picks up the configured value.
+_argon2_max_concurrent = _MAX_CONCURRENT_ARGON2
+
 # Semaphore is created lazily inside the running event loop so that an
 # unrelated import (e.g. from a test runner) doesn't bind it to a
 # now-stale loop. (#C4)
@@ -70,7 +74,7 @@ def _get_argon2_semaphore() -> asyncio.Semaphore:
     """Return the process-wide semaphore, creating it on first use."""
     global _argon2_semaphore
     if _argon2_semaphore is None:
-        _argon2_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ARGON2)
+        _argon2_semaphore = asyncio.Semaphore(_argon2_max_concurrent)
     return _argon2_semaphore
 
 
@@ -397,6 +401,7 @@ def init_auth(
     session_lifetime: int = 3600,
     rate_limit_max: int = 5,
     rate_limit_window: int = 60,
+    argon2_max_concurrent: int = _MAX_CONCURRENT_ARGON2,
 ) -> None:
     """Initialize the auth module's process-global state.
 
@@ -413,14 +418,17 @@ def init_auth(
     """
     global _db, _session_secret, _session_lifetime
     global _rate_limit_max, _rate_limit_window
-    global _argon2_semaphore
+    global _argon2_semaphore, _argon2_max_concurrent
+    if argon2_max_concurrent < 1:
+        raise ValueError("argon2_max_concurrent must be >= 1")
     _db = db
     _session_secret = session_secret
     _session_lifetime = session_lifetime
     _rate_limit_max = rate_limit_max
     _rate_limit_window = rate_limit_window
+    _argon2_max_concurrent = argon2_max_concurrent
     if _argon2_semaphore is None:
-        _argon2_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ARGON2)
+        _argon2_semaphore = asyncio.Semaphore(_argon2_max_concurrent)
 
 
 def _get_peer_identity() -> str:

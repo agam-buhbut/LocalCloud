@@ -50,6 +50,12 @@ class ServerConfig:
     # ── Security ──
     # Maximum request body size (slightly larger than chunk size + overhead)
     max_content_length: int = 5 * 1024 * 1024  # 5 MiB
+    # Max concurrent Argon2id verifications (PERF-H3). Each verification holds
+    # ~128 MiB, so this bounds login-burst memory at argon2_max_concurrent ×
+    # that. It is PER PROCESS and correct only under the committed single-
+    # worker model: under N workers the effective ceiling is N× this value.
+    # Never raise it past what RAM allows; never lower the Argon2 cost itself.
+    argon2_max_concurrent: int = 4
 
     @classmethod
     def from_env(cls) -> ServerConfig:
@@ -105,6 +111,11 @@ class ServerConfig:
         )
         config.max_content_length = int(
             os.environ.get("LOCALCLOUD_MAX_CONTENT_LENGTH", config.max_content_length)
+        )
+        config.argon2_max_concurrent = int(
+            os.environ.get(
+                "LOCALCLOUD_ARGON2_MAX_CONCURRENT", config.argon2_max_concurrent
+            )
         )
 
         return config
@@ -179,6 +190,8 @@ class ServerConfig:
             raise ValueError("rate_limit_window_seconds must be >= 1")
         if self.max_content_length < 1024:
             raise ValueError("max_content_length too small")
+        if self.argon2_max_concurrent < 1:
+            raise ValueError("argon2_max_concurrent must be >= 1")
 
     def ensure_directories(self) -> None:
         """Create required directories if they don't exist."""

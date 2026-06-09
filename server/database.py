@@ -226,6 +226,14 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         # Busy timeout (5 seconds)
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # PERF (4B-a): under WAL, synchronous=NORMAL is crash-safe — the
+        # database cannot corrupt; the only exposure is losing the *last*
+        # committed transaction on an OS crash / power loss (a checkpoint
+        # still syncs the WAL into the main db). FULL would additionally
+        # fsync on every commit. We keep durability of file *bytes* (the
+        # per-chunk fsync in storage.py is unchanged); this only relaxes the
+        # per-commit fsync of the metadata WAL. See docs/benchmarks.md (4B).
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         # Initialize schema
         self._init_schema()
 
@@ -692,25 +700,54 @@ class Database:
         """
         if limit < 1 or limit > 200 or offset < 0:
             raise ValueError("limit/offset out of range")
+        # PERF (4D): the previous query UNION'd the three visibility branches
+        # and then sorted the whole result, building two TEMP B-trees for the
+        # UNION dedup and one for the ORDER BY over the ENTIRE matching set —
+        # so first-page latency tracked total public-file count (measured 0.86
+        # ms @200 files -> 17.6 ms @5000; see docs/benchmarks.md).
+        #
+        # Since we only need one page, the global top (offset+limit) rows are
+        # contained in the union of each branch's own top (offset+limit) rows
+        # (a row globally in the top-N is at worst at rank N within its own
+        # branch; dedup cannot push a distinct row past that). So we cap each
+        # branch with ORDER BY created_at DESC LIMIT (offset+limit): the public
+        # branch is served directly by idx_files_visibility(visibility,
+        # created_at DESC) and stops after `cap` rows instead of materializing
+        # the whole corpus. UNION ALL then preserves duplicates, GROUP BY
+        # file_id dedups (every column is identical across branches for the
+        # same file, so the bare-column pick is deterministic), and the outer
+        # sort runs over at most 3*cap rows rather than the full corpus.
+        inner_cap = limit + offset
         with self._lock:
             rows = self.conn.execute(
                 """SELECT file_id, owner_id, filename, visibility,
                           total_chunks, total_bytes, created_at FROM (
-                    SELECT f.file_id, f.owner_id, f.filename, f.visibility,
-                           f.total_chunks, f.total_bytes, f.created_at
-                    FROM files f WHERE f.owner_id = ?
-                    UNION
-                    SELECT f.file_id, f.owner_id, f.filename, f.visibility,
-                           f.total_chunks, f.total_bytes, f.created_at
-                    FROM files f
-                    JOIN file_shares fs ON f.file_id = fs.file_id
-                    WHERE fs.shared_with_id = ?
-                    UNION
-                    SELECT f.file_id, f.owner_id, f.filename, f.visibility,
-                           f.total_chunks, f.total_bytes, f.created_at
-                    FROM files f WHERE f.visibility = 2
-                ) ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-                (user_id, user_id, limit, offset),
+                    SELECT * FROM (
+                        SELECT f.file_id, f.owner_id, f.filename, f.visibility,
+                               f.total_chunks, f.total_bytes, f.created_at
+                        FROM files f WHERE f.owner_id = ?
+                        ORDER BY f.created_at DESC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT * FROM (
+                        SELECT f.file_id, f.owner_id, f.filename, f.visibility,
+                               f.total_chunks, f.total_bytes, f.created_at
+                        FROM files f
+                        JOIN file_shares fs ON f.file_id = fs.file_id
+                        WHERE fs.shared_with_id = ?
+                        ORDER BY f.created_at DESC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT * FROM (
+                        SELECT f.file_id, f.owner_id, f.filename, f.visibility,
+                               f.total_chunks, f.total_bytes, f.created_at
+                        FROM files f WHERE f.visibility = 2
+                        ORDER BY f.created_at DESC LIMIT ?
+                    )
+                )
+                GROUP BY file_id
+                ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                (user_id, inner_cap, user_id, inner_cap, inner_cap, limit, offset),
             ).fetchall()
             return [dict(row) for row in rows]
 
