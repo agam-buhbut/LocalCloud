@@ -1,0 +1,52 @@
+# AppArmor profile for the LocalCloud daemon (PART II §1).
+# Install to /etc/apparmor.d/usr.local.bin.localcloud-server, then:
+#   apparmor_parser -r /etc/apparmor.d/usr.local.bin.localcloud-server
+#   aa-status   # confirm it is in "enforce" mode
+#
+# UNTESTED TEMPLATE. Confining a Python interpreter is fiddly — the profile
+# must allow the venv + system libraries while denying everything else. Run in
+# `complain` mode first (aa-complain) under a representative workload, then
+# `aa-logprof` to absorb the legitimate accesses, then switch to enforce.
+# This is defence-in-depth ON TOP OF the systemd sandbox in localcloud.service,
+# not a replacement for it.
+
+abi <abi/3.0>,
+include <tunables/global>
+
+# Attach to the interpreter that hypercorn execs.
+/opt/localcloud/venv/bin/python3 flags=(enforce) {
+  include <abstractions/base>
+  include <abstractions/python>
+  include <abstractions/openssl>
+
+  # Interpreter + application code: read/exec only (code is never writable).
+  /opt/localcloud/venv/{,**} r,
+  /opt/localcloud/venv/bin/python3* ix,
+  /opt/localcloud/venv/**/*.so mr,
+  /usr/lib/python3.*/{,**} r,
+  /usr/bin/python3* ix,
+
+  # Live data: the ONLY writable tree.
+  /srv/cloud/ rw,
+  /srv/cloud/** rwk,            # k = lock (SQLite WAL needs fcntl locks)
+
+  # Session secret via the systemd credentials dir (read-only).
+  @{run}/credentials/localcloud.service/session_secret r,
+
+  # Networking on the WireGuard interface.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+
+  # Entropy + basic process introspection.
+  /dev/urandom r,
+  /dev/random r,
+  owner @{PROC}/@{pid}/** r,
+
+  # Hard denies (belt-and-suspenders; systemd already blocks most).
+  deny /etc/shadow rwklx,
+  deny /home/** rwklx,
+  deny /root/** rwklx,
+  audit deny /srv/cloud/** mx,   # never execute anything from the data dir
+}

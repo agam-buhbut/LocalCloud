@@ -1,0 +1,40 @@
+# /etc/wireguard/wg0.conf  — LocalCloud server tunnel (TEMPLATE)
+#
+# Transport-only: the tunnel carries NO file keys, metadata keys, or secrets
+# (README.txt PART II §3). Compromise of the tunnel does not compromise stored
+# data. Generate keys ON THE BOX, from the console:
+#
+#   umask 077
+#   wg genkey | tee server.private | wg pubkey > server.public
+#   # per client:
+#   wg genkey | tee client-alice.private | wg pubkey > client-alice.public
+#
+# The client PINS this server's public key (set it as the [Peer] PublicKey in
+# the client's own wg config). The server authenticates clients ONLY via the
+# public-key allowlist below — a peer whose key is not listed cannot complete a
+# handshake.
+
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+# Paste the contents of server.private here (file mode 0600, root-only):
+PrivateKey = <SERVER_PRIVATE_KEY>
+# No DNS, no PostUp routing tricks — keep the tunnel minimal.
+# Do NOT add `SaveConfig = true` (it would rewrite this file and drop comments).
+
+# ─────────────────────────── Peer allowlist ───────────────────────────
+# One [Peer] block per authorized client. AllowedIPs MUST be a /32 so the
+# source-IP ↔ pubkey mapping is 1:1 — the server derives peer identity from the
+# WireGuard source IP (SEC-M2). Never use a wide AllowedIPs here.
+#
+# Revoke a client by deleting its block and running:  wg syncconf wg0 <(wg-quick strip wg0)
+
+[Peer]
+# alice
+PublicKey = <CLIENT_ALICE_PUBLIC_KEY>
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+# bob
+PublicKey = <CLIENT_BOB_PUBLIC_KEY>
+AllowedIPs = 10.0.0.3/32

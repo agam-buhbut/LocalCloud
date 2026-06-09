@@ -1,0 +1,12 @@
+# /etc/systemd/system/localcloud-online.service
+# Opens the WireGuard port in the firewall (brings the box "online").
+# Driven by localcloud-online.timer, or run manually:
+#   systemctl start localcloud-online.service
+[Unit]
+Description=LocalCloud: open the WireGuard port (go online)
+After=nftables.service
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/localcloud-online.sh

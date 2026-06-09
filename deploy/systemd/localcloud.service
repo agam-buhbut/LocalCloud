@@ -1,0 +1,80 @@
+# /etc/systemd/system/localcloud.service
+#
+# The E2EE cloud daemon, run as an unprivileged user, sandboxed, reachable
+# only over WireGuard. See deploy/README.md for the consistency contract and
+# the single-worker requirement.
+
+[Unit]
+Description=LocalCloud E2EE cloud server (hostile-box, WireGuard-only)
+After=network-online.target wg-quick@wg0.service nftables.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=localcloud
+Group=localcloud
+WorkingDirectory=/srv/cloud
+
+# ── Secret hygiene (SEC-M2/secret) ──
+# The session HMAC secret is passed via the systemd credentials directory
+# (%d), never an environment variable (env is readable via /proc/<pid>/environ
+# to the same uid). The app reads it from the file path.
+LoadCredential=session_secret:/etc/localcloud/session.secret
+Environment=LOCALCLOUD_SESSION_SECRET_FILE=%d/session_secret
+Environment=LOCALCLOUD_DATA_DIR=/srv/cloud
+Environment=LOCALCLOUD_BIND_HOST=10.0.0.1
+Environment=LOCALCLOUD_BIND_PORT=8443
+# Keep the token-forgery window small if the secret ever leaks (1h):
+Environment=LOCALCLOUD_SESSION_LIFETIME=3600
+
+# Single worker — MANDATORY (rate limiter + Argon2 cap are per-process state;
+# see deploy/README.md "Single-worker requirement"). Bind the WG address
+# directly: NO reverse proxy / forwarded-header middleware (SEC-M2).
+ExecStart=/opt/localcloud/venv/bin/hypercorn --workers 1 \
+    --bind 10.0.0.1:8443 "server.app:create_app()"
+
+# ── No core dumps, no swap of secrets ──
+LimitCORE=0
+MemorySwapMax=0
+
+# ── Sandboxing (PART II §1) ──
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/cloud
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @cpu-emulation @swap
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Egress limited to the WG subnet + loopback (the daemon only serves WG peers).
+IPAddressDeny=any
+IPAddressAllow=10.0.0.0/24 localhost
+# NOTE (UNTESTED): MemoryDenyWriteExecute=yes is desirable but can break cffi
+# (argon2-cffi) which may allocate executable trampolines. Enable it and verify
+# logins still work; if Argon2 verification fails at runtime, remove this line.
+MemoryDenyWriteExecute=yes
+
+# ── Resilience ──
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# /etc/systemd/system/localcloud-offline.service
+# Closes the WireGuard port (takes the box "offline"). Driven by
+# localcloud-offline.timer, or run manually.
+[Unit]
+Description=LocalCloud: close the WireGuard port (go offline)
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/localcloud-offline.sh

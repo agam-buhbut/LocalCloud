@@ -1,0 +1,13 @@
+# /etc/systemd/system/localcloud-online.timer
+# Scheduled uptime: open the WG port on a calendar (EXAMPLE: 08:00 daily).
+# Adjust OnCalendar to your availability window. `systemctl enable --now` it.
+[Unit]
+Description=LocalCloud: scheduled online window (open WG port)
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=false
+Unit=localcloud-online.service
+
+[Install]
+WantedBy=timers.target

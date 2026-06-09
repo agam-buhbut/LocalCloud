@@ -1,0 +1,59 @@
+#!/usr/sbin/nft -f
+#
+# LocalCloud firewall — default-deny inbound; the ONLY reachable inbound port
+# is the WireGuard UDP port, and only while the box is "online" (README.txt
+# PART II §2). Apply with:  nft -f deploy/nftables/localcloud.nft
+# Persist across boot: copy to /etc/nftables.conf and `systemctl enable nftables`.
+#
+# Availability is toggled by adding/removing the WG port from the `wg_online`
+# set (see deploy/scripts/localcloud-{online,offline}.sh and the uptime timers).
+# The set starts EMPTY => the box is OFFLINE by default. Nothing is reachable
+# until localcloud-online.sh (or the online timer) runs.
+
+flush ruleset
+
+table inet localcloud {
+
+    # Ports that are currently reachable from the WAN. Toggled at runtime:
+    #   nft add element    inet localcloud wg_online { 51820 }   # online
+    #   nft delete element inet localcloud wg_online { 51820 }   # offline
+    set wg_online {
+        type inet_service
+        # (empty on load — offline by default)
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # WireGuard handshake/transport from the WAN, per-source rate limited
+        # BEFORE it reaches the daemon (pre-daemon rate limiting, PART II §2).
+        # Gated by the wg_online set so the uptime control can open/close it.
+        udp dport @wg_online \
+            meter wg_ratelimit { ip saddr limit rate 25/second burst 40 packets } \
+            accept
+
+        # Traffic that already came up inside the tunnel (the app on
+        # 10.0.0.1:8443, ICMP for path MTU, etc.). The app binds only to wg0.
+        iifname "wg0" accept
+
+        # Minimal ICMP for connectivity (rate limited); everything else dropped.
+        ip protocol icmp icmp type { echo-request } limit rate 5/second accept
+        ip6 nexthdr ipv6-icmp limit rate 5/second accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        # This is an endpoint, not a router — never forward.
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+        # Egress is open: the daemon only talks to WG peers (further constrained
+        # by systemd IPAddressDeny in localcloud.service). Tighten here if you
+        # want belt-and-suspenders egress filtering.
+    }
+}
