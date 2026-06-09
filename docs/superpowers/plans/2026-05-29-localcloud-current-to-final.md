@@ -560,6 +560,24 @@ must re-read. Pure restructuring — no behavior change; tests must stay green.
 benchmark, change one thing, re-measure, document the delta.** No optimization
 without a profile.
 
+> **✅ EXECUTED 2026-06-09 (measure-first; 4D + 4B-a + 4F applied)** — commit
+> `65d1370`. Baselines + deltas in **`docs/benchmarks.md`**. **328 tests green**;
+> ruff/pyright clean; pylint 9.84. The deterministic baseline (`EXPLAIN QUERY
+> PLAN` + timings on the real schema) showed every query Phase 4 names is ≤ ~1 ms
+> at realistic single-user sizes, so most speculative tasks are **unjustified at
+> the target scale** and the concurrency ones **can't be profiled here** (no
+> `py-spy`/`strace`, no real load/corpus). Applied (owner-approved): **4D**
+> `list_user_files` rewrite (per-branch `LIMIT offset+limit` + `UNION ALL` +
+> `GROUP BY file_id`; public branch now index-served, **17.6 → 3.4 ms @5k public,
+> 5.1×**, no longer scales with public count; behavior pinned by
+> `tests/test_list_user_files.py`); **4B-a** `PRAGMA synchronous=NORMAL`
+> (crash-safe under WAL; per-chunk file-byte fsync kept); **4F** Argon2
+> concurrency made configurable (`argon2_max_concurrent`). **Declined/deferred:**
+> 4B-b (drop per-chunk fsync) — owner kept file-byte durability; 4C +
+> `cleanup_expired_staging` — measured unjustified (index-driven / empty table);
+> 4A (read-pool), 4E (prefetch), 4F *tuning* — need a real multi-user/large-corpus
+> deployment + profilers; **4G** — deployment-time (folded into Phase 5/soak).
+
 - **Task 4A (PERF-H1) — read connections:** Give reads their own connection(s)
   (read-only pool or per-thread connections) so WAL concurrency is realized; keep
   the write lock for the single writer. **(rev) Two correctness prerequisites the
