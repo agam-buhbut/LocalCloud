@@ -68,6 +68,22 @@ jobs:
       - name: pip-audit (Python supply chain)
         run: pip-audit
 
+      # SBOM is inventory, not a merge gate (pip-audit/cargo-audit are the
+      # gate). continue-on-error so a CLI quirk never blocks a merge; the
+      # CycloneDX JSON is uploaded for release records.
+      - name: Generate Python SBOM (CycloneDX)
+        continue-on-error: true
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py environment -o sbom-python.json
+      - name: Upload Python SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-python
+          path: sbom-python.json
+          if-no-files-found: ignore
+
   rust:
     name: Rust (fmt, clippy, tests, audit)
     runs-on: ubuntu-latest
@@ -98,3 +114,17 @@ jobs:
 
       - name: cargo audit (Rust supply chain)
         run: cargo audit --file rust/keycore/Cargo.lock
+
+      # SBOM is inventory, not a gate (see the Python job). Non-blocking.
+      - name: Generate Rust SBOM (CycloneDX)
+        continue-on-error: true
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --manifest-path rust/keycore/Cargo.toml --format json
+      - name: Upload Rust SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-rust
+          path: rust/keycore/**/*.cdx.json
+          if-no-files-found: ignore
