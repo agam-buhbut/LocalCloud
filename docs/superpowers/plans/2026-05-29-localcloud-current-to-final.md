@@ -658,6 +658,25 @@ reproducible provisioning (scripts/Ansible) + docs, NOT manual steps. Most of
 this is new `deploy/` content, not application code; it can proceed in parallel
 with Phases 2–4 once Phase 0 lands.
 
+> **✅ EXECUTED 2026-06-09 (artifacts authored; UNVALIDATED IN CI)** — commit
+> `9ebb8d6`, tree under `deploy/`. **This layer provisions an OS / kernel WG
+> interface / nftables / systemd / AppArmor and cannot run in the app sandbox**
+> — every file is a reviewed-but-untested template; the operator must apply and
+> verify it on the real Debian box (acceptance checks: `nmap` shows only the WG
+> UDP port, `systemd-analyze security`, `aa-status` enforcing, kill-switch).
+> Shell scripts pass `sh -n`. Delivered: `deploy/README.md` (consistency
+> contract + runbook + the single-worker SEC-M3 note, WG-source-IP peer
+> identity / no-forwarded-headers SEC-M2, secret hygiene); `wireguard/`
+> (/32-per-peer allowlist, server-key pinning, revocation); `nftables/`
+> (default-deny, WG port gated by a `wg_online` set, per-source pre-daemon rate
+> limiting); `systemd/` (`localcloud.service` = Hypercorn `--workers 1` as the
+> unprivileged `localcloud` user, `LoadCredential`, `LimitCORE=0`/
+> `MemorySwapMax=0`, full sandbox; online/offline uptime timers); `scripts/`
+> (online/offline + operator kill-switch); `apparmor/` profile;
+> `os/harden-debian.sh` + `os/DISKS.md` (LUKS2+LVM); `logging/` journald policy.
+> SEC-M4 (per-peer attempt-row cap) was already closed in Phase 0 code. Chose
+> plain scripts + systemd over Ansible (single box).
+
 - **WireGuard:** server keypair, client public-key allowlist, server-key pinning
   on the client, `wg0` config; bind the app to the WG interface; resolve SEC-M2
   by deriving peer identity safely (document "no forwarded-header middleware";
@@ -697,6 +716,19 @@ with Phases 2–4 once Phase 0 lands.
 
 **Objective:** Internal-HDD, offline-by-default, LUKS2-encrypted backups holding
 only ciphertext + encrypted metadata.
+
+> **✅ EXECUTED 2026-06-09 (core tested; LUKS wrapper UNVALIDATED)** — commit
+> `08d0286`, tree under `deploy/backup/`. Split into a **tested data-copy core**
+> (no LUKS) + thin operator wrappers (mount/unmount the offline disk). The core
+> snapshots `meta.db` via sqlite's online backup API (a plain `cp` of a live WAL
+> db can be torn), copies `blobs/` as immutable ciphertext, and **excludes**
+> `staging/`. `tests/test_backup_restore.py` (2 tests, green) proves: the
+> snapshot captures committed-but-uncheckpointed rows from a STILL-OPEN WAL db,
+> blobs round-trip byte-for-byte (incl. nested dirs), `staging/` is excluded, a
+> restored dir reopens with the same rows, and a non-data-dir SRC is refused.
+> `backup/README.md` documents the backup→wipe→restore drill (the acceptance)
+> and the plaintext spot-check. The LUKS open/mount/unmount wrappers need the
+> real device and remain documented-but-untested.
 
 - Secondary LUKS2 partition, never auto-mounted; operator mount→snapshot/rsync→
   unmount script; verify only `blobs/`, `meta.db`, and encrypted metadata are
