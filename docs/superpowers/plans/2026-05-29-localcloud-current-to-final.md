@@ -740,6 +740,22 @@ only ciphertext + encrypted metadata.
 
 ## Phase 7 — Release hardening & operations
 
+> **✅ EXECUTED 2026-06-09** — commit `8c2cfab`. **Key rotation TESTED** (the rev
+> task): `tests/test_key_rotation.py` proves session-secret rotation invalidates
+> all outstanding tokens (HMAC mismatch) and is symmetric; `docs/runbooks/key-
+> rotation.md` covers session-secret (vs per-user `session_version`) and
+> identity-key rotation (recipients re-wrapped; old shares die fail-closed).
+> **Supply chain:** CI already ran `pip-audit` + `cargo audit`; added non-gating
+> CycloneDX SBOM generation (Python + Rust) as uploaded artifacts. `Cargo.lock`
+> committed. **Docs:** `docs/threat-model.md`, `docs/runbooks/operations.md`
+> (kill-switch, scheduled uptime, user lifecycle, WG peer add/revoke,
+> backup/restore, incident response), `docs/release-checklist.md` (DoD split
+> CI-verifiable vs box-only), `CHANGELOG.md`. **Open decision:** the Python
+> lockfile is deliberately NOT added (needs pip-tools/uv = a new dev dependency
+> requiring approval) — documented in the release checklist; pip-audit +
+> upper-bounded ranges cover the gap meanwhile. Final internal review done; an
+> external audit is recommended before real data (per acceptance).
+
 **Objective:** Make it shippable and operable.
 
 - Supply chain: audits + SBOM in CI, reproducible `maturin --release` build,
