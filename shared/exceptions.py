@@ -31,12 +31,6 @@ class SignatureError(CryptoError):
     pass
 
 
-class NonceReuseError(CryptoError):
-    """Nonce reuse detected — critical security violation."""
-
-    pass
-
-
 class PaddingError(CryptoError, ValueError):
     """Length-prefixed padding is malformed (bad length prefix).
 
@@ -81,19 +75,6 @@ class StorageError(LocalCloudError):
 
 class QuotaExceededError(StorageError):
     """User storage quota exceeded."""
-
-    pass
-
-
-class UploadError(StorageError):
-    """Upload integrity check or staging error."""
-
-    pass
-
-
-class FileNotFoundError_(StorageError):
-    """Requested file does not exist. Named with underscore to avoid
-    shadowing the builtin FileNotFoundError."""
 
     pass
 

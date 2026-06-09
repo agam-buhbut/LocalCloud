@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import os
 
 import argon2
@@ -185,98 +184,6 @@ def merkle_root(chunk_hashes: list[bytes]) -> bytes:
         level = next_level
 
     return level[0]
-
-
-# Proof step kinds for verify_merkle_proof.
-# (sibling_on_left, sibling_on_right) indicate pairing direction; promote
-# carries no sibling and means "current was the odd node out at this level".
-_PROOF_LEFT = 0
-_PROOF_RIGHT = 1
-_PROOF_PROMOTE = 2
-
-
-def merkle_proof(
-    chunk_hashes: list[bytes], chunk_index: int
-) -> list[tuple[bytes | None, int]]:
-    """Generate a Merkle proof for a specific chunk.
-
-    Returns a list of (sibling_or_None, kind) tuples from leaf to root.
-    Sibling values are already tagged-hashed; the verifier combines them
-    with _pair_hash. Promotion steps carry no sibling and reapply
-    _promote_hash to the current value.
-    """
-    if not chunk_hashes or chunk_index >= len(chunk_hashes):
-        raise CryptoError("Invalid chunk index for Merkle proof")
-    if chunk_index < 0:
-        raise CryptoError("Invalid chunk index for Merkle proof")
-    if len(chunk_hashes) > MAX_CHUNKS:
-        raise CryptoError("Too many chunks for Merkle proof")
-
-    level = [_leaf_hash(h) for h in chunk_hashes]
-    if len(level) == 1:
-        return []
-
-    proof: list[tuple[bytes | None, int]] = []
-    idx = chunk_index
-
-    while len(level) > 1:
-        if idx % 2 == 1:
-            proof.append((level[idx - 1], _PROOF_LEFT))
-        elif idx + 1 < len(level):
-            proof.append((level[idx + 1], _PROOF_RIGHT))
-        else:
-            proof.append((None, _PROOF_PROMOTE))
-
-        next_level = []
-        for i in range(0, len(level), 2):
-            if i + 1 < len(level):
-                next_level.append(_pair_hash(level[i], level[i + 1]))
-            else:
-                next_level.append(_promote_hash(level[i]))
-        idx //= 2
-        level = next_level
-
-    return proof
-
-
-def verify_merkle_proof(
-    leaf_hash: bytes,
-    proof: list[tuple[bytes | None, int]],
-    expected_root: bytes,
-) -> bool:
-    """Verify a Merkle proof against an expected root.
-
-    `leaf_hash` is the raw chunk hash (this function applies the leaf tag).
-
-    Walks every proof step regardless of validity to avoid early returns
-    that could leak the length of the matching prefix. A sentinel digest
-    substitutes for missing siblings or unknown step kinds, and the final
-    comparison uses ``hmac.compare_digest`` for constant-time bytes equality.
-    """
-    if len(expected_root) != BLAKE2B_DIGEST_LEN:
-        return False
-
-    current = _leaf_hash(leaf_hash)
-    had_error = False
-    sentinel = b"\x00" * BLAKE2B_DIGEST_LEN
-
-    for sibling, kind in proof:
-        if kind == _PROOF_LEFT:
-            sib = sibling if sibling is not None else sentinel
-            had_error = had_error or sibling is None
-            current = _pair_hash(sib, current)
-        elif kind == _PROOF_RIGHT:
-            sib = sibling if sibling is not None else sentinel
-            had_error = had_error or sibling is None
-            current = _pair_hash(current, sib)
-        elif kind == _PROOF_PROMOTE:
-            current = _promote_hash(current)
-        else:
-            had_error = True
-            current = _promote_hash(current)
-
-    roots_equal = hmac.compare_digest(current, expected_root)
-    return roots_equal and not had_error
 
 
 # ──────────────────────────── Argon2id (Server-side) ────────────────────────────

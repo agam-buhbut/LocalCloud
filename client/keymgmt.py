@@ -1,8 +1,7 @@
 # LocalCloud - Client key-management glue (X25519 enrollment + directory)
 #
 # Item 2C client side. This module is the home for the key-wrapping
-# directory verification glue. It is deliberately NOT client/sharing.py
-# (which Phase 3C still deletes); the new helpers live here.
+# directory verification glue.
 #
 # The security property of the whole directory rests on the client
 # re-verifying the recipient's Ed25519 self-signature over their X25519

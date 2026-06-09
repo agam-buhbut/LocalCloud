@@ -396,15 +396,6 @@ class Database:
             )
             return cursor.rowcount > 0
 
-    def get_session_version(self, user_id: str) -> int | None:
-        """Return the user's current session_version, or None if missing."""
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT session_version FROM users WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            return row["session_version"] if row else None
-
     def get_user_status(self, user_id: str) -> tuple[int, bool] | None:
         """Return ``(session_version, is_active)`` for a user, or None.
 
@@ -777,14 +768,6 @@ class Database:
                 (file_id,),
             ).fetchone()
             return int(row["cnt"]) if row else 0
-
-    def get_file_shares(self, file_id: str) -> list[dict]:
-        """Get all share records for a file."""
-        with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM file_shares WHERE file_id = ?", (file_id,)
-            ).fetchall()
-            return [dict(row) for row in rows]
 
     def check_share_exists(self, file_id: str, user_id: str) -> bool:
         """Check if a user has been shared a file. O(1) via index (#12)."""
