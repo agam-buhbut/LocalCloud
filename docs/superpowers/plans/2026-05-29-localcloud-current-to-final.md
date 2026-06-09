@@ -495,6 +495,26 @@ metadata is version-bound. Each sub-task needs its own detailed plan.
 **Objective:** Reduce maintenance cost and the surface area each future audit
 must re-read. Pure restructuring — no behavior change; tests must stay green.
 
+> **✅ EXECUTED 2026-06-09 (3A + 3B + 3D + 3C)** — commits `d372fcb` (3A/3B/3D)
+> and `efb3338` (3C). **313 tests green** before and after each step (behavior
+> identical); full toolchain clean (ruff/pyright 0; pylint **9.84/10**, up from
+> 9.80). Acceptance met and measured: `upload_finalize` **56 lines** (≤ 60); no
+> function in `storage.py` **> 73 lines** (≤ 80); **0** `# type: ignore` in
+> `storage.py` (baseline 40); pylint reports no unused symbols. **3A** decomposed
+> `upload_finalize`→`_validate_finalize_request`/`_verify_staged_chunks`/
+> `_commit_finalized_blob` and split `cli.upload`/`cli.download`. **3B** unified
+> `canonicalize_username`+`canonicalize_file_id` in `shared/`, one
+> `api_client._raise_for_status` status→exception mapper (+ `"Bearer None"` fix),
+> one `server.timing.sleep_until_deadline` + `TIMING_BUDGET_S` for auth/share/
+> unshare; shipped `tests/test_timing_equalization.py` proving the equalized
+> endpoints stay timing-input-independent (incl. a unit test pinning the dummy
+> write to two real UPDATEs, so an emptied dummy branch fails loudly). **3C**
+> deleted `client/sharing.py`, `get_session_version`, `get_file_shares`,
+> `NonceReuseError`/`UploadError`/`FileNotFoundError_`, and
+> `merkle_proof`/`verify_merkle_proof` (range proofs out of scope per Accepted
+> limitations). **`get_user_by_id` was KEPT** — the 2C enrollment endpoint
+> (`server/users.py:119`) now calls it, so it is no longer dead.
+>
 > **Ordering (rev):** Tasks 3A and 3B touch `storage.py`/`cli.py`/`api_client.py`
 > — the SAME files Phase 2 rewrites. **3A/3B must run AFTER Phase 2-impl lands**,
 > not in parallel with it (the Sequencing diagram is corrected accordingly). 3C
