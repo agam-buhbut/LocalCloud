@@ -9,10 +9,11 @@ name = "keycore"
 crate-type = ["cdylib"]
 
 [dependencies]
-# pyo3 0.24+ addresses RUSTSEC-2025-0020 (buffer overflow in
-# PyString::from_object). 0.24 is API-compatible with our usage:
-# PyBytes::new_bound, Bound<'py>, #[pyclass], #[pyfunction].
-pyo3 = { version = "0.24", features = ["extension-module"] }
+# pyo3 >=0.29 clears RUSTSEC-2026-0176 (OOB read in PyList/PyTuple
+# iterators) and RUSTSEC-2026-0177 (missing Sync bound on
+# PyCFunction::new_closure). API-compatible with our usage: the modern
+# Bound API (PyBytes::new, Bound<'py>), #[pyclass], #[pyfunction].
+pyo3 = { version = "0.29", features = ["extension-module"] }
 
 # Cryptographic primitives
 # `zeroize` features are pinned explicitly so that key material carried

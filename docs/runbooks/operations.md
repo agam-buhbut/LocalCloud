@@ -4,6 +4,23 @@ Physical-console-only administration. There is **no** remote admin path: no
 admin SSH, no HTTP account endpoints. Everything below is run by the operator
 at the machine. Deployment artifacts referenced here live under `deploy/`.
 
+## First-deploy acceptance (run once, before trusting the box)
+
+After installing the `deploy/` tree and starting the service, run the acceptance
+check from the physical console:
+```sh
+deploy/scripts/localcloud-acceptance-check.sh                 # read-only probes
+deploy/scripts/localcloud-acceptance-check.sh --run-backup-drill   # + backup->restore core
+deploy/scripts/localcloud-acceptance-check.sh --test-uptime-toggle # + DISRUPTIVE port toggle
+```
+It checks DoD #4/#5/#7: WireGuard-only reachability and /32-per-peer, nftables
+default-deny, AppArmor enforce + systemd sandbox + non-root user, the
+**MemoryDenyWriteExecute-vs-argon2 login probe** (the make-or-break first-boot
+check — if it FAILs, remove `MemoryDenyWriteExecute=` from `localcloud.service`),
+scheduled-uptime timers, and the backup→restore core. It is SAFE by default;
+destructive/cross-host checks are reported as SKIP with the exact manual command.
+Resolve every FAIL before storing real data.
+
 ## Emergency takedown (kill-switch)
 
 Take the box offline instantly (README.txt PART II §2):
@@ -75,3 +92,18 @@ Run the **backup→wipe→restore drill** at least once before trusting backups
    so a tampered blob cannot decrypt; spot-check a known file restores.
 5. **Recover:** restore from the offline backup if data was altered; bring the
    box back online only after the cause is understood.
+
+## Concurrency model (accepted ceiling)
+
+The server is **single-worker by design** (SEC-M3; enforced by the env-var
+check *and* a per-process file lock — running a second worker fails closed).
+All DB access is serialized behind one SQLite connection guarded by one lock,
+so a write transaction (e.g. upload finalize) briefly blocks concurrent reads.
+
+This is an **accepted limitation** (owner decision 2026-06-22) appropriate to a
+single-operator / few-user personal box — it is NOT a bug. Symptom to expect
+under heavy concurrent use: brief read-latency spikes during large finalizes.
+If this box ever needs real multi-user throughput, the fix is a separate
+read-only SQLite connection (WAL permits concurrent readers) guarded by its own
+lock — do this only if profiling shows the single-lock path is the bottleneck,
+never speculatively.

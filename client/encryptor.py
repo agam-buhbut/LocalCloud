@@ -7,7 +7,11 @@
 # - Per-file random keys (file_key, meta_key) from CSPRNG
 # - Per-chunk unique nonce (192-bit random)
 # - AEAD binding: file_id + chunk_index + version + total_chunks
-# - Merkle root signed with Ed25519 to detect server rollback
+# - Merkle root signed with Ed25519: per-version integrity + authenticity.
+#   NOTE: this does NOT detect whole-file ROLLBACK — a hostile server can
+#   serve an older, still-validly-signed version and it verifies. Rollback
+#   detection is out of scope (would need a signed monotonic anchor + a
+#   client-side high-water mark). See MetadataBlob.version_number.
 # - Atomic failure: any verification error aborts entire operation
 # - Streaming I/O: plaintext never fully materialised in RAM
 

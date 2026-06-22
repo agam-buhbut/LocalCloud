@@ -31,13 +31,19 @@ the (encrypted) metadata and use opaque filenames.
 | **Server compromise (reads data at rest)** | **cannot read contents or non-filename metadata** | E2EE terminates on the client; the server never holds file/meta keys in plaintext (owner keys are wrapped to the owner's own X25519) |
 | Disk theft (powered off) | nothing | LUKS2 + encrypted LVM, console-only unlock, no keyfile/TPM auto-unlock |
 | Metadata inspection at rest | only the plaintext fields above | the rest is ciphertext |
-| Replay | rejected | WireGuard replay protection (transport) + authenticated chunking, signed Merkle root, version-bound metadata (app) |
+| Replay / rollback | in-version replay rejected; whole-file rollback NOT detected | transport replay protection + the signed Merkle root pins each chunk/geometry to ONE file version; a hostile server CAN still serve an older, still-validly-signed version (no monotonic anchor) — see "Out of scope" |
 | Retroactive decryption after key compromise | wrapped keys still required | per-file random keys, per-recipient ephemeral-static X25519 wrapping (forward secrecy); no shared global keys; no server-side caching of wrapped keys |
 | Username enumeration | suppressed | timing-equalized auth/share/unshare + fixed-shape, constant-deadline pubkey directory |
-| Peer impersonation inside the tunnel | prevented | identity derived from the WireGuard source IP with /32-per-peer AllowedIPs; no reverse proxy / forwarded headers |
+| Peer impersonation inside the tunnel | prevented | identity derived from the WireGuard source IP with /32-per-peer AllowedIPs (WireGuard cryptokey routing drops spoofed source IPs); no reverse proxy / forwarded headers. RATIFIED model (owner decision 2026-06-22): `request.remote_addr` IS the peer identity, sound ONLY under single-tunnel WireGuard — `config.validate()` fails closed on a public/unspecified bind, and the acceptance script verifies external reachability + /32-per-peer. Binding the session token to the WG peer *pubkey* (a map keyed by source IP) was evaluated and deferred: WG /32 already stops live IP-takeover, so it would only add churn/misconfig detection at the cost of a new root-trust file. See plans/2026-06-22-f8-peer-binding-design.md. |
 
 ## Out of scope / weak against (stated honestly)
 
+- **Whole-file rollback / version-replay** — a hostile server can serve an
+  older, still-validly-signed version of a file and the client cannot detect
+  it. There is no signed monotonic version anchor or client-side high-water
+  mark (`MetadataBlob.version_number` is a reserved placeholder, never
+  compared). Per-version integrity/authenticity IS enforced (signed Merkle
+  root verified before decrypt); only cross-version freshness is unprotected.
 - **Total hardware loss** — no off-box replica beyond the (offline, encrypted)
   backup HDD; losing both disks loses the data.
 - **Client-side compromise** — if the client device is owned, plaintext and

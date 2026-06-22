@@ -39,7 +39,7 @@ module. It does NOT provision the operating system, WireGuard, the firewall,
 AppArmor, systemd units, disk encryption, or the backup system — those are
 deployment concerns described in PART II and are not yet automated here.
 
-Implemented and tested (86 Python tests + 22 Rust tests, all passing):
+Implemented and tested (334 Python tests + 27 Rust tests, all passing):
 
   * Per-file client-side encryption: independent random file_key + meta_key,
     per-chunk random 192-bit nonces, fixed 4 MiB chunks, AEAD chunk binding,
@@ -85,7 +85,7 @@ Implemented and tested (86 Python tests + 22 Rust tests, all passing):
     app.py                App factory, security headers, periodic cleanup task
     auth.py               Argon2id login, HMAC session tokens, rate limiting
     storage.py            Upload/download/delete/list/share blob engine
-    database.py           SQLite data-access layer (WAL, schema v5)
+    database.py           SQLite data-access layer (WAL, schema v6)
     config.py             Env-driven config with secure defaults + validation
     policy.py             Visibility access control (private/shared/public)
     quota.py              Ciphertext-only quota accounting
@@ -96,11 +96,10 @@ Implemented and tested (86 Python tests + 22 Rust tests, all passing):
     encryptor.py          Streaming per-file encrypt/decrypt engine
     keystore.py           KeyStore wrapper over keycore (auto-lock on idle)
     api_client.py         httpx HTTP client (connection-pooled)
-    sharing.py            Thin wrap/unwrap helpers over the keystore
+    keymgmt.py            Unified fetch+unwrap of file keys (owner + recipient)
 
   tests/                  pytest suite (server, client, shared)
-  pyproject.toml          Python project + tool config (source of truth)
-  requirements.txt        Convenience pin list (NOT the source of truth)
+  pyproject.toml          Python project + tool config (sole source of truth)
 
 --------------------------------------------------------------------------------
 3. Build & install
@@ -181,7 +180,7 @@ init` output and gives it to the operator out-of-band.
   # Authenticate (session token saved next to the key file as ".session")
   localcloud --server http://10.0.0.1:8443 login alice
 
-  # Upload (encrypt + stream). Writes a local owner key cache <file_id>.keys.json
+  # Upload (encrypt + stream). Owner keys are self-wrapped (no plaintext cache).
   localcloud upload ./report.pdf --visibility private
 
   # List / quota
@@ -378,36 +377,32 @@ padded sizes (filenames are intentionally server-visible plaintext).
 These are intentionally listed so the roadmap (PART II) is honest about the
 distance remaining.
 
-Deployment / infrastructure — NOT in this repo (operator must provision):
-  * Minimal Debian, LUKS2 + encrypted LVM, secondary encrypted backup disk.
-  * WireGuard transport (server-key pinning, peer allowlist), nftables default-
-    deny + WireGuard-only port + pre-daemon rate limiting.
-  * systemd service units + scheduled-uptime timers + operator kill-switch.
-  * AppArmor profiles and systemd sandboxing (NoNewPrivileges, read-only root,
-    tmpfs writable paths, device/socket restrictions), separate unprivileged
-    users for tunnel vs. cloud service.
-  * Encrypted-HDD backup flow and minimal security logging policy.
+Deployment / infrastructure — present in deploy/ but UNVALIDATED on hardware:
+  * The hostile-box tree (Debian hardening, LUKS2 + encrypted LVM, WireGuard
+    transport, default-deny nftables, systemd units + scheduled-uptime timers +
+    operator kill-switch, AppArmor profiles + systemd sandboxing, separate
+    service users, encrypted-HDD backup flow, security logging) lives under
+    deploy/. It is statically validated (shell/systemd/nftables/AppArmor parse
+    clean) but has NOT been run on real hardware. First-deploy acceptance
+    remains: external reachability (only WG port open), AppArmor enforce mode,
+    the MemoryDenyWriteExecute-vs-argon2 risk, the kill-switch, and the
+    backup→restore drill. See deploy/README.md.
 
-Application-level gaps:
+Application-level limitations (consciously accepted unless noted):
   * Public visibility: the access policy authorizes any authenticated user to
     fetch a public file's ciphertext + metadata, but there is no automated
-    per-user on-demand key wrapping. A non-owner can only obtain file/meta keys
-    if a wrapped-keys row was explicitly created for them (i.e. via share).
-  * Owner self-access uses a local plaintext key cache (<file_id>.keys.json,
-    mode 0600) rather than keys wrapped to the owner's own identity key.
-  * Recipient public-key discovery is out-of-band; there is no directory
-    service, and register-pubkey is a manual operator step.
+    per-user on-demand key wrapping — a non-owner obtains file/meta keys only
+    via an explicit share. Full public key-delivery is deferred pending a
+    security-reviewed key-committing-AEAD design (see the roadmap's "Accepted
+    limitations"); Visibility.PUBLIC currently delivers no keys.
+  * Whole-file rollback: a hostile server can serve an older, still-validly-
+    signed file version; the client does not detect cross-version replay
+    (per-version integrity IS enforced before decrypt). MetadataBlob.version_
+    number is a reserved placeholder, never compared. See docs/threat-model.md.
   * Merkle range-proof downloads are not used: the client downloads all chunks
     and recomputes the root. merkle_proof()/verify_merkle_proof() exist but are
     unused by the download path.
   * MetadataBlob version_number / blob_ids are placeholders (no version history).
-  * No fuzz / property-based tests yet (hypothesis is a declared dev dependency
-    but not yet exercised), despite the spec mandate for parser fuzzing and
-    property tests on nonce uniqueness / key isolation.
-  * Dependency hygiene: the installed environment uses newer versions than the
-    upper bounds pinned in pyproject.toml (e.g. cbor2, argon2-cffi, pytest,
-    pytest-asyncio). requirements.txt duplicates a subset and is not the source
-    of truth.
 
 --------------------------------------------------------------------------------
 12. Development
@@ -431,7 +426,10 @@ Application-level gaps:
 
 Notes:
   * pyproject.toml is the single source of truth for dependencies and tool
-    config. requirements.txt is a convenience list only.
+    config (there is no requirements.txt). uv.lock is the committed,
+    reproducible lockfile — recreate the env with `uv sync --extra dev`;
+    refresh the lock after editing pyproject with `uv lock` (CI checks it
+    for drift via `uv lock --check`).
   * Tests are deterministic and use tmp_path for filesystem state. Tests that
     require the native keycore module skip if it is not installed.
 
@@ -514,15 +512,19 @@ Goal
       encrypt contents and metadata with XChaCha20-Poly1305; pad to fixed-size
       blocks; never reuse keys.
   5.3 Forward secrecy: per-file random keys, per-recipient key wrapping, no
-      shared global keys, on-demand wrapping for public access, no server-side
-      caching of wrapped keys; compromise of long-term keys does not allow
-      retroactive decryption without the wrapped keys.
-  5.4 Access control: private = keys encrypted only to owner; shared = keys
-      encrypted individually to each recipient public key; public = server only
-      authorizes the request and the client wraps keys on demand per user.
-      (Implementation note: per-user on-demand wrapping for PUBLIC files, and
-      wrapping owner keys to the owner's own identity instead of a local cache,
-      are the main remaining items here — see PART I §11.)
+      shared global keys, no server-side caching of wrapped keys; compromise of
+      long-term keys does not allow retroactive decryption without the wrapped
+      keys.
+  5.4 Access control: private = keys wrapped to the owner's own identity;
+      shared = keys wrapped individually to each recipient's public key;
+      public = the server authorizes any authenticated user to FETCH the
+      ciphertext + metadata, but there is NO automatic key delivery — only
+      users explicitly shared-with can decrypt.
+      (Owner decision 2026-06-22: automatic per-user key delivery for PUBLIC
+      files is an ACCEPTED non-goal — it would require a security-reviewed
+      key-committing-AEAD single-bundle design, since a publish-time fan-out is
+      not confidential against the hostile server. Use `shared` to grant
+      decryption. See PART I §11 and the roadmap "Accepted limitations".)
 
 6. Client application   [IMPLEMENTED — see PART I §6,8]
   Local key management; local encryption/decryption; upload/download logic;
@@ -533,7 +535,7 @@ Goal
   handles all key wrapping and signing. Quota display from the server. Secure
   deletion relies on encryption and key destruction, not physical shredding.
 
-7. Backup system   [NOT IMPLEMENTED]
+7. Backup system   [IMPLEMENTED — deploy/backup/, UNVALIDATED on hardware]
   Internal HDD backup only, LUKS2-encrypted, offline by default, mounted
   manually by the operator. Stores only encrypted blobs and encrypted metadata;
   no plaintext ever written. Flow: operator mounts disk, snapshots or rsyncs

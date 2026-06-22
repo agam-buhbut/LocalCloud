@@ -23,6 +23,10 @@ mkdir -p "$DEST/blobs"
 # The backup meta.db is a consistent, WAL-free snapshot, so a plain copy
 # restores it faithfully (no -wal/-shm sidecars to worry about).
 cp -a "$SRC/meta.db" "$DEST/meta.db"
-cp -a "$SRC/blobs/." "$DEST/blobs/" 2>/dev/null || true
+# Fail LOUD on a copy error (a swallowed partial restore would silently
+# drop ciphertext). The [ -d ] guard tolerates a legitimately-empty backup.
+if [ -d "$SRC/blobs" ]; then
+    cp -a "$SRC/blobs/." "$DEST/blobs/"
+fi
 
 echo "restore-copy: meta.db + blobs/ restored to $DEST"

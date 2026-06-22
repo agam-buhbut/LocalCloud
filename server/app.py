@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import os
 import sys
@@ -181,6 +182,41 @@ def create_app(config: ServerConfig | None = None) -> Quart:
         # the client. (#F12.1)
         logger.exception("Internal error: %s", type(e).__name__)
         return jsonify({"error": "Internal error"}), 500
+
+    # ── Single-worker enforcement at serve time (SEC-M3, defense in depth) ──
+    # assert_single_worker() above only reads env vars; `hypercorn --workers N`
+    # sets none of them and would silently bypass it. ASGI lifespan startup
+    # runs once per worker process, so an exclusive OS lock acquired here makes
+    # worker #2 fail closed. Registered BEFORE start_background_tasks so a lost
+    # race never spawns the cleanup task. Skipped for an in-memory db (no file
+    # to lock); the lockfile must live on a local filesystem.
+    @app.before_serving
+    async def acquire_single_worker_lock():
+        if config.db_path == ":memory:":
+            return
+        lock_path = f"{config.db_path}.worker.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise RuntimeError(
+                f"Another LocalCloud worker already holds {lock_path}. The "
+                "authoritative rate limiter and SQLite model are per-process "
+                "(SEC-M3); run exactly one worker."
+            ) from exc
+        app._worker_lock_fd = fd  # type: ignore
+
+    @app.after_serving
+    async def release_single_worker_lock():
+        fd = getattr(app, "_worker_lock_fd", None)
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            except OSError:
+                logger.warning("Failed to release single-worker lock fd")
+            app._worker_lock_fd = None  # type: ignore
 
     # ── Periodic background tasks (#11) ──
     @app.before_serving

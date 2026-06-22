@@ -826,15 +826,18 @@ The Definition of Done requires every README §11 gap to be closed OR explicitly
 accepted. These two are accepted as out-of-scope unless a future requirement
 revisits them — recording them here so the DoD can be honestly checked:
 
-- **Public visibility / on-demand public wrapping (2B)** — **deferred (owner decision,
-  2026-05-30)**. Public visibility will ship only via a *key-committing AEAD* single-bundle
-  scheme delivered as its own security-reviewed design. The weak alternatives were rejected: a
-  publish-time per-recipient fan-out is not confidential against the hostile server (the server
-  can mint synthetic enrolled identities and harvest the wrapped keys), and a pinned-allow-list
-  is not truly "public." Until that design lands, files are private/shared/owner-only;
-  `Visibility.PUBLIC` exists as a flag but delivers no keys. A committing AEAD can be composed
-  from audited primitives (e.g. a BLAKE2b key commitment + XChaCha20-Poly1305), so reviving 2B
-  need not introduce a custom primitive.
+- **Public visibility / on-demand public wrapping (2B)** — **ACCEPTED non-goal (owner
+  decision, 2026-06-22; previously deferred 2026-05-30)**. Automatic per-user key delivery for
+  PUBLIC files will NOT be implemented unless a future requirement revisits it. Files are
+  private/shared/owner-only; `Visibility.PUBLIC` exists as a flag and authorizes any
+  authenticated user to fetch ciphertext + metadata, but delivers NO keys — only users
+  explicitly shared-with can decrypt. The CLI warns on `--visibility public`. The weak
+  alternatives were rejected: a publish-time per-recipient fan-out is not confidential against
+  the hostile server (it can mint synthetic enrolled identities and harvest the wrapped keys),
+  and a pinned-allow-list is not truly "public." If ever revived, it must ship via a
+  security-reviewed *key-committing AEAD* single-bundle scheme — composable from audited
+  primitives (e.g. a BLAKE2b key commitment + XChaCha20-Poly1305), so it need not introduce a
+  custom primitive.
 
 - **File version history (`MetadataBlob.version_number` / `blob_ids`)** — these
   fields exist but are placeholders (`version_number=1`, `blob_ids=[]` always).

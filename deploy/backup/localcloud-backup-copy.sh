@@ -43,6 +43,12 @@ PY
 # recursive copy is safe and consistent. On the real box, swap this line for
 # `rsync -a --delete "$SRC/blobs/" "$DEST/blobs/"` for incremental backups.
 mkdir -p "$DEST/blobs"
-cp -a "$SRC/blobs/." "$DEST/blobs/" 2>/dev/null || true
+# Fail LOUD on a copy error: a swallowed partial copy would yield a
+# meta.db-valid backup with MISSING ciphertext. set -e aborts on any cp
+# failure; the [ -d ] guard handles a legitimately-absent blobs/ dir (the
+# only reason the copy was previously made non-fatal).
+if [ -d "$SRC/blobs" ]; then
+    cp -a "$SRC/blobs/." "$DEST/blobs/"
+fi
 
 echo "backup-copy: meta.db + blobs/ copied to $DEST (staging/ excluded)"

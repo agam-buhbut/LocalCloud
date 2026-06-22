@@ -205,9 +205,14 @@ class CloudClient:
         if not isinstance(pk, str) or not pk:
             return None
         try:
-            return bytes.fromhex(pk)
+            raw = bytes.fromhex(pk)
         except ValueError as e:
             raise StorageError("Invalid owner_pubkey response") from e
+        # Validate the length at the server trust boundary (fail closed early
+        # rather than returning a wrong-length key for callers to reject).
+        if len(raw) != 32:
+            raise StorageError("Invalid owner_pubkey length")
+        return raw
 
     def download_chunk(self, file_id: str, chunk_index: int) -> bytes:
         """Download a single encrypted chunk.

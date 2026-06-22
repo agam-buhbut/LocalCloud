@@ -39,3 +39,42 @@ def test_validate_rejects_zero_argon2_value() -> None:
     cfg.argon2_max_concurrent = 0
     with pytest.raises(ValueError, match="argon2_max_concurrent"):
         cfg.validate()
+
+
+# ── Peer-identity invariant (F8, hybrid): the box must refuse to run reachable
+# off the WireGuard tunnel. Identity == request.remote_addr is only sound when
+# the only reachable path is the WG interface, so a public/unspecified bind
+# fails closed unless the operator explicitly overrides. ──
+
+
+def test_validate_rejects_unspecified_bind() -> None:
+    cfg = _valid_config()
+    cfg.bind_host = "0.0.0.0"  # noqa: S104 — testing that this is REJECTED
+    with pytest.raises(ValueError, match="non-WireGuard"):
+        cfg.validate()
+
+
+def test_validate_rejects_public_bind() -> None:
+    cfg = _valid_config()
+    cfg.bind_host = "8.8.8.8"
+    with pytest.raises(ValueError, match="public address"):
+        cfg.validate()
+
+
+def test_validate_allows_private_bind() -> None:
+    cfg = _valid_config()
+    cfg.bind_host = "10.0.0.1"  # the WireGuard tunnel address
+    cfg.validate()  # must not raise
+
+
+def test_validate_allows_loopback_bind() -> None:
+    cfg = _valid_config()
+    cfg.bind_host = "127.0.0.1"
+    cfg.validate()  # must not raise
+
+
+def test_public_bind_override_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCALCLOUD_ALLOW_PUBLIC_BIND", "1")
+    cfg = _valid_config()
+    cfg.bind_host = "8.8.8.8"
+    cfg.validate()  # override allows it

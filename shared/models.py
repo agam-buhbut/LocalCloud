@@ -173,7 +173,9 @@ def build_metadata_aad(
     in the AAD (it is over the root, so it adds no information).
 
     The domain tag ``METADATA_AAD_CONTEXT`` provides the data-chunk-vs-metadata
-    separation that the v1 sentinel index (``METADATA_CHUNK_INDEX``) provided,
+    separation that the sentinel index (``METADATA_CHUNK_INDEX``) also still
+    provides (both mechanisms are live — the sentinel keys the serialized
+    metadata entry and is asserted at module load),
     and the ``protocol_version`` field forces non-interoperability on a future
     bump (defense in depth; the tag already does this). The u16 width matches
     ``FileHeader.version``.
@@ -492,6 +494,12 @@ class MetadataBlob:
         0  # exact plaintext size; encrypted in the blob, never sent in clear.
     )
     blob_ids: list[str] = field(default_factory=list)
+    # RESERVED forward-compat placeholder — NOT a security control. Always
+    # written as 1 and never compared. It carries NO rollback/replay meaning:
+    # a hostile server can serve any older, validly-signed file version and it
+    # verifies. Do NOT gate acceptance on this field without a signed monotonic
+    # anchor AND a persistent client-side high-water mark (e.g. reusing the
+    # download owner-pin store). See the threat model's "Accepted limitations".
     version_number: int = 1
 
     def serialize(self) -> bytes:
@@ -572,6 +580,10 @@ class MetadataBlob:
                 )
         if not isinstance(version_number, int) or isinstance(version_number, bool):
             raise MalformedRequestError("MetadataBlob.version_number must be int")
+        # NB: version_number is a reserved placeholder with NO security
+        # meaning (see the field definition). It is type-checked here but is
+        # attacker-controlled and unsigned beyond per-version integrity — never
+        # use it for a rollback/replay decision without a signed anchor.
 
         try:
             visibility = Visibility(visibility_raw)

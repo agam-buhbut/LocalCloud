@@ -75,6 +75,62 @@ def _atomic_write_secret(path: Path, data: str) -> None:
         raise
 
 
+_MAX_PIN_STORE_BYTES = 1 << 20  # 1 MiB ceiling on the local pin store
+
+
+def _owner_pins_path(key_file: str | Path) -> Path:
+    """Path of the per-user TOFU owner-pubkey pin store (next to the keyfile)."""
+    return Path(str(key_file) + ".owner_pins.json")
+
+
+def _load_owner_pins(key_file: str | Path) -> dict[str, str]:
+    """Load the ``{canonical_file_id: ed25519_hex}`` TOFU pin store.
+
+    A missing store is a legitimate first use → empty dict. A corrupt,
+    oversized, wrong-typed, or unreadable store FAILS CLOSED (raises
+    ``CryptoError``): a tampered pin file is exactly the signal TOFU exists to
+    catch, so it is never silently reset to empty (which would re-enable
+    trust-on-first-use to a server-chosen key). Delete the file deliberately
+    to re-pin.
+    """
+    path = _owner_pins_path(key_file)
+    try:
+        # O_NOFOLLOW: refuse a symlink swapped in at the pin path.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise CryptoError(f"Cannot read owner-pin store {path}: {e}") from e
+    try:
+        with os.fdopen(fd, "r") as f:
+            raw = f.read(_MAX_PIN_STORE_BYTES + 1)
+    except OSError as e:
+        raise CryptoError(f"Cannot read owner-pin store {path}: {e}") from e
+    if len(raw) > _MAX_PIN_STORE_BYTES:
+        raise CryptoError(f"Owner-pin store {path} is implausibly large; refusing")
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise CryptoError(
+            f"Owner-pin store {path} is corrupt; refusing "
+            "(delete it to deliberately re-pin)"
+        ) from e
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        raise CryptoError(f"Owner-pin store {path} is malformed; refusing")
+    return data
+
+
+def _save_owner_pins(key_file: str | Path, pins: dict[str, str]) -> None:
+    """Atomically persist the TOFU pin store (mode 0600).
+
+    ponytail: last-writer-wins on concurrent downloads — fine for a local
+    single-user CLI; a dropped pin just re-TOFUs on the next download.
+    """
+    _atomic_write_secret(_owner_pins_path(key_file), json.dumps(pins))
+
+
 @click.group()
 @click.option(
     "--key-file",
@@ -190,14 +246,33 @@ def enroll(ctx, username: str):
 
 
 def _resolve_owner_pubkey(
-    client: CloudClient, file_id: str, override_hex: str | None
-) -> bytes:
-    """Resolve the signer pubkey for downloading.
+    client: CloudClient,
+    file_id: str,
+    override_hex: str | None,
+    pins: dict[str, str],
+) -> tuple[bytes, str]:
+    """Resolve the owner's Ed25519 signer key and enforce the TOFU pin.
 
-    Priority: explicit --sender-pubkey override > server lookup. The
-    server-returned pubkey is the one registered against the file
-    owner's account; the client treats it as a TOFU-pinnable identity.
+    Returns ``(pubkey, canonical_file_id)``. Priority: explicit
+    ``--sender-pubkey`` override > server lookup. The resolved key is compared
+    (constant time) against any existing pin and a MISMATCH FAILS CLOSED. The
+    pin is NOT written here — the caller records it only after a successful
+    decrypt (trust-on-first-*successful*-use), so a failed download never
+    persists a bad pin.
+
+    Security: this pins the key used for the Merkle-root signature check. That
+    signature is the linchpin against a hostile server — content whose signed
+    root does not verify under this key is rejected fail-closed before any
+    plaintext is accepted, and the server cannot forge it without the owner's
+    private key. FIRST CONTACT IS TRUSTED (TOFU); the pin only guarantees
+    cross-download CONSISTENCY thereafter. Use ``--sender-pubkey`` for
+    out-of-band first-use authentication.
     """
+    try:
+        canonical = canonicalize_file_id(file_id)
+    except ValueError as e:
+        raise CryptoError(f"Invalid file_id: {file_id!r}") from e
+
     if override_hex:
         try:
             pk = bytes.fromhex(override_hex)
@@ -205,15 +280,32 @@ def _resolve_owner_pubkey(
             raise CryptoError("--sender-pubkey is not valid hex") from e
         if len(pk) != 32:
             raise CryptoError("--sender-pubkey must be 32 bytes")
-        return pk
+        is_override = True
+    else:
+        pk = client.get_owner_pubkey(file_id)
+        if pk is None or len(pk) != 32:
+            raise CryptoError(
+                "Server has no registered identity key for this file's owner; "
+                "pass --sender-pubkey explicitly if you trust an out-of-band key."
+            )
+        is_override = False
 
-    pk = client.get_owner_pubkey(file_id)
-    if pk is None or len(pk) != 32:
-        raise CryptoError(
-            "Server has no registered identity key for this file's owner; "
-            "pass --sender-pubkey explicitly if you trust an out-of-band key."
-        )
-    return pk
+    pinned = pins.get(canonical)
+    if pinned is not None and not hmac.compare_digest(pinned, pk.hex()):
+        if is_override:
+            click.echo(
+                f"WARNING: --sender-pubkey REPLACES the stored TOFU pin for "
+                f"{canonical}; the previously-pinned owner key will no longer "
+                "be trusted.",
+                err=True,
+            )
+        else:
+            raise CryptoError(
+                f"Owner identity key for {canonical} changed since first "
+                "download — refusing (the server may be hostile). Pass "
+                "--sender-pubkey to override with an out-of-band key you trust."
+            )
+    return pk, canonical
 
 
 def _encrypt_and_upload(
@@ -334,6 +426,15 @@ def upload(ctx, filepath: str, visibility: str):
 
     try:
         vis = _VIS_MAP[visibility]
+        if vis is Visibility.PUBLIC:
+            # Accepted limitation (owner decision 2026-06-22): PUBLIC stores the
+            # ciphertext but delivers no keys. Warn so it is not a silent footgun.
+            click.echo(
+                "WARNING: 'public' stores the encrypted file but delivers NO "
+                "decryption keys — only users you explicitly 'share' with can "
+                "read it. Use 'share' to grant access.",
+                err=True,
+            )
         encryptor = FileEncryptor(ks)
         encrypted, file_id = _encrypt_and_upload(client, encryptor, Path(filepath), vis)
         _register_owner_self_keys(client, ks, encrypted, file_id)
@@ -411,15 +512,20 @@ def download(
             client, file_id
         )
 
+        owner_pins = _load_owner_pins(ctx.obj["key_file"])
+
         # 2A unified acquisition: fetch + unwrap the bundle for THIS caller
-        # (owner self-share or recipient share alike). The Merkle signature
-        # is verified against the file OWNER's Ed25519 key, which is also
-        # the wrap's sender binding; _resolve_owner_pubkey honors an
-        # explicit --sender-pubkey override and otherwise pins the
-        # server-returned key (TOFU). One path, fail-closed.
+        # (owner self-share or recipient share alike), then verify the file's
+        # Merkle-root signature against the owner's Ed25519 key. That key is
+        # TOFU-pinned (_resolve_owner_pubkey): first contact is trusted, and
+        # any later substitution of the owner key for this file is refused
+        # fail-closed. --sender-pubkey supplies an out-of-band key for
+        # first-use authentication. One path, fail-closed.
         click.echo("Acquiring and unwrapping file keys...")
         file_key, meta_key = acquire_file_keys(client, ks, file_id)
-        sig_pubkey = _resolve_owner_pubkey(client, file_id, sender_pubkey)
+        sig_pubkey, canonical_fid = _resolve_owner_pubkey(
+            client, file_id, sender_pubkey, owner_pins
+        )
 
         click.echo("Decrypting and verifying...")
         encryptor = FileEncryptor(ks)
@@ -432,6 +538,12 @@ def download(
             signer_pubkey=sig_pubkey,
             output_path=Path(output),
         )
+        # Trust-on-first-*successful*-use: persist the pin only after the
+        # signature verified and the file decrypted, so a failed download
+        # never bricks future ones with a bad pin.
+        if owner_pins.get(canonical_fid) != sig_pubkey.hex():
+            owner_pins[canonical_fid] = sig_pubkey.hex()
+            _save_owner_pins(ctx.obj["key_file"], owner_pins)
         click.echo(f"Saved to {output}")
     except (StorageError, CryptoError, AuthError) as e:
         click.echo(f"Download failed: {e}", err=True)

@@ -352,26 +352,29 @@ async def upload_init():
     # canonicalized lookup, so every chunk POST would 400.
     upload_id = uuid.uuid4().hex
     staging_path = _safe_path(state.staging_dir, upload_id)
-    await asyncio.to_thread(os.makedirs, staging_path, mode=0o700, exist_ok=True)
 
-    # Record in database — if this fails, clean up the staging directory
-    # so it does not leak. Cleanup-task scans for DB rows, so an orphan
-    # directory with no DB row would otherwise persist indefinitely.
+    # Insert the DB row BEFORE creating the directory so the orphan-dir
+    # scanner's "canonical-id dir with no row => orphan" invariant always
+    # holds for a live upload — closing the makedirs->insert race where the
+    # background scanner could rmtree a live staging dir. If makedirs then
+    # fails we drop the row; a crash in between leaves a harmless
+    # row-without-dir that the expired-staging-row sweep reclaims at expiry.
+    await asyncio.to_thread(
+        state.db.create_staging_upload,
+        upload_id=upload_id,
+        owner_id=identity.user_id,
+        filename=filename,
+        expected_chunks=expected_chunks,
+        expiry_seconds=state.staging_expiry,
+    )
     try:
-        await asyncio.to_thread(
-            state.db.create_staging_upload,
-            upload_id=upload_id,
-            owner_id=identity.user_id,
-            filename=filename,
-            expected_chunks=expected_chunks,
-            expiry_seconds=state.staging_expiry,
-        )
+        await asyncio.to_thread(os.makedirs, staging_path, mode=0o700, exist_ok=True)
     except Exception:
         try:
-            await asyncio.to_thread(shutil.rmtree, staging_path, True)
-        except OSError:
+            await asyncio.to_thread(state.db.delete_staging_upload, upload_id)
+        except Exception:
             logger.warning(
-                "Failed to clean up staging dir after DB error: %s", upload_id
+                "Failed to delete staging row after makedirs error: %s", upload_id
             )
         raise
 
@@ -1588,9 +1591,10 @@ def cleanup_expired_uploads() -> int:
 
 def cleanup_orphan_staging_dirs() -> int:
     """Scan the staging directory and remove any subdirectory that has
-    no corresponding row in ``staging_uploads``. Closes the orphan-dir
-    leak where ``upload_init``'s DB insert failed AFTER ``os.makedirs``
-    succeeded (#20 fix).
+    no corresponding row in ``staging_uploads``. ``upload_init`` now inserts
+    the DB row BEFORE ``os.makedirs`` (race fix), so a live upload always has
+    a row before its dir exists — this no longer races a live upload and
+    remains a backstop for foreign/leftover directories.
 
     Returns the number of orphan directories removed.
     """
