@@ -77,13 +77,17 @@ def create_app(config: ServerConfig | None = None) -> Quart:
     app = Quart(__name__)
     app.config["MAX_CONTENT_LENGTH"] = config.max_content_length
 
+    # ── Ensure directories exist ──
+    # APP-1: must precede db.connect(). sqlite3.connect() does NOT create
+    # parent directories, so on a fresh box whose data_dir does not yet
+    # exist, opening the DB first raises OperationalError before the dirs
+    # would have been created.
+    config.ensure_directories()
+
     # ── Initialize database ──
     db = Database(config.db_path)
     db.connect()
     app.db = db  # type: ignore
-
-    # ── Ensure directories exist ──
-    config.ensure_directories()
 
     # ── Initialize modules ──
     init_auth(
@@ -314,28 +318,35 @@ async def _periodic_cleanup(db: Database, rate_limit_window: int) -> None:
 # ──────────────────────────── Entry Point ────────────────────────────
 
 
-def main():
+def main() -> None:
     """Run the server. For development only — production uses Hypercorn."""
-    configure_logging()
-    config = ServerConfig.from_env()
+    import sqlite3
 
-    # Validate config before starting
+    from shared.exceptions import StorageError
+
+    configure_logging()
+
+    # APP-2: from_env()/_read_secret_file() raise ValueError on a malformed
+    # env var or an unreadable/insecure secret file. Previously from_env()
+    # ran OUTSIDE any try and dumped an uncaught traceback; load + validate
+    # under one fail-closed umbrella so a misconfigured box exits cleanly.
     try:
+        config = ServerConfig.from_env()
         config.validate()
     except ValueError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    from shared.exceptions import StorageError
-
     try:
         app = create_app(config)
-    except (StorageError, ValueError, RuntimeError) as e:
+    except (StorageError, ValueError, RuntimeError, sqlite3.OperationalError) as e:
         # Catches ConfigurationError (StorageError subclass) raised by
         # init_storage when blob_dir/staging_dir are misconfigured
-        # (#F12.1 / #23), and the RuntimeError raised by the startup
-        # invariant assertions (e.g. assert_single_worker on a multi-
-        # worker misconfiguration) so a bad deployment exits cleanly
+        # (#F12.1 / #23); the RuntimeError raised by the startup invariant
+        # assertions (e.g. assert_single_worker on a multi-worker
+        # misconfiguration); the re-run config.validate()'s ValueError; and
+        # the sqlite3.OperationalError raised by db.connect() when the data
+        # dir is unwritable (APP-2) — so a bad deployment exits cleanly
         # fail-closed instead of dumping an uncaught traceback.
         print(f"Startup error: {e}", file=sys.stderr)
         sys.exit(1)

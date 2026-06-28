@@ -244,3 +244,94 @@ def test_create_app_fails_closed_multi_worker(
 
     with pytest.raises(RuntimeError, match="(?i)worker"):
         create_app(_config_for(tmp_data_dir, session_secret))
+
+
+# ──────────────────────────── APP-1: directories created before DB open ────────────────────────────
+#
+# sqlite3.connect() does NOT create parent directories — on a fresh box
+# whose configured data_dir does not yet exist, opening the DB before
+# create_app calls config.ensure_directories() raises OperationalError.
+# ensure_directories() must therefore run BEFORE db.connect().
+
+
+def test_create_app_creates_missing_data_dir(
+    tmp_path, session_secret, monkeypatch: pytest.MonkeyPatch
+):
+    """create_app builds when the configured data_dir does not pre-exist.
+
+    The data_dir (and its parent) are absent up front; create_app must
+    create the directory tree and open the DB inside it, rather than
+    raising sqlite3.OperationalError on the unborn path. (APP-1)
+    """
+    for var in ("WEB_CONCURRENCY", "HYPERCORN_WORKERS", "LOCALCLOUD_WORKERS"):
+        monkeypatch.delenv(var, raising=False)
+    from server.app import create_app
+    from server.config import ServerConfig
+
+    fresh = tmp_path / "absent-parent" / "data"
+    assert not fresh.exists()
+    config = ServerConfig(
+        bind_host="10.0.0.1",
+        data_dir=str(fresh),
+        blob_dir=str(fresh / "blobs"),
+        staging_dir=str(fresh / "staging"),
+        db_path=str(fresh / "meta.db"),
+        session_secret=session_secret,
+    )
+
+    app = create_app(config)
+    try:
+        assert app is not None
+        assert fresh.is_dir()
+        assert (fresh / "blobs").is_dir()
+        assert (fresh / "staging").is_dir()
+    finally:
+        db = getattr(app, "db", None)
+        if db is not None:
+            db.close()
+
+
+# ──────────────────────────── APP-2: main() fail-closed startup ────────────────────────────
+#
+# The dev-only main() must surface config/secret-file/db-open failures as a
+# clean stderr message + nonzero exit, never as an uncaught traceback.
+
+
+def test_main_exits_clean_on_bad_env_config(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A malformed env var makes ServerConfig.from_env() raise ValueError;
+    main() must catch it and exit cleanly rather than dump a traceback. (APP-2)
+    """
+    monkeypatch.setenv("LOCALCLOUD_BIND_PORT", "not-an-int")
+    from server.app import main
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    assert "Configuration error" in capsys.readouterr().err
+
+
+def test_main_exits_clean_on_db_open_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A sqlite3.OperationalError from create_app()'s db.connect() must be
+    caught by main() and surfaced as a clean fail-closed exit. (APP-2)
+    """
+    import sqlite3
+
+    for var in ("WEB_CONCURRENCY", "HYPERCORN_WORKERS", "LOCALCLOUD_WORKERS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LOCALCLOUD_SESSION_SECRET", "a" * 64)
+
+    import server.app as app_module
+
+    def _boom(_config: object) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(app_module, "create_app", _boom)
+
+    with pytest.raises(SystemExit) as exc:
+        app_module.main()
+    assert exc.value.code == 1
+    assert "Startup error" in capsys.readouterr().err
