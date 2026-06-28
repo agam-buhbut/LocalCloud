@@ -1,0 +1,17 @@
+# Sector H — deploy
+
+**Owns:** deploy/** (scripts, systemd units, nftables, wireguard example, apparmor, backup, os). Shell + config only. These are templates (never CI-run); keep changes conservative, well-commented, and `shellcheck`-clean where a shell is available.
+
+- **ACC-2 (MEDIUM)** — deploy/scripts/localcloud-acceptance-check.sh:33 greps `aa-status` for `usr.local.bin.localcloud-server`, but the AppArmor profile (deploy/apparmor/usr.local.bin.localcloud-server:17) is an UNNAMED profile attached to `/opt/localcloud/venv/bin/python3`, so `aa-status` reports that path — the grep can never match and a correctly-enforcing box always FAILs. Fix BOTH consistently: give the profile an explicit name (`profile localcloud-server /opt/localcloud/venv/bin/python3 flags=(enforce) { … }`) and grep that name; OR default `AA_PROFILE` to the python3 path the profile actually attaches to. Pick one and make the script + profile agree. Keep the env override.
+- **ACC-1 (LOW)** — acceptance-check `DATA_DIR` default is `/var/lib/localcloud` but the rest of the tree (and the server default) is `/srv/cloud`. Change the default to `/srv/cloud`; keep the env override.
+- **ACC-3 (LOW)** — the `/32 AllowedIPs` check false-passes a peer that has a `/32` plus a wider range. Tighten the validation to require each peer's AllowedIPs be exactly a single `/32` (reject if any wider CIDR is present).
+- **NFT-2 (LOW)** — deploy/nftables/localcloud.nft:35 WG-handshake rate-limit matches IPv4 only (`ip saddr`); add the `ip6 saddr` counterpart so IPv6 handshakes are rate-limited rather than dropped (or document IPv4-only intent if WG is v4-only here).
+- **NFT-1 (LOW)** — the offline toggle blocks NEW handshakes but doesn't sever an already-established peer with keepalives. Either add a conntrack/flush step to the offline path (drop established WG state) or document the limitation clearly in deploy/README.md + the offline script header.
+- **BKP-2 (LOW)** — deploy/backup/localcloud-restore-copy.sh:25 doesn't clear stale `meta.db-wal`/`-shm` in the destination before restoring, risking a mismatched WAL. Remove any existing `-wal`/`-shm` at the destination before/with the DB copy.
+- **BKP-1 (LOW)** — localcloud-backup-copy.sh:28 claims a "consistent snapshot" but there's a db-vs-blob cross-consistency window (DB backed up, then blobs copied). Document the window (blobs are immutable ciphertext, so a blob present without its DB row is harmless; a DB row without its blob is the risk) and/or snapshot blobs-before-db; at minimum correct the comment.
+- **BKP-3 (LOW)** — the backup/restore wrappers use bare `dirname "$0"`; make script self-location robust when invoked by bare name on PATH (resolve via `$(cd "$(dirname "$(readlink -f "$0")")" && pwd)` or `command -v`).
+- **SVC-2 (LOW)** — deploy/systemd/localcloud.service orders `After=nftables` but doesn't `Wants=`/`Requires=` it; add `Wants=nftables.service` (soft dep) so the firewall is pulled in, keeping the default-deny-before-daemon property.
+- **SVC-1 (INFO)** — the `MemoryDenyWriteExecute=yes` comment still says "UNTESTED / may break argon2"; pentest V15 hardware-validated it works. Update the comment to reflect it's cleared (keep the directive enabled).
+
+## Verify
+`shellcheck deploy/**/*.sh` if available (note in report if not); `systemd-analyze verify` / `nft -c -f` are not runnable here — note that they remain operator-side. No code tests. No git.
