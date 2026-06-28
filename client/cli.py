@@ -55,6 +55,9 @@ def _unlock_or_exit(ks: KeyStore, password: str) -> None:
     otherwise escape as an uncaught traceback. Normalize to one generic
     stderr line + exit 1 (no traceback, no password-vs-corrupt distinction).
     """
+    # The Argon2id keystore unlock is memory-hard and takes several seconds;
+    # without this line the CLI looks hung after the password prompt. (UX 2026-06-29)
+    click.echo("Unlocking key store (Argon2id, this takes a few seconds)…", err=True)
     try:
         ks.unlock(password)
     except (ValueError, FileNotFoundError):
@@ -329,8 +332,11 @@ def _resolve_owner_pubkey(
         pk = client.get_owner_pubkey(file_id)
         if pk is None or len(pk) != 32:
             raise CryptoError(
-                "Server has no registered identity key for this file's owner; "
-                "pass --sender-pubkey explicitly if you trust an out-of-band key."
+                "Server has no registered identity key for this file's owner. "
+                "If this is your OWN file, register your key once (the hex is "
+                "printed by 'localcloud init'): "
+                "python -m server.admin register-pubkey <you> <your-ed25519-hex>. "
+                "Otherwise pass --sender-pubkey if you trust an out-of-band key."
             )
         is_override = False
 
