@@ -36,11 +36,19 @@ _MAX_TOKEN_LEN = 4096
 # tie up Argon2 budget by submitting megabyte-sized "passwords".
 _LOGIN_MAX_CONTENT_LENGTH = 4096
 
-# Constant sleep budget when rate-limited. Keeps the response timing
-# of a rate-limit reject indistinguishable from an auth-failure path
-# that ran Argon2id + DB lookup. Sourced from the shared TIMING_BUDGET_S
-# (~150 ms — the same constant the share/unshare/directory equalized
-# paths use) so all equalized endpoints share one budget value.
+# Constant sleep budget applied to every early-reject path (oversized
+# body, wrong content-type, missing peer, malformed JSON, over-length
+# password, rate-limit trip). Its job is to CAP the timing variance among
+# those early rejects — NOT to match the full Argon2id verify path. A real
+# verify costs ~250 ms (memory-hard Argon2id), which is longer than this
+# ~150 ms budget, so an early reject is deliberately NOT made
+# indistinguishable from a completed auth failure that ran Argon2id. What
+# actually closes the username-enumeration oracle is that BOTH existing and
+# non-existent users run Argon2id (the real stored hash vs. a dummy hash);
+# this constant only bounds residual variance among the pre-verify rejects.
+# Sourced from the shared TIMING_BUDGET_S (~150 ms — the same constant the
+# share/unshare/directory equalized paths use) so all equalized endpoints
+# share one budget value.
 _RATE_LIMIT_SLEEP_SECONDS = TIMING_BUDGET_S
 
 # Dummy Argon2id hash used to equalize timing on unknown-username
@@ -367,8 +375,14 @@ def check_rate_limit(
 
     Raises RateLimitError if too many recent attempts.
     """
-    # Per-username check
-    count = db.count_recent_attempts(username, window_seconds)
+    # Per-username check, scoped to the peer (AUTH-1). Counting this
+    # username's recent attempts globally let one peer's failures lock the
+    # account out from every other peer (a cross-peer account-lockout DoS
+    # the victim could not self-clear). Scoping to ``ip_address`` matches
+    # the authoritative composite (peer, username) limiter's blast radius:
+    # a single peer is still brute-force limited, honouring #H11, but its
+    # failures no longer leak across peers.
+    count = db.count_recent_attempts(username, window_seconds, ip_address=ip_address)
     if count >= max_attempts:
         raise RateLimitError()
 
@@ -429,6 +443,14 @@ def init_auth(
     _argon2_max_concurrent = argon2_max_concurrent
     if _argon2_semaphore is None:
         _argon2_semaphore = asyncio.Semaphore(_argon2_max_concurrent)
+
+    # AUTH-3: pre-warm the dummy Argon2id hash at startup so the ~250 ms
+    # memory-hard computation is a one-time cost off the request path. The
+    # first unknown-user login would otherwise pay it inline, blocking the
+    # event loop and creating a cold-start timing artifact that distinguishes
+    # the first unknown-user probe from later ones. Runs once; subsequent
+    # calls are a cheap no-op (the hash is cached process-wide).
+    _get_dummy_hash()
 
 
 def _get_peer_identity() -> str:

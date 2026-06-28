@@ -46,3 +46,35 @@ def test_init_auth_applies_concurrency(
     auth.init_auth(db=db, session_secret="x" * 64, argon2_max_concurrent=2)
     assert auth._argon2_max_concurrent == 2
     assert auth._get_argon2_semaphore()._value == 2
+
+
+def test_init_auth_prewarms_dummy_hash(
+    db: Database, monkeypatch: pytest.MonkeyPatch, fast_argon2: None
+) -> None:
+    """AUTH-3: init_auth pre-warms the dummy Argon2 hash at startup.
+
+    The ~250 ms memory-hard dummy hash must be computed once at startup, not
+    lazily on the first unknown-user login (which would block the event loop
+    and add a cold-start timing artifact distinguishing the first unknown
+    user from later ones). After init_auth the cached hash is populated.
+    ``fast_argon2`` keeps the KDF cheap for this test and resets the cache to
+    None at setup; we re-assert that precondition, call init_auth, and prove
+    the cache is now warm.
+    """
+    # Snapshot every global init_auth mutates so teardown restores them and
+    # no state leaks into other tests.
+    for name in (
+        "_db",
+        "_session_secret",
+        "_session_lifetime",
+        "_rate_limit_max",
+        "_rate_limit_window",
+        "_argon2_max_concurrent",
+    ):
+        monkeypatch.setattr(auth, name, getattr(auth, name))
+    monkeypatch.setattr(auth, "_argon2_semaphore", None)
+    monkeypatch.setattr(auth, "_DUMMY_PASSWORD_HASH", None)
+
+    assert auth._DUMMY_PASSWORD_HASH is None
+    auth.init_auth(db=db, session_secret="x" * 64)
+    assert auth._DUMMY_PASSWORD_HASH is not None

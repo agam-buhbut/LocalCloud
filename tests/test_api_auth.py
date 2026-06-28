@@ -166,6 +166,50 @@ async def test_repeated_failures_lock_out_even_correct_password(
     assert await locked.get_json() == _GENERIC_AUTH_FAILURE
 
 
+async def test_failed_logins_from_one_peer_dont_lock_username_for_another(
+    app: Quart,
+    client: QuartClient,
+    make_user: Callable[..., str],
+    fast_argon2: None,
+) -> None:
+    """AUTH-1: a flood from peer P1 must not lock the user out from peer P2.
+
+    The legacy DB rate-limit gate scopes its per-username count to the
+    peer (matching the authoritative composite limiter's blast radius), so
+    failed logins authored by P1 against "alice" never count against a
+    DIFFERENT peer P2. P2 presenting the CORRECT password must reach verify
+    and succeed. Before the AUTH-1 fix the global per-username DB count
+    locked P2 out — a cross-peer account-lockout DoS the victim could not
+    self-clear. The same-peer lockout guard
+    (test_repeated_failures_lock_out_even_correct_password) stays green
+    because that path is enforced by the composite limiter.
+    """
+    max_attempts = _rate_limit_max(app)
+    assert max_attempts >= 1
+
+    make_user(TEST_USERNAME, TEST_PASSWORD)
+    attacker_peer = "10.0.0.40"
+    victim_peer = "10.0.0.41"
+
+    # P1 floods enough wrong-password attempts to trip the legacy
+    # per-username DB gate (>= max_attempts rows for "alice").
+    for _ in range(max_attempts):
+        bad = await _login_attempt(
+            client, TEST_USERNAME, "wrong", peer_host=attacker_peer
+        )
+        assert bad.status_code == 401
+
+    # P2 logs in with the CORRECT password from a different peer. Its
+    # composite key (P2, alice) is empty and the per-username DB gate is now
+    # peer-scoped, so this must reach verify and succeed.
+    ok = await _login_attempt(
+        client, TEST_USERNAME, TEST_PASSWORD, peer_host=victim_peer
+    )
+    assert ok.status_code == 200
+    body = await ok.get_json()
+    assert isinstance(body["token"], str) and body["token"]
+
+
 async def test_successful_login_clears_prior_failures(
     app: Quart,
     client: QuartClient,
