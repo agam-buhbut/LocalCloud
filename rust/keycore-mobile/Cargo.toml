@@ -1,0 +1,32 @@
+[package]
+name = "keycore-mobile"
+version = "0.1.0"
+edition = "2021"
+description = "UniFFI mobile bindings skin over keycore-core for the LocalCloud Android client"
+
+[lib]
+name = "keycore_mobile"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Shared pure-Rust crypto core (same logic as the desktop PyO3 skin).
+keycore-core = { path = "../keycore-core" }
+
+# UniFFI proc-macro mode: `setup_scaffolding!()` + `#[uniffi::export]`,
+# no .udl file and no build.rs. Default features only for the cdylib.
+uniffi = "0.31"
+
+[features]
+# `cli` is OFF by default so the cdylib build stays lean (no clap/bindgen
+# tree linked for a normal `cargo build -p keycore-mobile`). Enable it only
+# to run the library-mode bindings generator below.
+cli = ["uniffi/cli"]
+
+[[bin]]
+# Library-mode bindgen entry point. UniFFI does not publish a standalone
+# `uniffi-bindgen` binary whose version tracks `uniffi`, so the documented
+# approach is to expose `uniffi::uniffi_bindgen_main()` from the crate.
+# Gated behind `cli` via required-features so it never builds (or pulls its
+# dependency tree in) during ordinary host builds.
+name = "uniffi-bindgen"
+required-features = ["cli"]

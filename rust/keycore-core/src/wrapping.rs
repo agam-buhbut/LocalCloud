@@ -261,13 +261,15 @@ fn derive_wrapping_key(
     Ok(key)
 }
 
-/// Build the AEAD AAD::
+/// Build the AEAD AAD:
 ///
-///     WRAP_AAD_DOMAIN
-///         || sender_identity_pub (32 bytes)
-///         || recipient_pubkey    (32 bytes)
-///         || ephemeral_pub       (32 bytes)
-///         || file_id             (16 bytes)
+/// ```text
+/// WRAP_AAD_DOMAIN
+///     || sender_identity_pub (32 bytes)
+///     || recipient_pubkey    (32 bytes)
+///     || ephemeral_pub       (32 bytes)
+///     || file_id             (16 bytes)
+/// ```
 ///
 /// Binding the ephemeral pubkey defeats ephemeral-swap attacks;
 /// binding the sender identity defeats cross-sender grafting;

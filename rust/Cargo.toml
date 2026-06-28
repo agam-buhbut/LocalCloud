@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["keycore-core", "keycore", "keycore-mobile"]
+
+# Release profile lives at the workspace root: Cargo only honors
+# `[profile.*]` from the workspace root manifest, so the desktop PyO3
+# extension (`keycore`) inherits these settings on `--release` builds
+# exactly as it did before the split.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"

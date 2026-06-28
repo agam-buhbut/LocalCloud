@@ -1,54 +1,23 @@
 [package]
-name = "localcloud-keycore"
+name = "keycore"
 version = "0.1.0"
 edition = "2021"
-description = "Secure key management for LocalCloud — mlock, zeroize, key generation, wrapping"
+description = "Secure key management for LocalCloud — PyO3 desktop extension over keycore-core"
 
 [lib]
 name = "keycore"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Shared pure-Rust crypto core. All crypto primitives now live there;
+# this crate is a thin PyO3 skin and pulls them in transitively.
+keycore-core = { path = "../keycore-core" }
+
 # pyo3 >=0.29 clears RUSTSEC-2026-0176 (OOB read in PyList/PyTuple
 # iterators) and RUSTSEC-2026-0177 (missing Sync bound on
 # PyCFunction::new_closure). API-compatible with our usage: the modern
 # Bound API (PyBytes::new, Bound<'py>), #[pyclass], #[pyfunction].
 pyo3 = { version = "0.29", features = ["extension-module"] }
 
-# Cryptographic primitives
-# `zeroize` features are pinned explicitly so that key material carried
-# inside library types (StaticSecret, SigningKey) is always zeroized on
-# drop, even if upstream ever changes its default-features set.
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
-argon2 = "0.5"
-
-# Secure memory
-zeroize = { version = "1", features = ["derive"] }
-
-# Vetted constant-time primitives. Replaces the hand-rolled
-# ct_eq_32 / is_zero_32 loops which, while data-flow constant on
-# x86_64/aarch64 today, give LLVM under -O3+LTO room to introduce a
-# branch in future versions. subtle uses black_box reads and is
-# specifically maintained for crypto use.
-subtle = "2"
-
-# Randomness
-rand = "0.8"
-rand_core = { version = "0.6", features = ["getrandom"] }
-
-# Serialization
-ciborium = "0.2"
-serde = { version = "1", features = ["derive"] }
-
-# System
-libc = "0.2"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = "symbols"
+# NOTE: the release profile lives at the workspace root (rust/Cargo.toml);
+# Cargo ignores `[profile.*]` in non-root members.

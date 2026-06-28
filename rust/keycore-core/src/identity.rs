@@ -413,6 +413,78 @@ impl IdentityKeyPair {
         })
     }
 
+    // ──────── High-level operations (raw private keys stay internal) ────────
+
+    /// Sign a message with this identity's Ed25519 private key.
+    ///
+    /// The private key never leaves this struct; only the 64-byte signature
+    /// is returned. Use this instead of reaching for the raw private key.
+    ///
+    /// # Errors
+    /// Returns an error string if signing fails.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        crate::signing::sign(self.ed25519_private_key(), message)
+    }
+
+    /// Wrap `file_key` + `meta_key` for `recipient_pubkey` using
+    /// ephemeral-static ECDH, binding THIS identity (its Ed25519 public key)
+    /// as the sender.
+    ///
+    /// The identity's long-term keys are not used for ECDH; a fresh ephemeral
+    /// pair is generated per call (sender-side forward secrecy). The sender's
+    /// Ed25519 identity public key is bound into the KDF and AEAD AAD.
+    ///
+    /// Returns: ephemeral_pubkey (32) || nonce (24) || ciphertext+tag (80).
+    ///
+    /// # Errors
+    /// Returns an error string on invalid input or wrapping failure.
+    pub fn wrap_file_keys(
+        &self,
+        file_key: &[u8; 32],
+        meta_key: &[u8; 32],
+        file_id: &[u8],
+        recipient_pubkey: &[u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        crate::wrapping::wrap_file_keys(
+            file_key,
+            meta_key,
+            file_id,
+            recipient_pubkey,
+            self.ed25519_public_key(),
+        )
+    }
+
+    /// Unwrap `file_key` + `meta_key` from a wrapped bundle using this
+    /// identity's long-term X25519 private key.
+    ///
+    /// `sender_pubkey` is the sender's Ed25519 identity public key (a domain
+    /// binding, not an ECDH input); the ephemeral X25519 public key is read
+    /// from the bundle. The recipient private key never leaves this struct.
+    ///
+    /// The recovered values are per-file CONTENT keys, not identity private
+    /// keys, so they are returned by value.
+    ///
+    /// # Errors
+    /// Returns an error string if the bundle is malformed or AEAD
+    /// authentication fails.
+    pub fn unwrap_file_keys(
+        &self,
+        wrapped_bundle: &[u8],
+        file_id: &[u8],
+        sender_pubkey: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32]), String> {
+        let (file_key, meta_key) = crate::wrapping::unwrap_file_keys(
+            wrapped_bundle,
+            file_id,
+            sender_pubkey,
+            self.x25519_private_key(),
+        )?;
+        // `wrapping::unwrap_file_keys` returns the keys in `Zeroizing`
+        // wrappers; copy them out by value for the caller. These are per-file
+        // content keys — never identity private keys.
+        Ok((*file_key, *meta_key))
+    }
+
     // ──────────── Accessors (public keys are not secret) ────────────
 
     /// Get the X25519 public key bytes

@@ -1,18 +1,20 @@
 // LocalCloud Key Management - PyO3 Module Entry Point
 //
 // Exposes the Rust key management functionality to Python via PyO3.
-// Python code interacts with `keycore.KeyPair`, `keycore.wrap_file_keys()`, etc.
+// Python code interacts with `keycore.KeyPair`, `keycore.verify_signature()`, etc.
 // Private key material NEVER crosses the FFI boundary in plaintext —
 // only encrypted blobs, public keys, and operation results are returned.
+//
+// This is a thin skin over the `keycore-core` crate. The PyO3 `KeyPair`
+// wraps a `keycore_core::IdentityKeyPair` and drives it exclusively through
+// that type's high-level METHODS (sign / wrap_file_keys / unwrap_file_keys /
+// encrypt_to_store / decrypt_from_store). Raw private-key bytes are never
+// pulled out of the core type here — the core does not expose them.
 
+use keycore_core::IdentityKeyPair;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-
-mod identity;
-mod secure_memory;
-mod signing;
-mod wrapping;
 
 // ──────────────────────────── PyO3 Wrapper: KeyPair ────────────────────────────
 
@@ -22,7 +24,7 @@ mod wrapping;
 /// Python can only access public keys and perform operations through methods.
 #[pyclass]
 struct KeyPair {
-    inner: identity::IdentityKeyPair,
+    inner: IdentityKeyPair,
 }
 
 #[pymethods]
@@ -36,7 +38,7 @@ impl KeyPair {
         // Inner error strings are not propagated across the FFI boundary
         // — they could echo serializer/cipher internals. Return a
         // deliberately generic Python exception instead.
-        let inner = identity::IdentityKeyPair::generate()
+        let inner = IdentityKeyPair::generate()
             .map_err(|_| PyValueError::new_err("Key generation failed"))?;
         Ok(KeyPair { inner })
     }
@@ -64,7 +66,7 @@ impl KeyPair {
     /// the failure was due to wrong password vs corrupted data.
     #[staticmethod]
     fn decrypt_from_store(data: &[u8], password: &[u8]) -> PyResult<Self> {
-        let inner = identity::IdentityKeyPair::decrypt_from_store(data, password)
+        let inner = IdentityKeyPair::decrypt_from_store(data, password)
             .map_err(|_| PyValueError::new_err("Failed to decrypt key store"))?;
         Ok(KeyPair { inner })
     }
@@ -81,9 +83,13 @@ impl KeyPair {
 
     /// Sign a message using the Ed25519 private key.
     ///
-    /// Returns the 64-byte signature. The private key never leaves Rust memory.
+    /// Returns the 64-byte signature. The private key never leaves Rust memory:
+    /// signing is performed by the core `IdentityKeyPair::sign` method, which
+    /// uses the private key internally without exposing it.
     fn sign<'py>(&self, py: Python<'py>, message: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        let sig = signing::sign(self.inner.ed25519_private_key(), message)
+        let sig = self
+            .inner
+            .sign(message)
             .map_err(|_| PyValueError::new_err("Signing failed"))?;
         Ok(PyBytes::new(py, &sig))
     }
@@ -91,10 +97,10 @@ impl KeyPair {
     /// Wrap file_key + meta_key for a specific recipient using
     /// ephemeral-static ECDH for forward secrecy.
     ///
-    /// The sender's long-term X25519 key is NOT used; instead we
-    /// generate a fresh ephemeral pair per call. The sender's Ed25519
-    /// identity public key is bound into the KDF and AEAD AAD so the
-    /// bundle is cryptographically tied to the claimed sender.
+    /// The sender's long-term X25519 key is NOT used; instead the core
+    /// generates a fresh ephemeral pair per call. The sender's Ed25519
+    /// identity public key is bound into the KDF and AEAD AAD by the core
+    /// method so the bundle is cryptographically tied to this keypair.
     ///
     /// Returns: ephemeral_pubkey || nonce || ciphertext+tag.
     fn wrap_file_keys<'py>(
@@ -115,9 +121,10 @@ impl KeyPair {
             .try_into()
             .map_err(|_| PyValueError::new_err("recipient_pubkey must be 32 bytes"))?;
 
-        let wrapped =
-            wrapping::wrap_file_keys(fk, mk, file_id, rpk, self.inner.ed25519_public_key())
-                .map_err(|_| PyValueError::new_err("Key wrapping failed"))?;
+        let wrapped = self
+            .inner
+            .wrap_file_keys(fk, mk, file_id, rpk)
+            .map_err(|_| PyValueError::new_err("Key wrapping failed"))?;
 
         Ok(PyBytes::new(py, &wrapped))
     }
@@ -148,22 +155,16 @@ impl KeyPair {
             .try_into()
             .map_err(|_| PyValueError::new_err("sender_pubkey must be 32 bytes"))?;
 
-        let (file_key, meta_key) = wrapping::unwrap_file_keys(
-            wrapped_bundle,
-            file_id,
-            spk,
-            self.inner.x25519_private_key(),
-        )
-        .map_err(|_| PyValueError::new_err("Key unwrapping failed"))?;
+        let (file_key, meta_key) = self
+            .inner
+            .unwrap_file_keys(wrapped_bundle, file_id, spk)
+            .map_err(|_| PyValueError::new_err("Key unwrapping failed"))?;
 
         // Architectural boundary: the recovered file/meta keys necessarily
         // cross into Python `bytes` here (non-zeroizable, Python-owned
         // lifetime). Accepted tradeoff — see this method's doc. Only
         // per-file content keys cross; identity private keys never do.
-        Ok((
-            PyBytes::new(py, file_key.as_ref()),
-            PyBytes::new(py, meta_key.as_ref()),
-        ))
+        Ok((PyBytes::new(py, &file_key), PyBytes::new(py, &meta_key)))
     }
 }
 
@@ -183,7 +184,7 @@ fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> PyRe
         Ok(p) => p,
         Err(_) => return Ok(false),
     };
-    Ok(signing::verify(pk, message, signature).unwrap_or(false))
+    Ok(keycore_core::verify(pk, message, signature).unwrap_or(false))
 }
 
 // ──────────────────────────── Module Registration ────────────────────────────

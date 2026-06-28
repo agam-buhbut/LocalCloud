@@ -1,0 +1,43 @@
+[package]
+name = "keycore-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust cryptographic core for LocalCloud key management — identity, wrapping, signing, secure memory. No FFI."
+
+[lib]
+name = "keycore_core"
+# Default crate-type (rlib): pure logic, consumed by the PyO3 and UniFFI
+# skins. No cdylib here — this crate exposes no FFI of its own.
+
+[dependencies]
+# Cryptographic primitives
+# `zeroize` features are pinned explicitly so that key material carried
+# inside library types (StaticSecret, SigningKey) is always zeroized on
+# drop, even if upstream ever changes its default-features set.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
+
+# Secure memory
+zeroize = { version = "1", features = ["derive"] }
+
+# Vetted constant-time primitives. Replaces the hand-rolled
+# ct_eq_32 / is_zero_32 loops which, while data-flow constant on
+# x86_64/aarch64 today, give LLVM under -O3+LTO room to introduce a
+# branch in future versions. subtle uses black_box reads and is
+# specifically maintained for crypto use.
+subtle = "2"
+
+# Randomness
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Serialization
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+# System
+libc = "0.2"
