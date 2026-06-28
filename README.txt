@@ -189,13 +189,22 @@ init` output and gives it to the operator out-of-band.
   localcloud ls
   localcloud quota
 
-  # Download + verify + decrypt. The owner's Ed25519 signing key is TOFU-pinned
-  # on the first successful download (see "Trust" below); pass --sender-pubkey
-  # <ed25519-hex> to authenticate first use, or to re-pin after a legitimate
-  # owner key rotation.
+  # Download + verify + decrypt.
+  # PREREQUISITE: the file owner's Ed25519 key must be registered server-side
+  # (the operator `register-pubkey` step described above). For your OWN files
+  # that means
+  # registering YOUR key once: if you are the only user you are also the
+  # operator, so run `python -m server.admin register-pubkey <you>
+  # <your-ed25519-hex>` yourself (the hex is printed by `init`). Without it,
+  # download fails closed with "no registered identity key for this file's owner".
+  # The owner's signing key is TOFU-pinned on the first successful download (see
+  # "Trust" below); pass --sender-pubkey <ed25519-hex> to authenticate first use
+  # or to re-pin after a legitimate owner key rotation.
   localcloud download <file_id> ./report.pdf
 
-  # Share with a recipient (needs their X25519 public key, obtained out-of-band)
+  # Share with a recipient. The DEFAULT path looks the recipient up in the
+  # server directory, so the recipient must have run `localcloud enroll <name>`
+  # first. Or pass their X25519 key out-of-band to skip the directory:
   localcloud share <file_id> bob --recipient-pubkey <bob-x25519-hex>
 
   # Revoke a share (server-side revocation only — see "Revocation" below)
