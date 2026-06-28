@@ -135,6 +135,40 @@ deployment plus `py-spy`/`strace`; 4G is deployment-time. 4B-b (drop per-chunk
 fsync) was declined to keep file-byte durability. The deferred items remain
 open for a future soak test on the real box.
 
+## Client-side & crypto-core (measured 2026-06-28)
+
+Captured on a 4-core dev host (Python 3.13, release `keycore`), `time.perf_counter`
+median over N, after a warm-up. Indicative — Argon2id cost scales with CPU.
+
+| Op | Median | Notes |
+|---|---|---|
+| **keystore lock** (`keycore` Argon2id encrypt-to-store) | **~3.66 s** | one-time on `init` |
+| **keystore unlock** (Argon2id decrypt-from-store) | **~3.86 s** | **paid on EVERY connecting CLI command** (login/enroll/upload/download) |
+| `KeyPair.generate` (Ed25519+X25519) | 0.15 ms | negligible |
+| `sign` (256 B) | 0.13 ms | negligible |
+| `verify_signature` | 0.23 ms | negligible |
+| `wrap_file_keys` (X25519 ephemeral-static) | 0.27 ms | per recipient/file |
+| `unwrap_file_keys` | 0.25 ms | per file |
+| `encrypt_chunk` (4 MiB XChaCha20-Poly1305) | 20.5 ms | **≈205 MB/s** |
+| `decrypt_chunk` (4 MiB) | 14.8 ms | **≈283 MB/s** |
+| server `hash_password` (Argon2id) | ~707 ms | login/create-user |
+| server `verify_password` (Argon2id) | ~711 ms | login path |
+
+**Read of the numbers:**
+- The **Argon2id keystore unlock (~3.9 s) dominates client latency** and is paid
+  per command — the single biggest felt-UX cost. For small files it is the whole
+  wait; identity/wrap ops are sub-ms and irrelevant. Lowering it trades brute-force
+  resistance of the at-rest keystore — an explicit owner knob, not a free win.
+- **Bulk content crypto ≈200–280 MB/s** (PyNaCl XChaCha20-Poly1305). A 1 GiB
+  transfer is ~5 s of client-side encrypt, so large transfers are crypto/I/O-bound,
+  not keystore-bound. A Rust chunk path could lift this but is unjustified at
+  single-user scale (YAGNI).
+- **Server login Argon2id ≈0.7 s here** (≈0.25 s on the deploy box) — both far
+  above the old flat 150 ms timing budget, which is exactly the P1 finding
+  (`docs/pentest-2026-06-28.md`): the fix now calibrates `TIMING_BUDGET_S` to
+  `max(150 ms, measured×1.30)` at startup so login's equalization deadline tracks
+  the real verify cost on the deployment hardware.
+
 ## Reproduce
 
 These figures are **indicative single-host measurements, not a committed
