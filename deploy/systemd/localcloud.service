@@ -44,6 +44,12 @@ LimitCORE=0
 MemorySwapMax=0
 
 # ── Sandboxing (PART II §1) ──
+# Attach the AppArmor profile by NAME, not by exec path: a venv's bin/python3 is
+# a symlink to /usr/bin/python3, so the profile's path attachment never matches
+# the resolved interpreter and the daemon would run UNCONFINED. systemd attaches
+# by name here, symlink-proof. Hardware-validated 2026-06-28; see
+# docs/pentest-2026-06-28.md D3.
+AppArmorProfile=localcloud-server
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -66,6 +72,13 @@ LockPersonality=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete @cpu-emulation @swap
+# A denied syscall returns EPERM instead of SIGSYS-killing the process. REQUIRED:
+# hypercorn's --workers 1 worker calls setfsuid (x86_64 syscall 122, a member of
+# @privileged) at startup; under the default kill action that SIGSYS-kills the
+# worker and the daemon never binds (master exits 0, silent). EPERM keeps the
+# whole filter but fails soft. Hardware-validated 2026-06-28; see
+# docs/pentest-2026-06-28.md D1.
+SystemCallErrorNumber=EPERM
 UMask=0077
 CapabilityBoundingSet=
 AmbientCapabilities=

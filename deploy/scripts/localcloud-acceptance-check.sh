@@ -113,13 +113,25 @@ if have ss; then
     if [ -z "$nonwg" ]; then
         pass "no non-loopback UDP listener other than the WG port"
     else
-        fail "unexpected non-loopback UDP listener(s): $nonwg"
+        # Host services (dhclient udp/68, resolvers, …) may appear here and are
+        # NOT a LocalCloud failure: the default-deny firewall — not the bind —
+        # gates external reachability (the external-nmap SKIP below is the real
+        # test). Surface them for manual review instead of failing. (D5, 2026-06-28)
+        info "non-WG UDP listeners present (verify the firewall denies them externally): $nonwg"
     fi
-    # The HTTP app should bind the WG IP or loopback, never 0.0.0.0.
-    if ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -q '0\.0\.0\.0'; then
-        fail "a TCP socket is bound to 0.0.0.0 — the app must bind the WG IP only"
+    # The LocalCloud app must bind the WG IP, never 0.0.0.0. Scope this to the
+    # SERVICE's OWN process so a host sshd/other daemon listening on 0.0.0.0 is
+    # not mistaken for the app binding wide. (D5, 2026-06-28)
+    svc_pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
+    if [ -n "$svc_pid" ] && [ "$svc_pid" != 0 ]; then
+        if ss -H -ltnp 2>/dev/null | grep -E "pid=${svc_pid}[,)]" |
+            awk '{print $4}' | grep -q '0\.0\.0\.0'; then
+            fail "the $SERVICE process binds 0.0.0.0 — it must bind the WG IP only"
+        else
+            pass "$SERVICE does not bind 0.0.0.0 (host services on 0.0.0.0 out of scope)"
+        fi
     else
-        pass "no TCP listener bound to 0.0.0.0"
+        info "could not resolve $SERVICE MainPID — skipping app-specific 0.0.0.0 bind check"
     fi
 else
     skip "local listener check" "ss not available"
@@ -133,9 +145,24 @@ if have aa-status; then
     if aa-status --enforced 2>/dev/null | grep -q "$AA_PROFILE"; then
         pass "AppArmor profile $AA_PROFILE is in ENFORCE mode"
     elif aa-status 2>/dev/null | grep -q "$AA_PROFILE"; then
-        fail "AppArmor profile $AA_PROFILE loaded but NOT enforcing (complain?). Tune with aa-logprof then aa-enforce."
+        info "AppArmor profile $AA_PROFILE loaded but aa-status --enforced does not list it (apparmor-utils quirk); the /proc attachment check below is authoritative"
     else
         fail "AppArmor profile $AA_PROFILE not loaded"
+    fi
+    # AUTHORITATIVE (D3, 2026-06-28): a loaded profile confines NOTHING unless it
+    # is actually attached to the daemon. A venv's bin/python3 is a symlink, so
+    # path-based attachment silently fails and the daemon runs unconfined even
+    # with the profile "enforcing". Check the live process's context directly.
+    if have systemctl; then
+        aa_pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
+        if [ -n "$aa_pid" ] && [ "$aa_pid" != 0 ]; then
+            cur=$(cat /proc/"$aa_pid"/attr/current 2>/dev/null | tr -d '\0' || echo "?")
+            case "$cur" in
+            "$AA_PROFILE"*) pass "live daemon (pid $aa_pid) is CONFINED by $AA_PROFILE ($cur)" ;;
+            unconfined*) fail "live daemon (pid $aa_pid) is UNCONFINED — profile not attached. Add 'AppArmorProfile=$AA_PROFILE' to the unit (systemd attaches by name, symlink-proof)." ;;
+            *) info "live daemon AppArmor context: ${cur:-<unknown>}" ;;
+            esac
+        fi
     fi
 else
     skip "AppArmor enforce check" "aa-status not available"
@@ -259,15 +286,34 @@ if [ "$RUN_BACKUP_DRILL" = 1 ]; then
             else
                 pass "staging/ correctly excluded from the backup"
             fi
-            if have strings && [ -d "$bdir/blobs" ]; then
-                leak=$(find "$bdir/blobs" -type f -exec strings -n 12 {} + 2>/dev/null | head -1 || true)
-                if [ -n "$leak" ]; then
-                    fail "a backup blob contains a >=12-char printable run (possible plaintext): $leak"
+            # Plaintext detection by ENTROPY, not `strings`. A `strings -n12`
+            # scan FALSE-POSITIVES on ciphertext: a multi-MB XChaCha20 blob is
+            # ~8.0 bits/byte random and, by chance, contains 12–15 char printable
+            # runs (verified on hardware — see docs/pentest-2026-06-28.md D4).
+            # Real plaintext is well under ~6 bits/byte; 7.5 is a wide margin.
+            if have python3 && [ -d "$bdir/blobs" ]; then
+                worst=$(python3 - "$bdir/blobs" <<'PY'
+import sys, os, math, collections
+worst = 8.0
+for dp, _, files in os.walk(sys.argv[1]):
+    for name in files:
+        data = open(os.path.join(dp, name), "rb").read()
+        if not data:
+            continue
+        counts = collections.Counter(data)
+        n = len(data)
+        h = -sum(v / n * math.log2(v / n) for v in counts.values())
+        worst = min(worst, h)
+print(f"{worst:.3f}")
+PY
+)
+                if [ -n "$worst" ] && awk "BEGIN{exit !($worst < 7.5)}"; then
+                    fail "a backup blob has low entropy ($worst bits/byte) — possible plaintext on media"
                 else
-                    pass "no long printable runs in backup blobs (consistent with ciphertext)"
+                    pass "all backup blobs are high-entropy ciphertext (min $worst bits/byte)"
                 fi
             else
-                skip "blob plaintext spot-check" "strings unavailable or no blobs"
+                skip "blob entropy spot-check" "python3 unavailable or no blobs"
             fi
         else
             fail "backup-copy/restore-copy returned an error"

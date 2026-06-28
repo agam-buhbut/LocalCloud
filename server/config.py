@@ -242,10 +242,30 @@ def _read_secret_file(path: str) -> str:
         # block forever on read; /dev/zero would return endless bytes.
         if not _stat.S_ISREG(st.st_mode):
             raise ValueError(f"Session secret file {path} is not a regular file")
-        if st.st_mode & 0o077:
+        mode = st.st_mode & 0o777
+        # World access is never acceptable — any other user could read the key.
+        if mode & 0o007:
             raise ValueError(
-                f"Session secret file {path} is group/world-readable "
-                f"(mode={oct(st.st_mode & 0o777)}); require 0400 or 0600"
+                f"Session secret file {path} is world-accessible "
+                f"(mode={oct(mode)}); require 0400/0600 (or 0440 group-owned by "
+                f"the service group, e.g. systemd LoadCredential)"
+            )
+        # Group write/execute is never acceptable.
+        if mode & 0o030:
+            raise ValueError(
+                f"Session secret file {path} is group-writable/executable "
+                f"(mode={oct(mode)}); require 0400/0600/0440"
+            )
+        # Group READ is allowed only when the file's group is the service's own
+        # group (or root). This is exactly how systemd `LoadCredential=` delivers
+        # the secret: mode 0440 on a root-owned private tmpfs, group = the
+        # service group. Rejecting it (the old `& 0o077` check) made the
+        # recommended deploy unable to start — see docs/pentest-2026-06-28.md D2.
+        if (mode & 0o040) and st.st_gid not in (0, os.getegid()):
+            raise ValueError(
+                f"Session secret file {path} is group-readable by gid "
+                f"{st.st_gid}, not the service group ({os.getegid()}); "
+                f"require 0400/0600 or 0440 group-owned by the service"
             )
         # Ownership check: must be root or the current effective user.
         # Anything else means an unrelated user wrote this file, which

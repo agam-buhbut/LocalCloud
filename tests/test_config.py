@@ -124,3 +124,52 @@ def test_ensure_directories_tightens_existing(tmp_path) -> None:
     cfg.staging_dir = str(d / "staging")
     cfg.ensure_directories()
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+
+
+# ── D2 (pentest 2026-06-28): _read_secret_file must accept systemd's 0440 ──
+# LoadCredential file (group-owned by the service group) while still rejecting
+# world access and group write. Hardware finding: the old `& 0o077` check made
+# the recommended `LoadCredential=` deploy unable to start.
+
+
+def _write_secret(tmp_path, mode: int):
+    import os
+
+    p = tmp_path / "session.secret"
+    p.write_text("b" * 64)
+    os.chmod(p, mode)
+    return p
+
+
+def test_read_secret_accepts_0400(tmp_path) -> None:
+    from server.config import _read_secret_file
+
+    assert _read_secret_file(str(_write_secret(tmp_path, 0o400))) == "b" * 64
+
+
+def test_read_secret_accepts_0600(tmp_path) -> None:
+    from server.config import _read_secret_file
+
+    assert _read_secret_file(str(_write_secret(tmp_path, 0o600))) == "b" * 64
+
+
+def test_read_secret_accepts_0440_own_group(tmp_path) -> None:
+    # systemd LoadCredential delivers the secret at mode 0440 group-owned by the
+    # service group; a temp file's group defaults to the test process's egid.
+    from server.config import _read_secret_file
+
+    assert _read_secret_file(str(_write_secret(tmp_path, 0o440))) == "b" * 64
+
+
+def test_read_secret_rejects_world_readable(tmp_path) -> None:
+    from server.config import _read_secret_file
+
+    with pytest.raises(ValueError, match="world-accessible"):
+        _read_secret_file(str(_write_secret(tmp_path, 0o444)))
+
+
+def test_read_secret_rejects_group_writable(tmp_path) -> None:
+    from server.config import _read_secret_file
+
+    with pytest.raises(ValueError, match="group-writable"):
+        _read_secret_file(str(_write_secret(tmp_path, 0o660)))

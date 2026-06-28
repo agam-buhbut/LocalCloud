@@ -20,7 +20,10 @@ abi <abi/3.0>,
 include <tunables/global>
 
 # Named profile `localcloud-server`, attached to the interpreter hypercorn execs.
-profile localcloud-server /opt/localcloud/venv/bin/python3 flags=(enforce) {
+# attach_disconnected: under systemd PrivateDevices=yes, /dev is a private mount
+# and AppArmor sees /dev/null etc. as "disconnected paths"; without this flag
+# their lookups are denied. (hardware-tuned 2026-06-28, pentest D3)
+profile localcloud-server /opt/localcloud/venv/bin/python3 flags=(enforce attach_disconnected) {
   include <abstractions/base>
   include <abstractions/python>
   include <abstractions/openssl>
@@ -48,7 +51,19 @@ profile localcloud-server /opt/localcloud/venv/bin/python3 flags=(enforce) {
   # Entropy + basic process introspection.
   /dev/urandom r,
   /dev/random r,
+  /dev/null rw,
+  # hypercorn's worker manager creates multiprocessing POSIX semaphores in
+  # /dev/shm even with --workers 1; without these the worker dies with
+  # PermissionError on SemLock. (hardware-tuned 2026-06-28, pentest D3)
+  /dev/shm/ rw,
+  /dev/shm/* rwkl,
   owner @{PROC}/@{pid}/** r,
+
+  # Quiet the harmless readline/terminfo probes Python emits at startup — the
+  # server is non-interactive and does not need them. Plain `deny` (no `audit`)
+  # blocks AND silences them so the audit log stays clean. (hardware 2026-06-28)
+  deny /usr/share/terminfo/** r,
+  deny /etc/inputrc r,
 
   # Hard denies (belt-and-suspenders; systemd already blocks most).
   deny /etc/shadow rwklx,

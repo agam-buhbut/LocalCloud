@@ -94,6 +94,17 @@ path for an immediate cut-off.
 
 ## Install order (on the box, as root, from the physical console)
 
+> **⚠️ Provision from the physical console, NOT over SSH/LAN.** Two steps make
+> the box reachable **only over WireGuard**: applying `nftables/localcloud.nft`
+> (default-deny; step 6) and starting `localcloud.service` — whose
+> `Wants=nftables.service` *also* loads `/etc/nftables.conf` if you persisted the
+> ruleset there. On a box reached over the LAN, either one **severs your own
+> session** and locks you out until you recover at the console
+> (`nft flush ruleset`). This was hit during the 2026-06-28 hardware acceptance;
+> see `docs/pentest-2026-06-28.md` D6. If you must stage over SSH, add a
+> temporary `tcp dport <your-ssh-port> accept` rule before applying the firewall,
+> and remove it from the console once WireGuard is up.
+
 1. **OS hardening:** `deploy/os/harden-debian.sh` (minimal packages, no
    sleep/suspend, strip bluetooth/audio/camera/mic, sysctl). Review first.
 2. **Disks:** provision LUKS2 + encrypted LVM per `deploy/os/DISKS.md`
