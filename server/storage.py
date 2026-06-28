@@ -691,6 +691,27 @@ def _verify_staged_chunks(staged_chunks: list, req: _FinalizeRequest) -> bool:
     return True
 
 
+def _staged_chunk_files_present(
+    staging_dir: str, upload_id: str, total_chunks: int
+) -> bool:
+    """Confirm every expected ``{idx}.bin`` actually exists on disk.
+
+    ``_verify_staged_chunks`` inspects only DB rows + hashes, and a chunk's
+    ``staging_chunks`` row is committed BEFORE its ``{idx}.bin`` is durably
+    promoted (the promote runs after the quota txn commits). A promote that
+    fails therefore leaves a committed row with no file on disk. Because
+    finalize promotes the whole staging dir into the blob dir with a single
+    ``os.rename``, that gap would publish a blob missing a chunk. This guard
+    stats each expected file (O(total_chunks)) so the caller can fail finalize
+    before the rename. Offloaded via ``asyncio.to_thread`` like the other FS
+    ops.
+    """
+    for idx in range(total_chunks):
+        if not os.path.isfile(_safe_path(staging_dir, upload_id, f"{idx}.bin")):
+            return False
+    return True
+
+
 def _commit_finalized_blob(
     state: AppState,
     *,
@@ -883,6 +904,17 @@ async def upload_finalize(upload_id: str):
     if not _verify_staged_chunks(staged_chunks, req):
         await asyncio.to_thread(_cleanup_staging, upload_id)
         return jsonify({"error": "Invalid request"}), 400
+
+    # The DB-only check above can pass while a chunk's {idx}.bin is absent: the
+    # staging_chunks row commits before the promote, so a failed promote leaves
+    # a committed row with no file. The finalize dir-rename would then publish a
+    # blob missing a chunk. Confirm every expected file is on disk first; if any
+    # is missing, discard the staging dir and reject so the client re-uploads.
+    if not await asyncio.to_thread(
+        _staged_chunk_files_present, state.staging_dir, upload_id, req.total_chunks
+    ):
+        await asyncio.to_thread(_cleanup_staging, upload_id)
+        return jsonify({"error": "Invalid request"}), 409
 
     total_bytes = sum(c["chunk_size"] for c in staged_chunks)
     total_bytes += len(req.encrypted_metadata) + len(req.file_header)
@@ -1606,13 +1638,30 @@ def _write_temp_chunk(directory: str, data: bytes) -> str:
     never overwrites an already-accepted chunk at the same index and never
     costs a durable write (PERF-2: fsync is paid only on a successful
     promote). mkstemp creates the file 0o600.
+
+    On ANY failure of ``os.write`` (or ``os.close``) the temp file is
+    unlinked before the exception propagates — mirrors ``_write_file_bytes``.
+    Otherwise a leaked ``.chunk-*.tmp`` would survive in the staging dir and
+    the finalize dir-rename (whole-dir ``os.rename`` staging->blob) would
+    publish it into the blob dir.
     """
-    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".chunk-", suffix=".tmp")
+    fd: int | None = None
+    tmp_path: str | None = None
     try:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".chunk-", suffix=".tmp")
         os.write(fd, data)
-    finally:
         os.close(fd)
-    return tmp_path
+        fd = None
+        result = tmp_path
+        tmp_path = None  # success: caller owns the temp; don't unlink it below
+        return result
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
 
 def _promote_temp_chunk(tmp_path: str, final_path: str) -> None:

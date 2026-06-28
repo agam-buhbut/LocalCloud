@@ -730,3 +730,76 @@ async def test_init_reclaims_expired_staging_of_same_user(
 
     assert db.get_staging_upload(stale_id) is None, "expired row must be reclaimed"
     assert not stale_dir.exists(), "expired staging dir must be removed"
+
+
+# ──────────────── staging integrity (temp-write leak / missing file) ─────────
+
+
+async def test_chunk_temp_write_failure_returns_500_and_leaves_no_temp(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_data_dir: Path,
+) -> None:
+    """FIX 1: an os.write failure inside _write_temp_chunk returns 500 and
+    leaves no .chunk-*.tmp behind in the staging dir.
+
+    Before the unlink-on-failure fix the mkstemp'd temp survived (the finally
+    only closed the fd; the path was never returned for cleanup), so a
+    .chunk-*.tmp leaked into staging — and the finalize whole-dir rename would
+    publish it into the blob dir.
+    """
+    owner = await make_keyed_client()
+    init = await owner.authed.post(
+        "/api/files/upload/init",
+        json={"filename": "f.bin", "expected_chunks": 1},
+    )
+    assert init.status_code == 201
+    upload_id = (await init.get_json())["upload_id"]
+
+    # Unique payload so the injected failure fires ONLY for this chunk's temp
+    # write; every unrelated os.write delegates to the real implementation.
+    payload = b"Z" * 2048
+    real_write = storage.os.write
+
+    def boom_write(fd: int, data: bytes) -> int:
+        if data == payload:
+            raise OSError("injected write failure")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(storage.os, "write", boom_write)
+
+    resp = await _post_chunk(owner.authed, upload_id, 0, payload)
+    assert resp.status_code == 500
+
+    staging_upload_dir = Path(tmp_data_dir) / "staging" / upload_id
+    leftover = [p.name for p in staging_upload_dir.iterdir()]
+    assert leftover == [], f"os.write failure leaked temp files: {leftover}"
+
+
+async def test_finalize_rejected_when_staged_chunk_file_missing(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    http_upload: Callable[..., Awaitable[tuple[EncryptedUpload, str]]],
+    tmp_data_dir: Path,
+) -> None:
+    """FIX 2: finalize must reject (not publish) when a committed staging_chunks
+    row has no {idx}.bin on disk.
+
+    Simulates the promote-after-commit gap: the DB row (and its hash) survive
+    so _verify_staged_chunks passes, but the file is gone. Before the on-disk
+    presence guard finalize renamed the whole staging dir into the blob dir and
+    returned 201, publishing a blob missing a chunk.
+    """
+    owner = await make_keyed_client()
+    enc, upload_id = await http_upload(owner.authed, owner.keystore, _MULTI_CHUNK_DATA)
+    assert enc.total_chunks >= 2
+
+    # Delete one staged chunk file on disk, leaving its DB row intact.
+    missing = Path(tmp_data_dir) / "staging" / upload_id / "0.bin"
+    assert missing.exists()
+    missing.unlink()
+
+    fin = await _finalize(owner.authed, upload_id, enc)
+    assert fin.status_code in (409, 500)  # rejected — never a 201 publish
+    # Nothing was published and no quota was charged.
+    assert enc.file_id_hex not in await _listed_ids(owner.authed)
+    assert await _used_bytes(owner.authed) == 0
