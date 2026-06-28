@@ -71,7 +71,10 @@ def encrypt_chunk(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> byt
 
     try:
         return crypto_aead_xchacha20poly1305_ietf_encrypt(plaintext, aad, nonce, key)
-    except Exception as e:
+    except (nacl.exceptions.CryptoError, TypeError, ValueError) as e:
+        # Mirror decrypt_chunk's narrow catch: PyNaCl raises CryptoError on
+        # an AEAD failure and TypeError/ValueError on bad argument types or
+        # lengths — anything else is a genuine bug and must propagate.
         raise CryptoError("Encryption failed") from e
 
 

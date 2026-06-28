@@ -101,6 +101,48 @@ def test_file_header_validate_rejects_unsupported_version(bad_version: int):
         header.validate()
 
 
+def test_file_header_deserialize_maps_validation_error():
+    """A well-typed header that fails validate() surfaces as
+    MalformedRequestError, not the raw ProtocolError (CRYPTO-2).
+
+    All fields are present and correctly typed (so the per-field isinstance
+    gates pass), but the magic is wrong, so validate() raises ProtocolError —
+    which deserialize must catch and re-raise as MalformedRequestError.
+    """
+    payload = cbor2.dumps(
+        {
+            "magic": b"NOPE",  # wrong magic -> validate() raises ProtocolError
+            "version": PROTOCOL_VERSION,
+            "file_id": b"\x00" * FILE_ID_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "total_chunks": 1,
+            "merkle_root": b"\x00" * 32,
+            "signature": b"",
+        },
+        canonical=True,
+    )
+    with pytest.raises(MalformedRequestError):
+        FileHeader.deserialize(payload)
+
+
+def test_file_header_deserialize_does_not_mask_unexpected_errors(monkeypatch):
+    """deserialize narrows its validate() catch to ProtocolError (CRYPTO-2).
+
+    A genuine non-ProtocolError bug inside validate() must propagate, not be
+    silently relabelled MalformedRequestError. With the previous broad
+    ``except Exception`` this RuntimeError was swallowed; the narrowed catch
+    lets it through.
+    """
+
+    def _boom(self):
+        raise RuntimeError("unexpected internal error")
+
+    payload = _valid_header().serialize()
+    monkeypatch.setattr(FileHeader, "validate", _boom)
+    with pytest.raises(RuntimeError):
+        FileHeader.deserialize(payload)
+
+
 # ──────────────────────────── ChunkAAD ────────────────────────────
 
 
@@ -295,6 +337,31 @@ def test_safe_cbor_loads_truncated_input():
     valid = cbor2.dumps({"a": "hello"})
     with pytest.raises(MalformedRequestError):
         _safe_cbor_loads(valid[: len(valid) - 2])
+
+
+def test_safe_cbor_loads_maps_recursionerror(monkeypatch):
+    """A RecursionError from the CBOR decoder surfaces as
+    MalformedRequestError, never escapes uncaught (CRYPTO-1).
+
+    The pure-Python cbor2 decoder recurses in Python and raises
+    RecursionError on deeply nested (but under-cap) input; the installed C
+    decoder raises CBORDecodeError instead. To exercise the catch
+    deterministically regardless of which cbor2 build is present, the decode
+    step is driven directly to raise RecursionError. Before RecursionError
+    was added to the except tuple this escaped uncaught.
+    """
+    import shared.models as models
+
+    class _RecursingDecoder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def decode(self):
+            raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(models.cbor2, "CBORDecoder", _RecursingDecoder)
+    with pytest.raises(MalformedRequestError):
+        _safe_cbor_loads(b"\x00")
 
 
 def test_unpad_truncated_rejected():

@@ -47,7 +47,7 @@ from hypothesis import strategies as st
 from client.encryptor import EncryptResult, FileEncryptor
 from client.keystore import KeyStore
 from shared.crypto import decrypt_chunk, encrypt_chunk, generate_key, generate_nonce
-from shared.exceptions import DecryptionError, LocalCloudError
+from shared.exceptions import CryptoError, DecryptionError, LocalCloudError
 from shared.models import (
     METADATA_CHUNK_INDEX,
     NONCE_LEN,
@@ -128,6 +128,22 @@ def test_encrypt_decrypt_roundtrip(
 ) -> None:
     res, chunks = _encrypt(keystore, tmp_path, plaintext)
     assert _decrypt(keystore, tmp_path, res, chunks) == plaintext
+
+
+def test_encrypt_chunk_wrong_typed_arg_raises_cryptoerror() -> None:
+    """A non-bytes plaintext / aad makes the AEAD primitive raise TypeError,
+    which encrypt_chunk maps to CryptoError (CRYPTO-3).
+
+    Guards the narrowed catch: the specific argument-error type PyNaCl raises
+    must still be covered by ``(CryptoError, TypeError, ValueError)`` and
+    surface as the package CryptoError, not leak the raw TypeError.
+    """
+    key = generate_key()
+    nonce = generate_nonce()
+    with pytest.raises(CryptoError):
+        encrypt_chunk(key, nonce, 12345, b"aad")  # type: ignore[arg-type]
+    with pytest.raises(CryptoError):
+        encrypt_chunk(key, nonce, b"plaintext", 999)  # type: ignore[arg-type]
 
 
 # ──────────────────────────── Nonce uniqueness ────────────────────────────

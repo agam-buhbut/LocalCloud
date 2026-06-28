@@ -274,7 +274,17 @@ def _safe_cbor_loads(data: bytes) -> Any:
         value = decoder.decode()
     except MalformedRequestError:
         raise
-    except (cbor2.CBORDecodeError, KeyError, TypeError, ValueError) as e:
+    except (
+        cbor2.CBORDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        # The pure-Python cbor2 decoder recurses in Python and can raise
+        # RecursionError on attacker-crafted deep nesting that is still
+        # under the size cap (the C decoder raises CBORDecodeError instead);
+        # map it to MalformedRequestError so it never escapes uncaught.
+        RecursionError,
+    ) as e:
         raise MalformedRequestError("Malformed CBOR payload") from e
 
     _walk_safe(value)
@@ -340,7 +350,7 @@ class FileHeader:
                 contains unexpected CBOR tags, or fails type/structural
                 validation.
         """
-        from shared.exceptions import MalformedRequestError
+        from shared.exceptions import MalformedRequestError, ProtocolError
 
         if len(data) > MAX_HEADER_BYTES:
             raise MalformedRequestError("FileHeader payload exceeds size cap")
@@ -386,7 +396,10 @@ class FileHeader:
         )
         try:
             header.validate()
-        except Exception as e:
+        except ProtocolError as e:
+            # validate() only ever raises ProtocolError; narrowing the catch
+            # keeps a genuine non-ProtocolError bug from being silently
+            # relabelled as a malformed-input error.
             raise MalformedRequestError("FileHeader failed validation") from e
         return header
 

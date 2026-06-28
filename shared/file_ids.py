@@ -52,6 +52,18 @@ def canonicalize_file_id(value: str) -> str:
         ValueError: if ``value`` is not a valid identifier. Callers that
             need a different exception type (e.g. the client's CryptoError)
             wrap this and re-raise.
+
+    Note:
+        This deliberately raises a neutral ``ValueError`` rather than the
+        ``AuthError`` that the sibling ``usernames.canonicalize_username``
+        raises (EXC-1). The divergence is intentional: a file_id is validated
+        on both the storage path (``server.storage._validate_id``) and the
+        client (``cli._validate_file_id_local``), each of which catches
+        ``ValueError`` and re-raises its own domain exception, whereas a
+        username is canonicalized exclusively on the auth path where
+        ``AuthError`` is the correct boundary type. Aligning the two would
+        change the exception that out-of-module callers already catch, so the
+        type is documented here instead of changed.
     """
     if _SAFE_ID_RE.match(value):
         return value.replace("-", "")
