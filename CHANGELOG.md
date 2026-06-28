@@ -46,6 +46,30 @@ Keep a Changelog; this project is pre-1.0 and not yet released.
   Argon2 cap are per-process).
 - Session-secret rotation invalidates all outstanding tokens (tested).
 
+### Fixed
+- Review-remediation pass (branch `remediation/fix-review-findings`). Client UX
+  and safety: confirm-before-destructive `rm`/`unshare` (with `--force`), clean
+  error messages for a wrong key password and for malformed server responses,
+  the session token validated before the key-password prompt, client-side
+  `--limit`/`--offset`/filename bounds, and a plain-HTTP-to-non-loopback
+  warning. Deploy templates: the AppArmor profile named so the acceptance check
+  can match it, the `/srv/cloud` data-dir default, a strict single-`/32` peer
+  check, IPv6 WireGuard handshake rate-limiting, backup WAL-staleness and
+  consistency-window fixes, and `Wants=nftables` ordering.
+
+### Documentation
+- Corrected README PART I drift: SQLite schema version (now v6), references to
+  removed symbols (`client/sharing.py`, `merkle_proof()`/`verify_merkle_proof()`),
+  and the dangling `unshare` cross-reference.
+- Documented previously code-only client mechanics: TOFU owner-pubkey pinning
+  (`<key-file>.owner_pins.json`, the fail-closed "owner identity changed"
+  refusal, and the `--sender-pubkey` override), the `.session` token (location,
+  WireGuard peer-binding, expiry), and the keystore auto-lock timeout.
+- Closed the resolved Python-lockfile checklist item (`uv.lock` committed and
+  CI-gated via `uv lock --check`); added a benchmarks reproducibility note, an
+  internal-review-label glossary (`#Fxx` / `Round-N` / `item-2x`), and recorded
+  the MemoryDenyWriteExecute-vs-argon2 clearance (pentest V15).
+
 ### Removed
 - Dead code: `client/sharing.py`, unused DB accessors and exceptions, and the
   unused Merkle range-proof functions (range proofs are out of scope).

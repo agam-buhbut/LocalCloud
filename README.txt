@@ -39,7 +39,8 @@ module. It does NOT provision the operating system, WireGuard, the firewall,
 AppArmor, systemd units, disk encryption, or the backup system — those are
 deployment concerns described in PART II and are not yet automated here.
 
-Implemented and tested (334 Python tests + 27 Rust tests, all passing):
+Implemented and tested (300+ Python tests + 27 Rust tests, all passing; see CI
+for the authoritative count):
 
   * Per-file client-side encryption: independent random file_key + meta_key,
     per-chunk random 192-bit nonces, fixed 4 MiB chunks, AEAD chunk binding,
@@ -56,7 +57,7 @@ Implemented and tested (334 Python tests + 27 Rust tests, all passing):
     side Argon2id login, HMAC session tokens bound to the WireGuard peer,
     layered rate limiting, and timing-equalized endpoints to suppress
     username-enumeration oracles.
-  * SQLite metadata store (WAL, schema v5 with migrations).
+  * SQLite metadata store (WAL, schema v6 with migrations).
   * Operator admin CLI (physical-console-only user/account management).
   * Client CLI (init / login / upload / download / ls / rm / quota /
     share / unshare).
@@ -118,9 +119,10 @@ Prerequisites: Python >= 3.11 and a Rust toolchain (stable).
   pip install maturin
   cd rust/keycore && maturin develop --release && cd ../..
 
-The `keycore` module is required by the client (encryptor, keystore, sharing).
-The server does not import keycore. Tests that need keycore skip automatically
-if it is not installed.
+The `keycore` module is required by the client (the key store, the per-file
+encrypt/decrypt engine, and the key wrapping used for sharing). The server does
+not import keycore. Tests that need keycore skip automatically if it is not
+installed.
 
 --------------------------------------------------------------------------------
 4. Running the server
@@ -187,13 +189,16 @@ init` output and gives it to the operator out-of-band.
   localcloud ls
   localcloud quota
 
-  # Download + verify + decrypt
+  # Download + verify + decrypt. The owner's Ed25519 signing key is TOFU-pinned
+  # on the first successful download (see "Trust" below); pass --sender-pubkey
+  # <ed25519-hex> to authenticate first use, or to re-pin after a legitimate
+  # owner key rotation.
   localcloud download <file_id> ./report.pdf
 
   # Share with a recipient (needs their X25519 public key, obtained out-of-band)
   localcloud share <file_id> bob --recipient-pubkey <bob-x25519-hex>
 
-  # Revoke a share (server-side only; see note in section 9)
+  # Revoke a share (server-side revocation only — see "Revocation" below)
   localcloud unshare <file_id> bob
 
   # Delete
@@ -202,6 +207,44 @@ init` output and gives it to the operator out-of-band.
 Default key file: ~/.localcloud/keys.enc (override with --key-file or
 LOCALCLOUD_KEY_FILE). Default server: http://10.0.0.1:8443 (override with
 --server or LOCALCLOUD_SERVER).
+
+Client state files (all written 0600, alongside the key file):
+  * <key-file>                 the Argon2id-encrypted identity key store
+                               (default ~/.localcloud/keys.enc).
+  * <key-file dir>/.session    the session token written by `login` (default
+                               ~/.localcloud/.session). It is bound server-side
+                               to your WireGuard source IP — it only works from
+                               the same peer — and expires after the server's
+                               session lifetime (LOCALCLOUD_SESSION_LIFETIME,
+                               default 1 hour). After expiry, run `login` again.
+  * <key-file>.owner_pins.json the TOFU pin store: a JSON map of file_id -> the
+                               owner's Ed25519 signing key. See "Trust" below.
+
+Trust (TOFU owner-key pinning):
+  The Ed25519 key that signs a file's Merkle root is the linchpin against a
+  hostile server. On the first SUCCESSFUL download of a file, that key is
+  recorded in owner_pins.json. On every later download the server-supplied owner
+  key is compared (constant time) against the pin; a mismatch FAILS CLOSED with
+  "Owner identity key for <file_id> changed since first download — refusing (the
+  server may be hostile)" and nothing is decrypted. First contact is trust-on-
+  first-use; the pin only guarantees cross-download consistency thereafter. Pass
+  `download --sender-pubkey <ed25519-hex>` to supply an out-of-band key for
+  first-use authentication, or to deliberately replace a pin after a legitimate
+  owner key rotation (it warns that it overwrites the stored pin). A corrupt or
+  oversized pin file also fails closed; delete it deliberately to re-pin. (See
+  docs/runbooks/key-rotation.md.)
+
+Key locking (auto-lock):
+  After you unlock the key store, it auto-locks — private keys are zeroized in
+  memory — after 5 minutes of inactivity. A command that tries to use a locked
+  store fails with "Key store is locked"; simply re-run the command, which re-
+  prompts for the key password and unlocks a fresh copy.
+
+Revocation:
+  `unshare` is SERVER-SIDE revocation only. It removes the recipient's wrapped-
+  key row on the server, but anyone who already downloaded the wrapped keys
+  keeps that copy and can still decrypt that file version offline. For true
+  revocation, re-upload the file (which generates a fresh random file_key).
 
 --------------------------------------------------------------------------------
 7. Configuration (server environment variables)
@@ -385,8 +428,10 @@ Deployment / infrastructure — present in deploy/ but UNVALIDATED on hardware:
     deploy/. It is statically validated (shell/systemd/nftables/AppArmor parse
     clean) but has NOT been run on real hardware. First-deploy acceptance
     remains: external reachability (only WG port open), AppArmor enforce mode,
-    the MemoryDenyWriteExecute-vs-argon2 risk, the kill-switch, and the
-    backup→restore drill. See deploy/README.md.
+    the kill-switch, and the backup→restore drill. (The
+    MemoryDenyWriteExecute-vs-argon2 concern was cleared on real hardware in the
+    2026-06-22 pentest, item V15 — keep the directive enabled.) See
+    deploy/README.md.
 
 Application-level limitations (consciously accepted unless noted):
   * Public visibility: the access policy authorizes any authenticated user to
@@ -399,9 +444,9 @@ Application-level limitations (consciously accepted unless noted):
     signed file version; the client does not detect cross-version replay
     (per-version integrity IS enforced before decrypt). MetadataBlob.version_
     number is a reserved placeholder, never compared. See docs/threat-model.md.
-  * Merkle range-proof downloads are not used: the client downloads all chunks
-    and recomputes the root. merkle_proof()/verify_merkle_proof() exist but are
-    unused by the download path.
+  * Merkle range-proof downloads are not implemented: the client downloads all
+    chunks and recomputes the root from scratch. (The unused range-proof helper
+    functions were removed — see CHANGELOG.)
   * MetadataBlob version_number / blob_ids are placeholders (no version history).
   * Storage/quota amplification: every chunk is zero-padded to the full chunk
     size (4 MiB) before encryption to hide the true file size, and quota is
@@ -439,6 +484,10 @@ Notes:
     for drift via `uv lock --check`).
   * Tests are deterministic and use tmp_path for filesystem state. Tests that
     require the native keycore module skip if it is not installed.
+  * Inline comments tagged `#Fxx`, `Round-N`, or `item-2x` (e.g. `#F8`,
+    `Round-3 H8`, `item 2A`) refer to internal security-review findings,
+    remediation rounds, and roadmap work items. They are development bookkeeping
+    with no public issue tracker — there is nothing external to look up.
 
 
 ================================================================================

@@ -134,3 +134,18 @@ but cannot be justified or validated here without a multi-user/large-corpus
 deployment plus `py-spy`/`strace`; 4G is deployment-time. 4B-b (drop per-chunk
 fsync) was declined to keep file-byte durability. The deferred items remain
 open for a future soak test on the real box.
+
+## Reproduce
+
+These figures are **indicative single-host measurements, not a committed
+benchmark suite** — the ad-hoc timing / `EXPLAIN QUERY PLAN` harness used to
+produce them is **not in the repository**, so exact numbers will vary by
+machine, Python/SQLite build, and seeded corpus. To reproduce the method
+described under "Environment & method": build the real schema with
+`server.database.Database.connect()` against a throwaway DB; seed a synthetic
+corpus (owned / shared-to-me / public rows across ~50 users); capture query
+plans with `EXPLAIN QUERY PLAN` on the actual `Database` methods; and time each
+method best-of-5 with `time.perf_counter`. The tasks marked **BLOCKED-ON-LOAD**
+(4A read-connection contention, 4E prefetch, 4F login latency/RSS tuning) need a
+real soak test on the deployment box — plus `py-spy`/`strace`, absent here — and
+cannot be reproduced from this repo.

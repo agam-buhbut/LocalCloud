@@ -21,6 +21,14 @@ scheduled-uptime timers, and the backup→restore core. It is SAFE by default;
 destructive/cross-host checks are reported as SKIP with the exact manual command.
 Resolve every FAIL before storing real data.
 
+> **MemoryDenyWriteExecute:** the historical worry that
+> `MemoryDenyWriteExecute=yes` would break Argon2 was **hardware-validated as a
+> non-issue** in the 2026-06-22 pentest (item V15) — `hash_password` +
+> `verify_password` run correctly under the MDWX sandbox at production cost
+> (~250 ms/hash). Keep the directive enabled; the probe above is a belt-and-
+> braces first-boot confirmation, **not** a reason to disable MDWX pre-emptively.
+> Only remove it if that probe actually FAILs on your specific kernel/libc.
+
 ## Emergency takedown (kill-switch)
 
 Take the box offline instantly (README.txt PART II §2):

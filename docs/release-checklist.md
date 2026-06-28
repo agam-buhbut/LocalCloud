@@ -13,7 +13,8 @@
 - [ ] Key-rotation tests pass (`tests/test_key_rotation.py`).
 - [ ] Backup/restore core tests pass (`tests/test_backup_restore.py`).
 - [ ] `CHANGELOG.md` updated; version bumped.
-- [ ] Lockfiles committed (`rust/keycore/Cargo.lock`; Python — see below).
+- [ ] Lockfiles committed and current (`rust/keycore/Cargo.lock`, `uv.lock`;
+      CI gates `uv lock --check` for drift).
 
 **Deployment layer (verifiable only on the box — UNVALIDATED in CI):**
 - [ ] `nmap` from an external host shows **only** the WG UDP port.
@@ -42,20 +43,12 @@
 3. Run the full DoD above. Tag only when every application-layer box is checked
    and the deployment boxes are verified on the target box.
 
-## Open item — Python lockfile (DEPENDENCY DECISION REQUIRED)
+## Python lockfile — RESOLVED
 
-`rust/keycore/Cargo.lock` is committed; there is **no committed Python
-lockfile** yet. A reproducible Python install needs a hash-pinned lockfile,
-which requires a resolver tool (`pip-tools`/`pip-compile` or `uv`). Adding one
-is a **new dev dependency** and must be approved first (per the dependencies
-policy), so it is intentionally NOT added here.
-
-Once approved, the intended step is:
-```sh
-pip install pip-tools           # add to [project.optional-dependencies].dev
-pip-compile --generate-hashes -o requirements.lock pyproject.toml
-git add requirements.lock
-# CI: `pip install --require-hashes -r requirements.lock` before `pip install -e .`
-```
-Until then, reproducibility rests on the audited, upper-bounded ranges in
-`pyproject.toml` + `pip-audit` in CI.
+Both lockfiles are committed: `rust/keycore/Cargo.lock` and `uv.lock`. The
+Python dependency-lock decision was made in favour of `uv`: `uv.lock` is the
+hash-pinned, reproducible source of truth, regenerated with `uv lock` after any
+`pyproject.toml` change. CI fails the build if it has drifted
+(`uv lock --check`, see `.github/workflows/ci.yml`). Recreate the environment
+with `uv sync --extra dev`. `pip-audit` over the locked set remains the
+supply-chain gate.

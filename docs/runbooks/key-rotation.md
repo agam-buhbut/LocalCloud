@@ -41,6 +41,17 @@ be unwrapped by the new key and must be re-established** by each file's owner
 re-wrapping to the new key. There is no server-side re-wrap (the server never
 holds plaintext keys).
 
+**Effect on recipients' TOFU pins (the rotating user's Ed25519 *signing*
+key):** anyone who has already downloaded a file owned by the rotating user has
+that user's **old** Ed25519 key pinned in their `<key-file>.owner_pins.json`
+(trust-on-first-use; see README §6 "Trust"). Once the owner rotates, those
+downloaders' next download of an affected file refuses **fail-closed**
+(`Owner identity key ... changed since first download — refusing`). Each
+downloader re-establishes trust **out-of-band** by re-running `localcloud
+download --sender-pubkey <new-ed25519-hex>` (which overwrites the stale pin), or
+by deleting that file's entry from their pin store to re-TOFU. There is no
+automatic pin update — that is the point of the pin.
+
 **Procedure:**
 1. The rotating user generates a new identity (`localcloud init` to a new key
    file) and re-enrolls the new X25519 (self-signed by the new Ed25519) via the
