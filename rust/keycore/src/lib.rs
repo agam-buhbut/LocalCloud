@@ -129,6 +129,14 @@ impl KeyPair {
     /// ephemeral X25519 public key is read from the bundle itself.
     ///
     /// Returns (file_key: bytes, meta_key: bytes).
+    ///
+    /// FFI boundary note: the recovered file_key/meta_key necessarily
+    /// cross into Python `bytes`, which are NOT zeroizable — Python owns
+    /// their lifetime and CPython will not wipe the buffer on free. This
+    /// is an accepted architectural boundary: these per-file content keys
+    /// must be usable by the Python layer to decrypt data. Long-term
+    /// identity private keys never cross this boundary; they stay in
+    /// Rust mlock'd, zeroize-on-drop memory.
     fn unwrap_file_keys<'py>(
         &self,
         py: Python<'py>,
@@ -148,6 +156,10 @@ impl KeyPair {
         )
         .map_err(|_| PyValueError::new_err("Key unwrapping failed"))?;
 
+        // Architectural boundary: the recovered file/meta keys necessarily
+        // cross into Python `bytes` here (non-zeroizable, Python-owned
+        // lifetime). Accepted tradeoff — see this method's doc. Only
+        // per-file content keys cross; identity private keys never do.
         Ok((
             PyBytes::new(py, file_key.as_ref()),
             PyBytes::new(py, meta_key.as_ref()),

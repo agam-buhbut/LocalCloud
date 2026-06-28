@@ -65,6 +65,9 @@ type UnwrappedKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
 
 // ──────────────────────────── Key Wrapping ────────────────────────────
 
+/// Required file_id length: raw 16-byte UUID4 bytes, enforced at the wrap/unwrap boundary so a malformed file_id never reaches HKDF/AAD construction. (Round-2 H4)
+pub const REQUIRED_FILE_ID_LEN: usize = 16;
+
 /// Wrap file_key and meta_key for a specific recipient using
 /// ephemeral-static ECDH.
 ///
@@ -76,14 +79,6 @@ type UnwrappedKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
 /// 5. Drop ephemeral_priv — it is never persisted.
 ///
 /// Returns: ephemeral_pubkey (32) || nonce (24) || ciphertext+tag (80).
-/// Required length of the file_id (16-byte UUID4 raw bytes). The
-/// length is enforced at the wrap/unwrap boundary so an empty or
-/// malformed file_id can never reach HKDF/AAD construction — earlier
-/// the function accepted any length, which would have allowed two
-/// distinct callers passing different but suffix-related file_ids to
-/// produce ambiguous AAD encodings. (Round-2 H4)
-pub const REQUIRED_FILE_ID_LEN: usize = 16;
-
 pub fn wrap_file_keys(
     file_key: &[u8; 32],
     meta_key: &[u8; 32],

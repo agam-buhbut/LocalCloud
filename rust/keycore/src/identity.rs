@@ -185,9 +185,12 @@ impl IdentityKeyPair {
         // the upcoming move of the outer IdentityKeyPair struct.
         //
         // mlock failure is intentionally non-fatal here (CRY-L3): we warn
-        // but still return the keypair. Production hardening (Phase 5:
-        // systemd RLIMIT_MEMLOCK) must guarantee mlock succeeds so key
-        // material is never swapped to disk. No behavior change here.
+        // but still return the keypair. In production this soft-fail is
+        // backstopped by the deployment's systemd `LimitMEMLOCK`
+        // (RLIMIT_MEMLOCK) being raised high enough that mlock always
+        // succeeds, so the key bytes are never swappable to disk. The
+        // warn-and-continue path exists only so the unprivileged / dev
+        // case (low RLIMIT_MEMLOCK) still works. No behavior change here.
         let x25519_locked = secure_memory::mlock_slice(&x25519_private[..]);
         let ed25519_locked = secure_memory::mlock_slice(&ed25519_private[..]);
         let lock_ok = x25519_locked && ed25519_locked;
@@ -288,6 +291,15 @@ impl IdentityKeyPair {
         secure_memory::disable_core_dumps()
             .map_err(|e| format!("Failed to disable core dumps: {}", e))?;
 
+        // SAFETY (caller contract): the structural checks below (size cap,
+        // CBOR parse, version, Argon2-param range, salt length) run and can
+        // return BEFORE the expensive Argon2id KDF, so a structural error
+        // is distinguishable by timing from a wrong-password error. This is
+        // acceptable ONLY because `decrypt_from_store` is a local CLI unlock
+        // against an on-disk file and is never exposed across a network or
+        // remote trust boundary (see the `# Security` section above). Do not
+        // wire this function to a remote oracle.
+
         // Cap the input size BEFORE handing it to the CBOR decoder.
         // A maliciously planted multi-GiB blob would otherwise be
         // happily parsed and consume memory until OOM. (Finding #9)
@@ -377,7 +389,11 @@ impl IdentityKeyPair {
             return Err("Ed25519 public key does not match private key".to_string());
         }
 
-        // mlock the heap-stable allocations.
+        // mlock the heap-stable allocations. As in `generate`, an mlock
+        // failure here is non-fatal and is backstopped in production by
+        // the deployment's systemd `LimitMEMLOCK` (RLIMIT_MEMLOCK), which
+        // keeps key bytes off swap; the warn path covers only the
+        // low-RLIMIT_MEMLOCK dev / unprivileged case. No behavior change.
         let x25519_locked = secure_memory::mlock_slice(&x25519_priv[..]);
         let ed25519_locked = secure_memory::mlock_slice(&ed25519_priv[..]);
         let lock_ok = x25519_locked && ed25519_locked;
