@@ -338,11 +338,16 @@ async def upload_init():
     if expected_chunks < 1 or expected_chunks > MAX_CHUNKS_PER_FILE:
         return jsonify({"error": "Invalid request"}), 400
 
-    # K3: Cap concurrent staging sessions per user to bound parallel
-    # disk-fill attacks. Counted against non-expired, non-finalizing rows.
-    open_count = await asyncio.to_thread(state.db.count_open_uploads, identity.user_id)
-    if open_count >= MAX_OPEN_UPLOADS_PER_USER:
-        return jsonify({"error": "Too many open uploads"}), 429
+    # STG-5: reclaim this user's just-expired, non-finalizing staging rows
+    # (and their dirs) synchronously before evaluating caps, so expired-but-
+    # uncollected bytes/sessions don't sit cap-invisible until the periodic
+    # GC. The window where they are unaccounted is now bounded by a single
+    # request rather than the GC interval.
+    reclaimed = await asyncio.to_thread(
+        state.db.reclaim_expired_staging_for_user, identity.user_id
+    )
+    if reclaimed:
+        await asyncio.to_thread(_remove_staging_dirs, state.staging_dir, reclaimed)
 
     # Generate upload ID (server-generated, always safe). It MUST be in the
     # same canonical 32-char no-hyphen form _validate_id returns, so the
@@ -353,20 +358,28 @@ async def upload_init():
     upload_id = uuid.uuid4().hex
     staging_path = _safe_path(state.staging_dir, upload_id)
 
-    # Insert the DB row BEFORE creating the directory so the orphan-dir
-    # scanner's "canonical-id dir with no row => orphan" invariant always
-    # holds for a live upload — closing the makedirs->insert race where the
-    # background scanner could rmtree a live staging dir. If makedirs then
-    # fails we drop the row; a crash in between leaves a harmless
-    # row-without-dir that the expired-staging-row sweep reclaims at expiry.
-    await asyncio.to_thread(
-        state.db.create_staging_upload,
+    # K3 / STG-4: count open uploads + insert the row in ONE transaction so
+    # two concurrent inits at the cap cannot both pass a snapshot count and
+    # both insert past MAX_OPEN_UPLOADS_PER_USER.
+    #
+    # The insert happens BEFORE makedirs so the orphan-dir scanner's
+    # "canonical-id dir with no row => orphan" invariant always holds for a
+    # live upload — closing the makedirs->insert race where the background
+    # scanner could rmtree a live staging dir. If makedirs then fails we drop
+    # the row; a crash in between leaves a harmless row-without-dir that the
+    # expired-staging-row sweep reclaims at expiry.
+    inserted = await asyncio.to_thread(
+        state.db.try_create_staging_upload,
         upload_id=upload_id,
         owner_id=identity.user_id,
         filename=filename,
         expected_chunks=expected_chunks,
         expiry_seconds=state.staging_expiry,
+        max_open_uploads=MAX_OPEN_UPLOADS_PER_USER,
     )
+    if not inserted:
+        return jsonify({"error": "Too many open uploads"}), 429
+
     try:
         await asyncio.to_thread(os.makedirs, staging_path, mode=0o700, exist_ok=True)
     except Exception:
@@ -391,29 +404,40 @@ async def _persist_staged_chunk(
 ):
     """Write a validated chunk to staging, gated transactionally on quota.
 
-    Two phases, unchanged from the original handler:
+    Write-temp-then-promote (STG-1 / STG-3 / PERF-2):
 
-    * Phase 1 writes the bytes to disk OUTSIDE the DB lock (so concurrent
-      uploads don't serialize on disk I/O). ``_write_file_bytes`` is itself
-      atomic (tempfile + fsync + replace).
-    * Phase 2 does a transactional check-and-insert; if the per-user quota
-      (or the staging cap) is blown, the just-written chunk is removed.
-      Gating the quota check inside the same transaction as the insert is
-      what makes two parallel uploads from one user unable to both pass a
-      snapshot check and then both overshoot (Round-2 H2/H3).
+    * Phase 1 writes the bytes to a TEMP file in the upload's staging dir,
+      OUTSIDE the DB lock and WITHOUT fsync — so concurrent uploads don't
+      serialize on disk I/O and a chunk that is about to be rejected costs no
+      durable write.
+    * Phase 2 does a transactional check-and-insert. The quota/staging
+      comparison charges only the size DELTA for a re-uploaded index
+      (subtracting the existing row's chunk_size, STG-3) so an idempotent
+      re-upload is not double-counted. Gating the check inside the same
+      transaction as the insert is what stops two parallel uploads from one
+      user both passing a snapshot check and overshooting (Round-2 H2/H3).
+    * Phase 3 promotes the temp to its final ``{idx}.bin`` (fsync + atomic
+      replace) ONLY on success. A rejected chunk drops the temp and NEVER
+      touches an already-accepted chunk at this index — the previous code
+      ``os.replace``d into the final path BEFORE the quota txn and then
+      unconditionally unlinked it on rejection, destroying a re-uploaded
+      chunk while its ``staging_chunks`` row survived, so finalize later
+      promoted a blob missing a chunk.
 
-    Returns the final response tuple (200 with the chunk hash, or a 4xx/5xx
-    error).
+    Returns the final response tuple (200 with the chunk hash, or 413/500).
     """
     new_chunk_size = len(chunk_data)
     chunk_hash = blake2b_hash(chunk_data).hex()
-    chunk_path = _safe_path(state.staging_dir, upload_id, f"{chunk_index}.bin")
+    staging_upload_dir = _safe_path(state.staging_dir, upload_id)
+    final_path = _safe_path(state.staging_dir, upload_id, f"{chunk_index}.bin")
 
     try:
-        await asyncio.to_thread(_write_file_bytes, chunk_path, chunk_data)
+        tmp_path = await asyncio.to_thread(
+            _write_temp_chunk, staging_upload_dir, chunk_data
+        )
     except OSError as exc:
         logger.warning(
-            "chunk write failed for upload_id=%s idx=%d: %s",
+            "chunk temp write failed for upload_id=%s idx=%d: %s",
             upload_id,
             chunk_index,
             exc,
@@ -424,9 +448,13 @@ async def _persist_staged_chunk(
         with state.db.transaction():
             used, quota = state.db.get_user_usage(owner_id)
             staging = state.db.get_total_staging_bytes(owner_id)
-            if used + staging + new_chunk_size > quota:
+            # STG-3: `staging` already includes any prior row for this exact
+            # index, so charge only the size delta on a re-upload.
+            existing = state.db.get_staging_chunk_size(upload_id, chunk_index)
+            delta = new_chunk_size - (existing or 0)
+            if used + staging + delta > quota:
                 return False, "Quota exceeded"
-            if staging + new_chunk_size > MAX_STAGING_BYTES_PER_USER:
+            if staging + delta > MAX_STAGING_BYTES_PER_USER:
                 return False, "Staging quota exceeded"
             state.db.add_staging_chunk(
                 upload_id=upload_id,
@@ -436,14 +464,31 @@ async def _persist_staged_chunk(
             )
             return True, ""
 
-    ok, err_msg = await asyncio.to_thread(_check_and_insert)
-    if not ok:
-        # Roll back the disk write so the chunk doesn't accrue.
-        with contextlib.suppress(OSError):
-            await asyncio.to_thread(os.unlink, chunk_path)
-        return jsonify({"error": err_msg}), 413
-
-    return jsonify({"chunk_hash": chunk_hash}), 200
+    promoted = False
+    try:
+        ok, err_msg = await asyncio.to_thread(_check_and_insert)
+        if not ok:
+            return jsonify({"error": err_msg}), 413
+        try:
+            await asyncio.to_thread(_promote_temp_chunk, tmp_path, final_path)
+        except OSError as exc:
+            logger.warning(
+                "chunk promote failed for upload_id=%s idx=%d: %s",
+                upload_id,
+                chunk_index,
+                exc,
+            )
+            return jsonify({"error": "Upload failed"}), 500
+        promoted = True
+        return jsonify({"chunk_hash": chunk_hash}), 200
+    finally:
+        # On any non-success path (rejection, promote failure, or an
+        # unexpected error from the txn) drop the temp; on success
+        # os.replace already consumed it. Only the temp WE created here is
+        # ever removed — never the established {idx}.bin.
+        if not promoted:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(os.unlink, tmp_path)
 
 
 @storage_bp.route("/upload/<upload_id>/chunk/<int:chunk_index>", methods=["POST"])
@@ -752,9 +797,18 @@ async def _run_finalize_commit(
 ):
     """Run the commit in a worker thread and map outcomes to a response.
 
-    Returns the success ``{"file_id": ...}`` 201 tuple, or the mapped
-    error tuple (413 quota / 409 collision / 500 unexpected) — identical to
-    the original inline handling.
+    Returns the success ``{"file_id": ...}`` 201 tuple, or the mapped error
+    tuple (413 quota / 409 collision / 500 unexpected).
+
+    STG-2: a successful commit deletes the staging row, but every FAILURE
+    branch here leaves the row intact with ``finalizing = 1`` (set by the
+    earlier claim). Without clearing it, a retry would hit
+    ``mark_upload_finalizing`` -> False -> a misleading "Upload expired" 410,
+    and the bytes stay cap-invisible until the expiry+grace sweep. So each
+    failure branch clears the claim (``clear_finalizing``) so the client can
+    retry and the cleanup path sees an un-claimed row again. The returned
+    status still conveys the real cause (413 quota / 409 collision / 500
+    transient) — never a false expiry.
     """
     try:
         await asyncio.to_thread(
@@ -767,15 +821,18 @@ async def _run_finalize_commit(
             total_bytes=total_bytes,
         )
     except QuotaExceededError:
+        await asyncio.to_thread(state.db.clear_finalizing, upload_id)
         return jsonify({"error": "Quota exceeded"}), 413
     except StorageError as exc:
         # Known collision — surfaced as 409.
         logger.info("Finalize rejected: %s (upload_id=%s)", exc, upload_id)
+        await asyncio.to_thread(state.db.clear_finalizing, upload_id)
         return jsonify({"error": "Invalid request"}), 409
     except Exception:
         logger.exception(
             "Finalize failed for upload_id=%s file_id=%s", upload_id, req.file_id
         )
+        await asyncio.to_thread(state.db.clear_finalizing, upload_id)
         return jsonify({"error": "Upload failed"}), 500
     return jsonify({"file_id": req.file_id}), 201
 
@@ -1538,6 +1595,66 @@ def _write_file_bytes(path: str, data: bytes) -> None:
         if tmp_path is not None:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
+
+
+def _write_temp_chunk(directory: str, data: bytes) -> str:
+    """Write ``data`` to a fresh temp file in ``directory`` WITHOUT fsync.
+
+    Returns the temp path. The caller promotes it to its final ``{idx}.bin``
+    name with ``_promote_temp_chunk`` ONLY after the quota/staging
+    transaction accepts the chunk (STG-1), so a rejected over-quota chunk
+    never overwrites an already-accepted chunk at the same index and never
+    costs a durable write (PERF-2: fsync is paid only on a successful
+    promote). mkstemp creates the file 0o600.
+    """
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".chunk-", suffix=".tmp")
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    return tmp_path
+
+
+def _promote_temp_chunk(tmp_path: str, final_path: str) -> None:
+    """Durably promote an accepted temp chunk to its final path.
+
+    fsyncs the temp file's bytes (PERF-2: durability is paid only for an
+    accepted chunk), then atomically ``os.replace``s it into place — a
+    concurrent reader/finalize sees either the prior chunk or the fully
+    written new one, never a torn file. ``os.replace`` consumes the temp on
+    success; on failure it leaves both the temp and the established
+    ``final_path`` untouched (the caller removes the temp).
+    """
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, final_path)
+
+
+def _remove_staging_dirs(staging_dir: str, upload_ids: list[str]) -> None:
+    """Best-effort rmtree of synchronously-reclaimed staging dirs (STG-5).
+
+    The DB rows are already gone (``reclaim_expired_staging_for_user``
+    deleted them atomically), so a directory that fails to remove here is at
+    worst reclaimed later by the orphan scanner. FS errors are logged and
+    swallowed.
+    """
+    for upload_id in upload_ids:
+        try:
+            path = _safe_path(staging_dir, upload_id)
+        except ValueError:
+            continue
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning(
+                "STG-5 reclaim: failed to remove staging dir %s: %s",
+                upload_id,
+                exc,
+            )
 
 
 def _cleanup_staging(upload_id: str) -> None:

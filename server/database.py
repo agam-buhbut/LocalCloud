@@ -27,6 +27,13 @@ SCHEMA_VERSION = 6
 # legitimate finalize would still be running. (Round-2 H4)
 _FINALIZING_GRACE_SECONDS = 3600
 
+# SCHEMA_SQL creates TABLES ONLY — every CREATE INDEX lives in
+# SCHEMA_INDEXES_SQL and is applied AFTER migrations (see _init_schema).
+# Splitting them is what fixes MIG-1: on an old (<v6) database the table
+# already exists (CREATE TABLE IF NOT EXISTS is a no-op) but is missing
+# columns the migrations have not added yet; if the index that references
+# such a column (e.g. login_attempts.ip_address, staging_uploads.finalizing)
+# were created here, SQLite raises "no such column" before migrations run.
 SCHEMA_SQL = """
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -67,12 +74,6 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     ip_address TEXT NOT NULL DEFAULT '',
     attempt_time REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_login_attempts_user_time
-    ON login_attempts(username, attempt_time);
-CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
-    ON login_attempts(ip_address, attempt_time);
-CREATE INDEX IF NOT EXISTS idx_login_attempts_time
-    ON login_attempts(attempt_time);
 
 -- File metadata (server-side only — encrypted metadata is a blob)
 CREATE TABLE IF NOT EXISTS files (
@@ -87,11 +88,6 @@ CREATE TABLE IF NOT EXISTS files (
     created_at REAL NOT NULL,
     FOREIGN KEY (owner_id) REFERENCES users(user_id)
 );
-CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_id);
--- Index `visibility` so the public-file branch of list_user_files
--- doesn't scan the whole files table. (Round-3 perf #2)
-CREATE INDEX IF NOT EXISTS idx_files_visibility
-    ON files(visibility, created_at DESC);
 
 -- File sharing (who can access shared files)
 CREATE TABLE IF NOT EXISTS file_shares (
@@ -101,10 +97,6 @@ CREATE TABLE IF NOT EXISTS file_shares (
     created_at REAL NOT NULL,
     PRIMARY KEY (file_id, shared_with_id)
 );
--- Index lookups by recipient so list_user_files's shared-with branch
--- doesn't scan all shares to find this user's rows. (Round-3 perf #2)
-CREATE INDEX IF NOT EXISTS idx_file_shares_user
-    ON file_shares(shared_with_id);
 
 -- Staging uploads (in-progress uploads before finalization)
 CREATE TABLE IF NOT EXISTS staging_uploads (
@@ -118,10 +110,6 @@ CREATE TABLE IF NOT EXISTS staging_uploads (
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
--- Index staging owner_id for get_total_staging_bytes / count_open_uploads.
--- Without it those two hot-path queries do a full table scan plus join.
-CREATE INDEX IF NOT EXISTS idx_staging_uploads_owner
-    ON staging_uploads(owner_id, finalizing, expires_at);
 
 -- Individual chunks in staging
 CREATE TABLE IF NOT EXISTS staging_chunks (
@@ -134,52 +122,71 @@ CREATE TABLE IF NOT EXISTS staging_chunks (
 );
 """
 
-# Migration from schema v1 to v2: add ip_address column and indexes
-MIGRATION_V1_TO_V2 = """
-ALTER TABLE login_attempts ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';
+# All indexes, applied unconditionally AFTER tables + migrations on every
+# connect (every statement is IF NOT EXISTS, so it is idempotent for both a
+# fresh install and an upgraded DB once the referenced columns exist). This
+# is the single source of truth for indexes — migrations no longer create
+# any. (MIG-1)
+SCHEMA_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_login_attempts_user_time
+    ON login_attempts(username, attempt_time);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
     ON login_attempts(ip_address, attempt_time);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_time
     ON login_attempts(attempt_time);
-"""
-
-# Migration from schema v2 to v3: add session_version column for token revocation
-MIGRATION_V2_TO_V3 = """
-ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1;
-"""
-
-# Migration from schema v3 to v4:
-#   * `finalizing` flag on staging_uploads — set during the finalize
-#     transaction so the periodic cleanup task does not race finalize
-#     (H19).
-#   * `ed25519_pubkey` BLOB on users — owner identity key returned with
-#     file metadata for pinned signature verification (H17).
-MIGRATION_V3_TO_V4 = """
-ALTER TABLE staging_uploads
-    ADD COLUMN finalizing INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE users
-    ADD COLUMN ed25519_pubkey BLOB NOT NULL DEFAULT x'';
-"""
-
-# Migration from schema v4 to v5: add indexes for query plans the
-# audit identified as performance hot paths (Round-3 perf #2).
-MIGRATION_V4_TO_V5 = """
+-- Index `visibility` so the public-file branch of list_user_files
+-- doesn't scan the whole files table. (Round-3 perf #2)
+CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_id);
 CREATE INDEX IF NOT EXISTS idx_files_visibility
     ON files(visibility, created_at DESC);
+-- Index lookups by recipient so list_user_files's shared-with branch
+-- doesn't scan all shares to find this user's rows. (Round-3 perf #2)
 CREATE INDEX IF NOT EXISTS idx_file_shares_user
     ON file_shares(shared_with_id);
+-- Index staging owner_id for get_total_staging_bytes / count_open_uploads;
+-- without it those hot-path queries do a full table scan plus join.
 CREATE INDEX IF NOT EXISTS idx_staging_uploads_owner
     ON staging_uploads(owner_id, finalizing, expires_at);
 """
 
-# Migration from schema v5 to v6: add the user's long-term X25519
-# key-agreement public key plus its Ed25519 self-signature (2C / FEAT-1).
-# Existing v5 rows migrate with empty key + empty self-sig — i.e. "not
-# enrolled". Idempotent via the duplicate-column catch in the runner.
-MIGRATION_V5_TO_V6 = """
-ALTER TABLE users ADD COLUMN x25519_pubkey BLOB NOT NULL DEFAULT x'';
-ALTER TABLE users ADD COLUMN x25519_self_sig BLOB NOT NULL DEFAULT x'';
-"""
+# Migrations are lists of single ALTER statements applied one at a time by
+# _apply_idempotent_alters, each tolerating ONLY "duplicate column name".
+# Per-statement application (rather than one executescript of the whole
+# block) is what fixes MIG-2: if a crash already applied ALTER #1, on the
+# next connect #1 re-raises duplicate-column (swallowed) and #2 still runs.
+# Index creation is no longer done here — it is centralised in
+# SCHEMA_INDEXES_SQL and applied unconditionally after migrations (MIG-1).
+
+# v1 -> v2: add ip_address column to login_attempts.
+MIGRATION_V1_TO_V2: list[str] = [
+    "ALTER TABLE login_attempts ADD COLUMN ip_address TEXT NOT NULL DEFAULT ''",
+]
+
+# v2 -> v3: add session_version column for token revocation.
+MIGRATION_V2_TO_V3: list[str] = [
+    "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1",
+]
+
+# v3 -> v4:
+#   * `finalizing` flag on staging_uploads — set during the finalize
+#     transaction so the periodic cleanup task does not race finalize (H19).
+#   * `ed25519_pubkey` BLOB on users — owner identity key returned with file
+#     metadata for pinned signature verification (H17).
+MIGRATION_V3_TO_V4: list[str] = [
+    "ALTER TABLE staging_uploads ADD COLUMN finalizing INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN ed25519_pubkey BLOB NOT NULL DEFAULT x''",
+]
+
+# v4 -> v5 was index-only; those indexes now live in SCHEMA_INDEXES_SQL, so
+# the step is a pure version bump with no ALTERs (handled in _run_migrations).
+
+# v5 -> v6: add the user's long-term X25519 key-agreement public key plus its
+# Ed25519 self-signature (2C / FEAT-1). Existing v5 rows migrate with empty
+# key + empty self-sig — i.e. "not enrolled".
+MIGRATION_V5_TO_V6: list[str] = [
+    "ALTER TABLE users ADD COLUMN x25519_pubkey BLOB NOT NULL DEFAULT x''",
+    "ALTER TABLE users ADD COLUMN x25519_self_sig BLOB NOT NULL DEFAULT x''",
+]
 
 
 def _is_duplicate_column_error(exc: sqlite3.OperationalError) -> bool:
@@ -278,11 +285,57 @@ class Database:
         assert self._conn is not None, "Database not connected"
         return self._conn
 
+    def _apply_idempotent_alters(self, statements: list[str]) -> None:
+        """Apply migration ALTERs one statement at a time (MIG-2).
+
+        Each statement is run individually so a crash that already applied
+        an earlier ALTER does not prevent a later one from running on the
+        next connect: the already-applied one re-raises "duplicate column
+        name" (swallowed here), and the remaining statements still execute.
+        Every OTHER OperationalError (locked DB, syntax, etc.) propagates —
+        we never silently swallow a real failure.
+        """
+        assert self._conn is not None
+        for statement in statements:
+            try:
+                self._conn.execute(statement)
+            except sqlite3.OperationalError as exc:
+                if not _is_duplicate_column_error(exc):
+                    raise
+
+    def _run_migrations(self, current: int) -> None:
+        """Upgrade an existing DB from ``current`` to ``SCHEMA_VERSION``.
+
+        Runs only the steps newer than ``current``, in order. v4 -> v5 was
+        index-only (now handled by SCHEMA_INDEXES_SQL), so it is a bare
+        version bump with no ALTERs.
+        """
+        if current < 2:
+            self._apply_idempotent_alters(MIGRATION_V1_TO_V2)
+            current = 2
+        if current < 3:
+            self._apply_idempotent_alters(MIGRATION_V2_TO_V3)
+            current = 3
+        if current < 4:
+            self._apply_idempotent_alters(MIGRATION_V3_TO_V4)
+            current = 4
+        if current < 5:
+            current = 5
+        if current < 6:
+            self._apply_idempotent_alters(MIGRATION_V5_TO_V6)
+            current = 6
+
     def _init_schema(self) -> None:
-        """Create tables if they don't exist and check schema version."""
+        """Create tables, run migrations, then (re)create indexes.
+
+        Ordering is load-bearing (MIG-1): tables first, then any pending
+        column-adding migrations, and ONLY THEN the indexes — so a CREATE
+        INDEX can never reference a column an old (<v6) table has not yet
+        gained via ALTER.
+        """
         assert self._conn is not None
         self._conn.executescript(SCHEMA_SQL)
-        # Check/set schema version
+        # Check/set schema version.
         row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         if row is None:
             self._conn.execute(
@@ -290,45 +343,7 @@ class Database:
                 (SCHEMA_VERSION,),
             )
         elif row["version"] < SCHEMA_VERSION:
-            # Run migrations in order. Each ALTER TABLE migration is
-            # idempotent ONLY for the specific "duplicate column name"
-            # error — every other OperationalError is re-raised so we
-            # never silently swallow a locked DB or syntax error.
-            current = row["version"]
-            if current < 2:
-                try:
-                    self._conn.executescript(MIGRATION_V1_TO_V2)
-                except sqlite3.OperationalError as exc:
-                    if not _is_duplicate_column_error(exc):
-                        raise
-                current = 2
-            if current < 3:
-                try:
-                    self._conn.executescript(MIGRATION_V2_TO_V3)
-                except sqlite3.OperationalError as exc:
-                    if not _is_duplicate_column_error(exc):
-                        raise
-                current = 3
-            if current < 4:
-                try:
-                    self._conn.executescript(MIGRATION_V3_TO_V4)
-                except sqlite3.OperationalError as exc:
-                    if not _is_duplicate_column_error(exc):
-                        raise
-                current = 4
-            if current < 5:
-                # v5 only adds indexes (all `IF NOT EXISTS`), so the
-                # script is fully idempotent without a duplicate-column
-                # catch.
-                self._conn.executescript(MIGRATION_V4_TO_V5)
-                current = 5
-            if current < 6:
-                try:
-                    self._conn.executescript(MIGRATION_V5_TO_V6)
-                except sqlite3.OperationalError as exc:
-                    if not _is_duplicate_column_error(exc):
-                        raise
-                current = 6
+            self._run_migrations(row["version"])
             self._conn.execute(
                 "UPDATE schema_version SET version = ?",
                 (SCHEMA_VERSION,),
@@ -338,6 +353,10 @@ class Database:
                 f"Schema version mismatch: expected {SCHEMA_VERSION}, "
                 f"got {row['version']}"
             )
+        # Indexes are created unconditionally now that every referenced
+        # column exists (fresh install or post-migration). All IF NOT
+        # EXISTS, so this is a cheap idempotent no-op on subsequent connects.
+        self._conn.executescript(SCHEMA_INDEXES_SQL)
 
     # ──────────────────────────── User Operations ────────────────────────────
 
@@ -594,15 +613,38 @@ class Database:
             )
             return True
 
-    def count_recent_attempts(self, username: str, window_seconds: int) -> int:
-        """Count login attempts within the rate limit window."""
+    def count_recent_attempts(
+        self,
+        username: str,
+        window_seconds: int,
+        ip_address: str | None = None,
+    ) -> int:
+        """Count login attempts for a username within the rate-limit window.
+
+        Args:
+            username: Canonical username the attempts targeted.
+            window_seconds: Trailing window (seconds) to count within.
+            ip_address: When provided, additionally scope the count to this
+                peer (``AND ip_address = ?``) so the legacy per-username gate
+                matches the composite limiter's per-peer blast radius — a
+                flood from one peer can no longer lock the username out from
+                another peer (AUTH-1). When ``None`` (the default) the
+                behaviour is exactly the legacy username-only count.
+        """
         cutoff = time.time() - window_seconds
         with self._lock:
-            row = self.conn.execute(
-                "SELECT COUNT(*) as cnt FROM login_attempts "
-                "WHERE username = ? AND attempt_time > ?",
-                (username, cutoff),
-            ).fetchone()
+            if ip_address is None:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) as cnt FROM login_attempts "
+                    "WHERE username = ? AND attempt_time > ?",
+                    (username, cutoff),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) as cnt FROM login_attempts "
+                    "WHERE username = ? AND ip_address = ? AND attempt_time > ?",
+                    (username, ip_address, cutoff),
+                ).fetchone()
             return row["cnt"] if row else 0
 
     def count_recent_attempts_by_ip(self, ip_address: str, window_seconds: int) -> int:
@@ -862,6 +904,80 @@ class Database:
                 ),
             )
 
+    def try_create_staging_upload(
+        self,
+        upload_id: str,
+        owner_id: str,
+        filename: str,
+        expected_chunks: int | None,
+        expiry_seconds: int,
+        max_open_uploads: int,
+    ) -> bool:
+        """Atomically create a staging upload iff the user is under the cap.
+
+        Counts the user's open (non-expired, non-finalizing) uploads and
+        inserts the new row in ONE write transaction (BEGIN IMMEDIATE), so
+        two concurrent inits at the cap cannot both pass a snapshot count and
+        then both insert past ``max_open_uploads`` (STG-4). Mirrors the chunk
+        check-and-insert pattern.
+
+        Returns:
+            True if the row was created, False if the user is already at
+            ``max_open_uploads`` open uploads.
+        """
+        now = time.time()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM staging_uploads "
+                "WHERE owner_id = ? AND expires_at >= ? AND finalizing = 0",
+                (owner_id, now),
+            ).fetchone()
+            open_count = int(row["cnt"]) if row else 0
+            if open_count >= max_open_uploads:
+                return False
+            conn.execute(
+                """INSERT INTO staging_uploads
+                   (upload_id, owner_id, filename, expected_chunks,
+                    created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    upload_id,
+                    owner_id,
+                    filename,
+                    expected_chunks,
+                    now,
+                    now + expiry_seconds,
+                ),
+            )
+            return True
+
+    def reclaim_expired_staging_for_user(self, owner_id: str) -> list[str]:
+        """Delete a user's expired, non-finalizing staging rows; return ids.
+
+        Called synchronously at upload_init (STG-5) so a just-expired
+        upload's bytes/rows are reclaimed for this user before the new
+        upload's caps are evaluated, instead of lingering cap-invisible
+        (excluded by ``get_total_staging_bytes``/``count_open_uploads``)
+        until the periodic GC runs. ``finalizing = 1`` rows are left to the
+        finalize path / grace sweep. The caller is responsible for removing
+        the returned uploads' on-disk staging directories.
+        """
+        now = time.time()
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT upload_id FROM staging_uploads "
+                "WHERE owner_id = ? AND expires_at < ? AND finalizing = 0",
+                (owner_id, now),
+            ).fetchall()
+            upload_ids = [row["upload_id"] for row in rows]
+            if upload_ids:
+                conn.execute(
+                    "DELETE FROM staging_uploads "
+                    "WHERE owner_id = ? AND expires_at < ? AND finalizing = 0",
+                    (owner_id, now),
+                )
+            return upload_ids
+
     def get_staging_upload(self, upload_id: str) -> dict | None:
         """Get a staging upload by upload_id."""
         with self._lock:
@@ -886,6 +1002,23 @@ class Database:
                    VALUES (?, ?, ?, ?, ?)""",
                 (upload_id, chunk_index, chunk_hash, chunk_size, time.time()),
             )
+
+    def get_staging_chunk_size(self, upload_id: str, chunk_index: int) -> int | None:
+        """Return the recorded ``chunk_size`` for a staged chunk, or None.
+
+        Backs the re-upload delta accounting (STG-3): when a client re-POSTs
+        an index it already staged, only the size *difference* against the
+        existing row should count toward quota, otherwise the prior row is
+        double-counted by ``get_total_staging_bytes`` (which already includes
+        it). Returns None when no row exists for ``(upload_id, chunk_index)``.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT chunk_size FROM staging_chunks "
+                "WHERE upload_id = ? AND chunk_index = ?",
+                (upload_id, chunk_index),
+            ).fetchone()
+            return int(row["chunk_size"]) if row else None
 
     def get_staging_chunks(self, upload_id: str) -> list[dict]:
         """Get all chunks for a staging upload, ordered by index."""
@@ -955,6 +1088,26 @@ class Database:
             (upload_id,),
         )
         return cursor.rowcount > 0
+
+    def clear_finalizing(self, upload_id: str) -> bool:
+        """Reset ``finalizing = 0`` so a stranded claim can be retried (STG-2).
+
+        Called when a finalize attempt fails on a RECOVERABLE branch (quota
+        or a transient commit error) WITHOUT deleting the staging row, so the
+        background cleanup and a client retry both see an un-claimed row
+        again — rather than one stuck at finalizing=1 (cap-invisible, and
+        re-claim returns False so a retry would mislead with "Upload
+        expired") until the grace window. Runs in its own write transaction.
+
+        Returns:
+            True if a row was updated.
+        """
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE staging_uploads SET finalizing = 0 WHERE upload_id = ?",
+                (upload_id,),
+            )
+            return cursor.rowcount > 0
 
     def get_total_staging_bytes(self, owner_id: str) -> int:
         """Return the sum of chunk_size across all open (non-expired,

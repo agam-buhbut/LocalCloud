@@ -21,7 +21,13 @@ same canonical no-hyphen form, so the genuine ingest path works end to end.)
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
+import pytest
+from quart import Quart
+
+from server import storage
+from shared.crypto import blake2b_hash
 from tests.conftest import (
     TEST_PEER_PORT,
     AuthedClient,
@@ -552,3 +558,175 @@ async def test_real_double_finalize_does_not_commit_twice(
     assert await _used_bytes(owner.authed) == committed
     ids = await _listed_ids(owner.authed)
     assert ids == {enc.file_id_hex}
+
+
+# ──────────────────── staging robustness (STG-1/2/3/5, PERF-2) ───────────────
+
+
+async def _post_chunk(authed: AuthedClient, upload_id: str, index: int, data: bytes):
+    """POST raw bytes to a chunk endpoint with the octet-stream content type."""
+    return await authed.client.post(
+        f"/api/files/upload/{upload_id}/chunk/{index}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {authed.token}",
+            "Content-Type": "application/octet-stream",
+        },
+        scope_base={"client": (authed.peer_host, TEST_PEER_PORT)},
+    )
+
+
+async def test_requota_fail_preserves_prior_chunk_and_finalizes(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    tmp_data_dir: Path,
+) -> None:
+    """STG-1 / PERF-2: a quota-failed re-upload of an accepted index must NOT
+    destroy the prior chunk; the upload still finalizes into a complete,
+    downloadable file, and the rejected re-upload leaves no temp behind.
+
+    Before the write-temp-then-promote fix the re-upload os.replace'd into
+    {idx}.bin and then unlinked it on quota rejection, so finalize promoted a
+    blob missing a chunk.
+    """
+    quota = 5000
+    owner = await make_keyed_client(quota_bytes=quota)
+    original = b"A" * 1500
+    chunk_hash = blake2b_hash(original).hex()
+
+    init = await owner.authed.post(
+        "/api/files/upload/init",
+        json={"filename": "f.bin", "expected_chunks": 1},
+    )
+    assert init.status_code == 201
+    upload_id = (await init.get_json())["upload_id"]
+
+    assert (await _post_chunk(owner.authed, upload_id, 0, original)).status_code == 200
+
+    # Re-upload the same index with a chunk that blows the quota.
+    reup = await _post_chunk(owner.authed, upload_id, 0, b"B" * (quota + 1000))
+    assert reup.status_code == 413
+
+    # The original chunk file survived untouched, and the rejected re-upload
+    # left no temp file behind (PERF-2).
+    staging_upload_dir = Path(tmp_data_dir) / "staging" / upload_id
+    assert (staging_upload_dir / "0.bin").read_bytes() == original
+    leftover = [p.name for p in staging_upload_dir.iterdir() if p.name != "0.bin"]
+    assert leftover == [], f"rejected re-upload left junk in staging: {leftover}"
+
+    # Finalize against the ORIGINAL chunk's hash → complete, committed file.
+    file_id = "ab" * 16
+    fin = await owner.authed.post(
+        f"/api/files/upload/{upload_id}/finalize",
+        json={
+            "file_id": file_id,
+            "total_chunks": 1,
+            "file_header": (b"h" * 64).hex(),
+            "encrypted_metadata": (b"m" * 64).hex(),
+            "visibility": 0,
+            "expected_hashes": [chunk_hash],
+        },
+    )
+    assert fin.status_code == 201, await fin.get_data()
+
+    # The finalized chunk downloads back as the original bytes (not missing).
+    dl = await owner.authed.get(f"/api/files/{file_id}/chunk/0")
+    assert dl.status_code == 200
+    assert (await dl.get_data()) == original
+
+
+async def test_reupload_same_index_not_over_rejected(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    app: Quart,
+) -> None:
+    """STG-3: a same-size re-upload near quota charges only the size delta, so
+    it is not falsely over-quota, and the staging total reflects one chunk.
+
+    Before the delta fix the re-upload double-counted (2000 + 2000 > 3000) and
+    returned 413.
+    """
+    owner = await make_keyed_client(quota_bytes=3000)
+    init = await owner.authed.post(
+        "/api/files/upload/init",
+        json={"filename": "f.bin", "expected_chunks": 2},
+    )
+    upload_id = (await init.get_json())["upload_id"]
+
+    payload = b"x" * 2000  # >= MIN_CHUNK_SIZE; 2x would exceed the 3000 quota
+    assert (await _post_chunk(owner.authed, upload_id, 0, payload)).status_code == 200
+    assert (await _post_chunk(owner.authed, upload_id, 0, payload)).status_code == 200
+
+    db = app.db  # type: ignore[attr-defined]
+    assert db.get_total_staging_bytes(owner.user_id) == 2000
+
+
+async def test_finalize_transient_failure_clears_finalizing_and_allows_retry(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    http_upload: Callable[..., Awaitable[tuple[EncryptedUpload, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+    app: Quart,
+) -> None:
+    """STG-2: a transient commit failure clears the finalize claim so a retry
+    is accepted, instead of stranding finalizing=1 and returning a misleading
+    'Upload expired' 410 on the retry.
+    """
+    owner = await make_keyed_client()
+    enc, upload_id = await http_upload(owner.authed, owner.keystore, _MULTI_CHUNK_DATA)
+
+    real_commit = storage._commit_finalized_blob
+    calls = {"n": 0}
+
+    def flaky_commit(*args: object, **kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient commit boom")
+        return real_commit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(storage, "_commit_finalized_blob", flaky_commit)
+
+    first = await _finalize(owner.authed, upload_id, enc)
+    assert first.status_code == 500  # transient server error, NOT 410 expiry
+
+    # The claim was cleared so the row is reclaimable / retryable.
+    db = app.db  # type: ignore[attr-defined]
+    upload = db.get_staging_upload(upload_id)
+    assert upload is not None
+    assert upload["finalizing"] == 0
+
+    # A retry now succeeds (commit works on the 2nd call), proving the retry
+    # was NOT blocked by the one-shot claim guard.
+    second = await _finalize(owner.authed, upload_id, enc)
+    assert second.status_code == 201
+    assert (await second.get_json())["file_id"] == enc.file_id_hex
+    assert calls["n"] == 2
+
+
+async def test_init_reclaims_expired_staging_of_same_user(
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    app: Quart,
+    tmp_data_dir: Path,
+) -> None:
+    """STG-5: a new init reclaims the same user's expired staging row + dir
+    synchronously, so the expired upload stops counting against caps before
+    the periodic GC runs.
+    """
+    owner = await make_keyed_client()
+    db = app.db  # type: ignore[attr-defined]
+    stale_id = "ab" * 16
+    db.create_staging_upload(
+        upload_id=stale_id,
+        owner_id=owner.user_id,
+        filename="stale.bin",
+        expected_chunks=1,
+        expiry_seconds=-60,  # already expired
+    )
+    stale_dir = Path(tmp_data_dir) / "staging" / stale_id
+    stale_dir.mkdir(parents=True, exist_ok=True)
+
+    init = await owner.authed.post(
+        "/api/files/upload/init",
+        json={"filename": "new.bin", "expected_chunks": 1},
+    )
+    assert init.status_code == 201
+
+    assert db.get_staging_upload(stale_id) is None, "expired row must be reclaimed"
+    assert not stale_dir.exists(), "expired staging dir must be removed"
