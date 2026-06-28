@@ -3,11 +3,19 @@
 # Item 2C client side. This module is the home for the key-wrapping
 # directory verification glue.
 #
-# The security property of the whole directory rests on the client
-# re-verifying the recipient's Ed25519 self-signature over their X25519
-# key before wrapping. The server is hostile and may lie about any field;
-# a verified (ed25519, x25519, self_sig) triple authenticates the X25519
-# key as strongly as the recipient's Ed25519 pin (transitive trust).
+# The recipient self-signature check (verify_x25519_self_sig) proves the
+# (ed25519, x25519, self_sig) triple is INTERNALLY consistent — the X25519
+# key is bound to that Ed25519 identity under that username. It is NECESSARY
+# but NOT SUFFICIENT as a trust anchor: the server is hostile and supplies the
+# Ed25519 itself, so on FIRST contact it can mint a fresh keypair and return a
+# fully self-consistent triple it controls (and then unwrap the shared file).
+# The actual anchor is therefore TOFU on the recipient's Ed25519, enforced by
+# the CALLER (client/cli.py ``share``): the first SUCCESSFUL directory share
+# pins the recipient's Ed25519, and any later server substitution of that
+# username's identity key is refused fail-closed. For authenticated FIRST
+# contact the operator passes an out-of-band key via
+# ``localcloud share --recipient-pubkey``, which bypasses the directory and the
+# pin entirely.
 
 from __future__ import annotations
 
@@ -27,6 +35,7 @@ __all__ = [
     "build_enroll_signing_input",
     "verify_x25519_self_sig",
     "resolve_recipient",
+    "resolve_recipient_verified",
     "acquire_file_keys",
 ]
 
@@ -155,32 +164,38 @@ def verify_x25519_self_sig(
         return False
 
 
-def resolve_recipient(api_client: object, username: str) -> bytes:
-    """Resolve and verify a recipient's X25519 key via the directory.
+def resolve_recipient_verified(
+    api_client: object, username: str
+) -> tuple[bytes, bytes, str]:
+    """Resolve+verify a recipient's directory triple, returning all three fields.
 
-    Fetches ``{ed25519, x25519, self_sig}`` from the server's pubkey
-    directory, MANDATORILY verifies the self-signature binds the
-    recipient's canonical username, and returns the verified 32-byte
-    X25519 key. This is what lets ``share`` drop the out-of-band
-    ``--recipient-pubkey``: the verified key is authenticated by the
-    recipient's Ed25519 identity, not trusted from the hostile server.
+    Fetches ``{ed25519, x25519, self_sig}`` from the server's pubkey directory,
+    MANDATORILY verifies the self-signature binds the recipient's canonical
+    username, and returns the verified
+    ``(x25519_pub, ed25519_pub, canonical_username)``.
 
-    Fail-closed: raises ``CryptoError`` if the recipient is not enrolled
-    (any field absent) or the self-signature does not verify. The caller
-    MUST NOT wrap to an unverified key.
+    The self-sig check proves only that the triple is INTERNALLY consistent —
+    necessary, not sufficient. The hostile server supplies the Ed25519, so the
+    returned ``ed25519_pub`` MUST be TOFU-pinned by the caller against a prior
+    first-contact value before it is trusted across shares (see
+    ``client.cli._resolve_recipient_pubkey``).
+
+    Fail-closed: raises ``CryptoError`` if the username is invalid, the
+    recipient is not enrolled (any field absent), or the self-signature does
+    not verify. The caller MUST NOT wrap to an unverified key.
 
     Args:
         api_client: A ``CloudClient`` exposing ``get_pubkeys(username)``.
         username: The raw recipient username (canonicalized here so the
-            signature check binds the exact canonical bytes the server
-            stored the self-sig under).
+            signature check binds the exact canonical bytes the server stored
+            the self-sig under).
 
     Returns:
-        The verified 32-byte X25519 public key.
+        ``(x25519_pub, ed25519_pub, canonical_username)`` — both keys 32 bytes.
 
     Raises:
-        CryptoError: if the username is invalid, the recipient is not
-            enrolled, or the self-signature fails verification.
+        CryptoError: if the username is invalid, the recipient is not enrolled,
+            or the self-signature fails verification.
     """
     try:
         canonical = canonicalize_username(username)
@@ -208,4 +223,41 @@ def resolve_recipient(api_client: object, username: str) -> bytes:
             f"X25519 self-signature for {canonical!r} is invalid — refusing "
             "to wrap to a potentially server-substituted key"
         )
+    return x, ed, canonical
+
+
+def resolve_recipient(api_client: object, username: str) -> bytes:
+    """Resolve and verify a recipient's X25519 key via the directory.
+
+    Thin wrapper over :func:`resolve_recipient_verified` for callers that only
+    need the X25519 wrap key. Fetches ``{ed25519, x25519, self_sig}`` from the
+    directory and MANDATORILY verifies the self-signature binds the recipient's
+    canonical username.
+
+    The returned key is authenticated only as INTERNALLY consistent (the
+    self-sig binds it to the supplied Ed25519 under this username). That is
+    necessary but NOT sufficient against a hostile server, which supplies the
+    Ed25519 too; cross-share Ed25519 TOFU pinning is the CALLER's responsibility
+    (see ``client.cli._resolve_recipient_pubkey``). Use
+    ``localcloud share --recipient-pubkey`` to authenticate a recipient on first
+    contact out of band.
+
+    Fail-closed: raises ``CryptoError`` if the recipient is not enrolled (any
+    field absent) or the self-signature does not verify. The caller MUST NOT
+    wrap to an unverified key.
+
+    Args:
+        api_client: A ``CloudClient`` exposing ``get_pubkeys(username)``.
+        username: The raw recipient username (canonicalized here so the
+            signature check binds the exact canonical bytes the server stored
+            the self-sig under).
+
+    Returns:
+        The verified 32-byte X25519 public key.
+
+    Raises:
+        CryptoError: if the username is invalid, the recipient is not enrolled,
+            or the self-signature fails verification.
+    """
+    x, _ed, _canonical = resolve_recipient_verified(api_client, username)
     return x

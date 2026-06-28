@@ -44,6 +44,21 @@ the (encrypted) metadata and use opaque filenames.
   mark (`MetadataBlob.version_number` is a reserved placeholder, never
   compared). Per-version integrity/authenticity IS enforced (signed Merkle
   root verified before decrypt); only cross-version freshness is unprotected.
+- **Recipient key exchange on FIRST contact is TOFU** — the directory-based
+  `share` path resolves the recipient's X25519 key from the (hostile) server
+  and verifies the recipient's Ed25519 self-signature over it. That self-sig
+  proves only that the `{ed25519, x25519, self_sig}` triple is internally
+  consistent; it is necessary but NOT sufficient, because the server supplies
+  the Ed25519 too and could, on first contact, mint a self-consistent triple it
+  controls (and then unwrap the shared file). The trust anchor is therefore
+  Trust-On-First-Use on the recipient's Ed25519: the first SUCCESSFUL directory
+  share pins it (client-side, `<key-file>.recipient_pins.json`), and any later
+  server substitution of that recipient's identity key is refused fail-closed —
+  mirroring the owner-pubkey TOFU pin on the download path. For authenticated
+  first contact, `share --recipient-pubkey <hex>` supplies an out-of-band
+  X25519 anchor and bypasses the directory and the pin entirely. So "server
+  compromise cannot read shared-file contents" holds only once a recipient has
+  been pinned via an authentic first contact (or via `--recipient-pubkey`).
 - **Total hardware loss** — no off-box replica beyond the (offline, encrypted)
   backup HDD; losing both disks loses the data.
 - **Client-side compromise** — if the client device is owned, plaintext and

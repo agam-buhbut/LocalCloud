@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from client.cli import cli
+from client.cli import _load_recipient_pins, _recipient_pins_path, cli
 from client.keystore import KeyStore
 from shared.crypto import blake2b_hash
 from shared.exceptions import AuthError, StorageError
@@ -111,9 +111,12 @@ class FakeCloudClient:
         self.delete_raises: Exception | None = None
         self.unshare_raises: Exception | None = None
         self.enroll_raises: Exception | None = None
+        # Recipient directory lookup (share path). Empty dict ⇒ "not enrolled".
+        self.pubkeys_return: dict[str, bytes] = {}
         # Captured payloads for assertions.
         self.self_keys_calls: list[tuple[str, bytes]] = []
         self.enroll_calls: list[tuple[bytes, bytes]] = []
+        self.pubkeys_calls: list[str] = []
         self.share_calls: list[tuple[str, str, bytes]] = []
         self.login_calls: list[tuple[str, str]] = []
         self.list_files_calls: list[tuple[int, int]] = []
@@ -194,6 +197,10 @@ class FakeCloudClient:
         self.enroll_calls.append((x25519_pubkey, self_sig))
         if self.enroll_raises is not None:
             raise self.enroll_raises
+
+    def get_pubkeys(self, username: str) -> dict[str, bytes]:
+        self.pubkeys_calls.append(username)
+        return dict(self.pubkeys_return)
 
     # sharing path
     def share_file(self, file_id: str, recipient: str, wrapped: bytes) -> None:
@@ -534,6 +541,152 @@ def test_share_fail_closed_without_owner_bundle(
     assert "Share failed" in result.output
     # Nothing was shared (no wrapped bundle ever uploaded).
     assert patched_cli.share_calls == []
+
+
+def _install_owner_self_share(fake: FakeCloudClient, ks: KeyStore) -> None:
+    """Set up a GENUINE owner self-share bundle so acquire_file_keys succeeds.
+
+    Mirrors a real upload's ``/self_keys`` row: file_key+meta_key wrapped to the
+    owner's own X25519, with ``/owner_pubkey`` returning the owner's Ed25519, so
+    the CLI's unified key acquisition unwraps it for real (no plaintext cache).
+    """
+    raw_id = bytes.fromhex(_FILE_ID)
+    fake.wrapped_keys_return = ks.wrap_file_keys(
+        file_key=b"\x11" * 32,
+        meta_key=b"\x22" * 32,
+        file_id=raw_id,
+        recipient_pubkey=ks.x25519_public_key(),
+    )
+    fake.owner_pubkey_return = ks.ed25519_public_key()
+
+
+def _recipient_triple(username: str) -> dict[str, bytes]:
+    """A GENUINE {ed25519, x25519, self_sig} directory triple for ``username``.
+
+    Minted from a throwaway ``keycore.KeyPair`` (only ``KeyStore.generate`` pays
+    the Argon2id KDF — raw ``KeyPair.generate`` is free), so the self-signature
+    genuinely verifies under a DISTINCT identity each call. This is exactly what
+    a hostile server returns when it substitutes a recipient's identity: a fully
+    self-consistent triple it controls.
+    """
+    import keycore
+
+    kp = keycore.KeyPair.generate()  # type: ignore[reportAttributeAccessIssue]
+    ed = bytes(kp.ed25519_public_key())
+    x = bytes(kp.x25519_public_key())
+    canonical = canonicalize_username(username)
+    sig = bytes(kp.sign(build_enroll_signing_input(canonical, x)))
+    return {"ed25519": ed, "x25519": x, "self_sig": sig}
+
+
+def test_share_directory_first_use_pins_recipient_and_succeeds(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+    _shared_keystore: KeyStore,
+) -> None:
+    """(a) A first directory share to a new recipient pins their Ed25519.
+
+    The verified directory triple lets the share proceed (TOFU first contact),
+    and the recipient's Ed25519 is recorded under the canonical username only
+    after the share POST succeeds.
+    """
+    _install_owner_self_share(patched_cli, _shared_keystore)
+    triple = _recipient_triple("bob")
+    patched_cli.pubkeys_return = triple
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "share", _FILE_ID, "bob"], input=f"{_KEY_PW}\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(patched_cli.share_calls) == 1
+    # The directory was consulted under the canonical username, and the
+    # recipient's Ed25519 is now TOFU-pinned for that username.
+    assert patched_cli.pubkeys_calls == ["bob"]
+    assert _load_recipient_pins(keyfile) == {"bob": triple["ed25519"].hex()}
+
+
+def test_share_directory_rejects_substituted_recipient_key(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+    _shared_keystore: KeyStore,
+) -> None:
+    """(b) CORE REGRESSION: a later share returning a DIFFERENT Ed25519 for the
+    same recipient is refused fail-closed.
+
+    A hostile server that substitutes the recipient's identity returns a fresh,
+    fully self-consistent triple (so ``verify_x25519_self_sig`` passes), but the
+    Ed25519 differs from the pinned one — the TOFU pin catches it. Fails before
+    the fix (the share path never consulted any pin) and passes after.
+    """
+    _install_owner_self_share(patched_cli, _shared_keystore)
+    runner = CliRunner()
+
+    # First share: genuine identity A → pins bob→edA, succeeds.
+    triple_a = _recipient_triple("bob")
+    patched_cli.pubkeys_return = triple_a
+    first = runner.invoke(
+        cli, ["--key-file", keyfile, "share", _FILE_ID, "bob"], input=f"{_KEY_PW}\n"
+    )
+    assert first.exit_code == 0, first.output
+    assert _load_recipient_pins(keyfile) == {"bob": triple_a["ed25519"].hex()}
+
+    # Second share: server mints a FRESH identity B for the same username.
+    triple_b = _recipient_triple("bob")
+    assert triple_b["ed25519"] != triple_a["ed25519"]
+    patched_cli.pubkeys_return = triple_b
+    second = runner.invoke(
+        cli, ["--key-file", keyfile, "share", _FILE_ID, "bob"], input=f"{_KEY_PW}\n"
+    )
+
+    assert second.exit_code != 0
+    assert "Share failed" in second.output
+    assert "changed since the first share" in second.output
+    # Only the first share was ever uploaded; the pin still holds identity A.
+    assert len(patched_cli.share_calls) == 1
+    assert _load_recipient_pins(keyfile) == {"bob": triple_a["ed25519"].hex()}
+
+
+def test_share_recipient_pubkey_override_skips_pin_store(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+    _shared_keystore: KeyStore,
+) -> None:
+    """(c) The --recipient-pubkey path neither reads nor writes the recipient
+    pin store, and never consults the directory.
+
+    Proof it does not READ the store: a pre-planted CORRUPT store would
+    fail-closed if consulted, yet the override share still succeeds. Proof it
+    does not WRITE: the corrupt bytes are left exactly as written, and the
+    directory was never called.
+    """
+    _install_owner_self_share(patched_cli, _shared_keystore)
+    recipient_pk = _shared_keystore.x25519_public_key().hex()
+    # A corrupt store that WOULD fail-closed on the directory path.
+    _recipient_pins_path(keyfile).write_text("{ not json", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--key-file",
+            keyfile,
+            "share",
+            _FILE_ID,
+            "bob",
+            "--recipient-pubkey",
+            recipient_pk,
+        ],
+        input=f"{_KEY_PW}\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(patched_cli.share_calls) == 1
+    # Directory NOT consulted, and the (corrupt) pin store NEITHER read NOR
+    # written — left byte-for-byte as planted.
+    assert patched_cli.pubkeys_calls == []
+    assert _recipient_pins_path(keyfile).read_text(encoding="utf-8") == "{ not json"
 
 
 # ──────────────────────────── enroll ────────────────────────────

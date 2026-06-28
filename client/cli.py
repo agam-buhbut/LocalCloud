@@ -165,6 +165,59 @@ def _save_owner_pins(key_file: str | Path, pins: dict[str, str]) -> None:
     _atomic_write_secret(_owner_pins_path(key_file), json.dumps(pins))
 
 
+def _recipient_pins_path(key_file: str | Path) -> Path:
+    """Path of the per-recipient-username TOFU pin store (next to the keyfile)."""
+    return Path(str(key_file) + ".recipient_pins.json")
+
+
+def _load_recipient_pins(key_file: str | Path) -> dict[str, str]:
+    """Load the ``{canonical_username: ed25519_hex}`` recipient TOFU pin store.
+
+    Mirrors :func:`_load_owner_pins` for the SHARE path: a missing store is a
+    legitimate first use → empty dict. A corrupt, oversized, wrong-typed, or
+    unreadable store FAILS CLOSED (raises ``CryptoError``): a tampered pin file
+    is exactly the signal TOFU exists to catch, so it is never silently reset to
+    empty (which would re-enable trust-on-first-use to a server-chosen recipient
+    key). Delete the file deliberately to re-pin.
+    """
+    path = _recipient_pins_path(key_file)
+    try:
+        # O_NOFOLLOW: refuse a symlink swapped in at the pin path.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise CryptoError(f"Cannot read recipient-pin store {path}: {e}") from e
+    try:
+        with os.fdopen(fd, "r") as f:
+            raw = f.read(_MAX_PIN_STORE_BYTES + 1)
+    except OSError as e:
+        raise CryptoError(f"Cannot read recipient-pin store {path}: {e}") from e
+    if len(raw) > _MAX_PIN_STORE_BYTES:
+        raise CryptoError(f"Recipient-pin store {path} is implausibly large; refusing")
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise CryptoError(
+            f"Recipient-pin store {path} is corrupt; refusing "
+            "(delete it to deliberately re-pin)"
+        ) from e
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        raise CryptoError(f"Recipient-pin store {path} is malformed; refusing")
+    return data
+
+
+def _save_recipient_pins(key_file: str | Path, pins: dict[str, str]) -> None:
+    """Atomically persist the recipient TOFU pin store (mode 0600).
+
+    ponytail: last-writer-wins on concurrent shares — fine for a local
+    single-user CLI; a dropped pin just re-TOFUs on the next share.
+    """
+    _atomic_write_secret(_recipient_pins_path(key_file), json.dumps(pins))
+
+
 @click.group()
 @click.option(
     "--key-file",
@@ -356,6 +409,42 @@ def _resolve_owner_pubkey(
                 "--sender-pubkey to override with an out-of-band key you trust."
             )
     return pk, canonical
+
+
+def _resolve_recipient_pubkey(
+    client: CloudClient,
+    recipient: str,
+    pins: dict[str, str],
+) -> tuple[bytes, str, str]:
+    """Resolve+verify the recipient's X25519 wrap key and enforce the TOFU pin.
+
+    Returns ``(x25519_pubkey, canonical_username, directory_ed25519_hex)`` for
+    the DEFAULT directory share path. The recipient's ``{ed25519, x25519,
+    self_sig}`` triple is fetched and the self-signature verified
+    (``resolve_recipient_verified``, fail-closed). That check proves only the
+    triple's INTERNAL consistency; the trust anchor is the recipient's Ed25519,
+    so the directory ed25519 is compared (constant time) against any existing
+    username pin and a MISMATCH FAILS CLOSED — the server has substituted the
+    recipient's identity since the first share.
+
+    The pin is NOT written here: the caller records it only after a successful
+    share (trust-on-first-*successful*-use), mirroring the owner pin written
+    only after a successful decrypt, so a failed share never persists a bad pin.
+    The ``--recipient-pubkey`` out-of-band path does NOT call this — it bypasses
+    the directory and the pin entirely as the stronger first-contact auth.
+    """
+    from client.keymgmt import resolve_recipient_verified
+
+    x25519_pub, ed25519_pub, canonical = resolve_recipient_verified(client, recipient)
+    ed_hex = ed25519_pub.hex()
+    pinned = pins.get(canonical)
+    if pinned is not None and not hmac.compare_digest(pinned, ed_hex):
+        raise CryptoError(
+            f"Recipient identity key for {canonical} changed since the first "
+            "share — refusing (the server may be hostile). Pass "
+            "--recipient-pubkey to wrap to an out-of-band key you trust."
+        )
+    return x25519_pub, canonical, ed_hex
 
 
 def _encrypt_and_upload(
@@ -740,17 +829,24 @@ def share(
 ):
     """Share a file with another user.
 
-    Resolves the recipient's X25519 public key from the server directory
-    and verifies the recipient's Ed25519 self-signature over it before
-    wrapping (so a hostile server cannot substitute its own key). The
-    client wraps file_key+meta_key for the verified recipient and uploads
-    the wrapped bundle; the server never sees plaintext keys.
+    DEFAULT (directory) path: resolves the recipient's X25519 public key from
+    the server directory and verifies the recipient's Ed25519 self-signature
+    over it. That self-sig check proves the directory triple is INTERNALLY
+    consistent — necessary but NOT sufficient, because the hostile server
+    supplies the Ed25519 itself and could mint a self-consistent triple it
+    controls. The trust anchor is therefore TOFU on the recipient's Ed25519:
+    the first SUCCESSFUL directory share pins it, and any later server
+    substitution of that recipient's identity key is refused fail-closed.
+    FIRST contact trusts the server.
 
-    Pass ``--recipient-pubkey`` to override the directory with an
-    out-of-band key (explicit trust; the self-signature check is skipped
-    because there is no directory entry to verify).
+    Pass ``--recipient-pubkey`` to wrap to an out-of-band X25519 key you
+    already trust; this BYPASSES the directory AND the pin entirely and is the
+    recommended way to authenticate a recipient on FIRST contact.
+
+    The client wraps file_key+meta_key for the resolved recipient and uploads
+    the wrapped bundle; the server never sees plaintext keys.
     """
-    from client.keymgmt import acquire_file_keys, resolve_recipient
+    from client.keymgmt import acquire_file_keys
 
     ks = _get_keystore(ctx.obj["key_file"])
     if not ks.has_keys:
@@ -764,9 +860,15 @@ def share(
     key_password = click.prompt("Key password", hide_input=True)
     _unlock_or_exit(ks, key_password)
     try:
+        # Default empty; the override path deliberately NEITHER reads NOR
+        # writes the recipient-pin store (it is the stronger first-contact
+        # auth). Only the directory path loads and may update it.
+        recipient_pins: dict[str, str] = {}
+        pin_username: str | None = None
+        pin_ed_hex: str | None = None
         if recipient_pubkey is not None:
-            # Explicit out-of-band override: the operator vouches for this
-            # key directly, so we do not consult (or trust) the directory.
+            # Explicit out-of-band override: the operator vouches for this key
+            # directly, so we consult NEITHER the directory NOR the pin store.
             try:
                 recipient_pk = bytes.fromhex(recipient_pubkey)
             except ValueError as e:
@@ -774,9 +876,14 @@ def share(
             if len(recipient_pk) != 32:
                 raise CryptoError("--recipient-pubkey must be 32 bytes")
         else:
-            # Default: resolve + MANDATORILY verify via the directory.
-            # resolve_recipient fails closed on a missing/invalid self-sig.
-            recipient_pk = resolve_recipient(client, recipient)
+            # Default: resolve + MANDATORILY verify via the directory, then
+            # enforce the recipient-Ed25519 TOFU pin (fail-closed on a later
+            # server key substitution). First contact is trusted (TOFU); the
+            # pin is recorded only AFTER a successful share, below.
+            recipient_pins = _load_recipient_pins(ctx.obj["key_file"])
+            recipient_pk, pin_username, pin_ed_hex = _resolve_recipient_pubkey(
+                client, recipient, recipient_pins
+            )
 
         # 2A: the owner re-acquires their own file_key/meta_key through the
         # unified server path (own self-share row) — no plaintext cache.
@@ -798,6 +905,17 @@ def share(
             recipient_pubkey=recipient_pk,
         )
         client.share_file(file_id, recipient, wrapped)
+        # Trust-on-first-*successful*-use: pin the recipient Ed25519 only after
+        # the share POST succeeds (mirrors the owner pin written post-decrypt),
+        # so a failed share never persists a bad pin. The override path leaves
+        # pin_username None and never touches the store.
+        if (
+            pin_username is not None
+            and pin_ed_hex is not None
+            and recipient_pins.get(pin_username) != pin_ed_hex
+        ):
+            recipient_pins[pin_username] = pin_ed_hex
+            _save_recipient_pins(ctx.obj["key_file"], recipient_pins)
         click.echo(f"Shared {file_id} with {recipient}")
     except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Share failed: {e}", err=True)
