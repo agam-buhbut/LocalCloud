@@ -172,13 +172,16 @@ def build_metadata_aad(
     the Ed25519 signature covers; the signature itself is intentionally NOT
     in the AAD (it is over the root, so it adds no information).
 
-    The domain tag ``METADATA_AAD_CONTEXT`` provides the data-chunk-vs-metadata
-    separation that the sentinel index (``METADATA_CHUNK_INDEX``) also still
-    provides (both mechanisms are live — the sentinel keys the serialized
-    metadata entry and is asserted at module load),
-    and the ``protocol_version`` field forces non-interoperability on a future
-    bump (defense in depth; the tag already does this). The u16 width matches
-    ``FileHeader.version``.
+    The domain tag ``METADATA_AAD_CONTEXT`` is the SOLE data-chunk-vs-metadata
+    separator in the shipped AAD: ``build_metadata_aad`` uses only the context
+    tag (a metadata blob and a chunk AAD can never collide — different lengths,
+    content, and keys). ``METADATA_CHUNK_INDEX`` is NOT fed into the metadata
+    AAD; it survives only as the import-time tripwire asserting the u32 ChunkAAD
+    packing invariant (asserted at module load). The ``protocol_version`` field
+    additionally forces non-interoperability on a future bump (defense in depth).
+    The u16 width matches ``FileHeader.version``. (pentest 2026-06-28: corrected
+    the prior "both mechanisms are live" claim — only the context tag is
+    load-bearing for metadata/chunk separation.)
 
     Raises:
         ValueError: ``file_id`` is not ``FILE_ID_LEN`` bytes, ``merkle_root``

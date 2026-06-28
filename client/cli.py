@@ -262,7 +262,7 @@ def enroll(ctx, username: str):
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
         sys.exit(1)
 
-    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock so a missing
+    # ORDER-1: validate the session BEFORE the ~4s Argon2 unlock so a missing
     # session fails fast without first prompting for + deriving the key.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
@@ -477,7 +477,7 @@ def upload(ctx, filepath: str, visibility: str):
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
         sys.exit(1)
 
-    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock.
+    # ORDER-1: validate the session BEFORE the ~4s Argon2 unlock.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
 
@@ -757,7 +757,7 @@ def share(
         click.echo("Error: No keys found.", err=True)
         sys.exit(1)
 
-    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock.
+    # ORDER-1: validate the session BEFORE the ~4s Argon2 unlock.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
 
@@ -885,7 +885,7 @@ def migrate_keys(ctx, key_cache: str | None):
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
         sys.exit(1)
 
-    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock.
+    # ORDER-1: validate the session BEFORE the ~4s Argon2 unlock.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
 

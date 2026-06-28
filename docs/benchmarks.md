@@ -143,7 +143,7 @@ median over N, after a warm-up. Indicative — Argon2id cost scales with CPU.
 | Op | Median | Notes |
 |---|---|---|
 | **keystore lock** (`keycore` Argon2id encrypt-to-store) | **~3.66 s** | one-time on `init` |
-| **keystore unlock** (Argon2id decrypt-from-store) | **~3.86 s** | **paid on EVERY connecting CLI command** (login/enroll/upload/download) |
+| **keystore unlock** (Argon2id decrypt-from-store) | **~3.86 s** | **paid on every key-using CLI command** (enroll/upload/download; `login` does NOT unlock the keystore — it pays only the server-side ~0.7 s argon2) |
 | `KeyPair.generate` (Ed25519+X25519) | 0.15 ms | negligible |
 | `sign` (256 B) | 0.13 ms | negligible |
 | `verify_signature` | 0.23 ms | negligible |
