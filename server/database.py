@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
 import uuid
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 # ──────────────────────────── Schema Version ────────────────────────────
 
@@ -236,6 +237,13 @@ class Database:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         # Initialize schema
         self._init_schema()
+        # L-1 (pentest 2026-06-22): SQLite creates the DB + -wal/-shm with the
+        # process umask (often 0644). The DB holds password hashes and all
+        # server-side metadata; tighten to 0600. Defense in depth — the 0700
+        # data dir is the primary gate, but the file should not rely on it.
+        for _suffix in ("", "-wal", "-shm"):
+            with suppress(OSError):  # :memory:, sidecar absent, or unsupported fs
+                os.chmod(self.db_path + _suffix, 0o600)
 
     def close(self) -> None:
         """Close the database connection."""

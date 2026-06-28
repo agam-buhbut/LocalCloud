@@ -78,3 +78,49 @@ def test_public_bind_override_env(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _valid_config()
     cfg.bind_host = "8.8.8.8"
     cfg.validate()  # override allows it
+
+
+# ── M-2 (pentest): warn that a non-loopback bind must be the WireGuard
+# interface (the app is plain HTTP). ──
+
+
+def test_validate_warns_on_non_loopback_bind(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    cfg = _valid_config()
+    cfg.bind_host = "10.0.0.1"  # a private IP — allowed, but not necessarily WG
+    with caplog.at_level(logging.WARNING, logger="localcloud.config"):
+        cfg.validate()
+    assert "PLAIN HTTP" in caplog.text and "WireGuard" in caplog.text
+
+
+def test_validate_does_not_warn_on_loopback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    cfg = _valid_config()
+    cfg.bind_host = "127.0.0.1"
+    with caplog.at_level(logging.WARNING, logger="localcloud.config"):
+        cfg.validate()
+    assert "PLAIN HTTP" not in caplog.text
+
+
+# ── L-1 (pentest): ensure_directories re-tightens a pre-existing loose dir. ──
+
+
+def test_ensure_directories_tightens_existing(tmp_path) -> None:
+    import os
+    import stat
+
+    d = tmp_path / "data"
+    d.mkdir(mode=0o777)
+    os.chmod(d, 0o777)  # simulate a pre-existing world-accessible data dir
+    cfg = _valid_config()
+    cfg.data_dir = str(d)
+    cfg.blob_dir = str(d / "blobs")
+    cfg.staging_dir = str(d / "staging")
+    cfg.ensure_directories()
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import stat as _stat
 from dataclasses import dataclass
@@ -141,16 +142,17 @@ class ServerConfig:
         if self.bind_port < 1 or self.bind_port > 65535:
             raise ValueError("Invalid bind port")
 
-        # Refuse public-network bind addresses. The deployment is
-        # WireGuard-only; binding to 0.0.0.0/::/loopback-only-aliases is
-        # a misconfiguration. Operator can override by setting
-        # ``LOCALCLOUD_ALLOW_PUBLIC_BIND=1`` if they really mean it.
-        # (#F12.4)
+        # Parse the bind address once (used by the public-bind guard and the
+        # plain-HTTP/WireGuard warning below).
+        try:
+            ip = ipaddress.ip_address(self.bind_host)
+        except ValueError as exc:
+            raise ValueError(f"Invalid bind_host: {self.bind_host!r}") from exc
+        # Refuse public-network bind addresses. The deployment is WireGuard-only;
+        # binding to 0.0.0.0/:: or a public address is a misconfiguration.
+        # Operator can override with ``LOCALCLOUD_ALLOW_PUBLIC_BIND=1`` if they
+        # really mean it. (#F12.4)
         if os.environ.get("LOCALCLOUD_ALLOW_PUBLIC_BIND") != "1":
-            try:
-                ip = ipaddress.ip_address(self.bind_host)
-            except ValueError as exc:
-                raise ValueError(f"Invalid bind_host: {self.bind_host!r}") from exc
             if ip.is_unspecified:
                 raise ValueError(
                     f"bind_host {self.bind_host!r} would accept "
@@ -162,6 +164,22 @@ class ServerConfig:
                     f"bind_host {self.bind_host!r} is a public address; "
                     "set LOCALCLOUD_ALLOW_PUBLIC_BIND=1 to override."
                 )
+        # M-2 (pentest 2026-06-22): a non-loopback bind MUST be the WireGuard
+        # interface. LocalCloud serves PLAIN HTTP and relies entirely on
+        # WireGuard for transport confidentiality/integrity. A "private IP" is
+        # NOT the same as "WireGuard" — binding a plain LAN/private address
+        # exposes credentials and session tokens in cleartext. We cannot verify
+        # the interface type portably here, so warn loudly; the documented
+        # deploy binds the wg0 address (10.0.0.1) behind the default-deny
+        # firewall.
+        if not ip.is_loopback:
+            logging.getLogger("localcloud.config").warning(
+                "bind_host %s is not loopback — LocalCloud serves PLAIN HTTP and "
+                "relies on WireGuard for transport security. Ensure this is the "
+                "WireGuard interface; a plain LAN/public bind exposes credentials "
+                "in cleartext.",
+                self.bind_host,
+            )
 
         # Paths must be absolute so they don't depend on the daemon's
         # CWD (#61).
@@ -194,9 +212,13 @@ class ServerConfig:
             raise ValueError("argon2_max_concurrent must be >= 1")
 
     def ensure_directories(self) -> None:
-        """Create required directories if they don't exist."""
+        """Create required directories if they don't exist (mode 0700)."""
         for d in [self.data_dir, self.blob_dir, self.staging_dir]:
             os.makedirs(d, mode=0o700, exist_ok=True)
+            # L-1 (pentest 2026-06-22): makedirs' mode is ignored for an
+            # existing dir, so re-tighten — a pre-existing data dir must not
+            # stay group/world-accessible.
+            os.chmod(d, 0o700)
 
 
 def _read_secret_file(path: str) -> str:

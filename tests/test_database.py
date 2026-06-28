@@ -19,6 +19,21 @@ import pytest
 
 from server.database import SCHEMA_VERSION, Database
 
+
+def test_db_file_is_chmod_0600(tmp_path: Path) -> None:
+    """L-1 (pentest): the DB (holding password hashes + metadata) is 0600."""
+    import os
+    import stat
+
+    p = tmp_path / "meta.db"
+    db = Database(str(p))
+    db.connect()
+    try:
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    finally:
+        db.close()
+
+
 # A users table shaped exactly as it was at schema v5 — i.e. WITHOUT the
 # v6 x25519 columns — so a v6 migration applied over it exercises the real
 # ALTER path (rather than a no-op against an already-current SCHEMA_SQL).

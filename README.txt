@@ -403,6 +403,13 @@ Application-level limitations (consciously accepted unless noted):
     and recomputes the root. merkle_proof()/verify_merkle_proof() exist but are
     unused by the download path.
   * MetadataBlob version_number / blob_ids are placeholders (no version history).
+  * Storage/quota amplification: every chunk is zero-padded to the full chunk
+    size (4 MiB) before encryption to hide the true file size, and quota is
+    charged the padded size. A small file therefore consumes a 4 MiB blob and
+    4 MiB of quota (a 1 GiB quota holds ~256 small files). Intentional
+    size-hiding tradeoff; revisiting the granularity (configurable chunk size,
+    or size-class padding for the final chunk, accepting a coarse size-class
+    leak) is a future option. See docs/pentest-2026-06-22.md (M-1).
 
 --------------------------------------------------------------------------------
 12. Development

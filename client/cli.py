@@ -18,7 +18,7 @@ from client.api_client import CloudClient
 from client.encryptor import FileEncryptor
 from client.keystore import KeyStore
 from shared.crypto import blake2b_hash
-from shared.exceptions import AuthError, CryptoError, StorageError
+from shared.exceptions import AuthError, CryptoError, ProtocolError, StorageError
 from shared.file_ids import canonicalize_file_id
 from shared.io import read_capped
 from shared.models import FileHeader, Visibility
@@ -237,7 +237,7 @@ def enroll(ctx, username: str):
         self_sig = ks.sign(signing_input)
         client.enroll_x25519(x25519_pub, self_sig)
         click.echo(f"Enrolled X25519 key for {canonical}.")
-    except (StorageError, CryptoError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Enroll failed: {e}", err=True)
         sys.exit(1)
     finally:
@@ -439,7 +439,7 @@ def upload(ctx, filepath: str, visibility: str):
         encrypted, file_id = _encrypt_and_upload(client, encryptor, Path(filepath), vis)
         _register_owner_self_keys(client, ks, encrypted, file_id)
         click.echo(f"Upload complete. File ID: {file_id}")
-    except (StorageError, CryptoError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Upload failed: {e}", err=True)
         sys.exit(1)
     except Exception:
@@ -545,7 +545,7 @@ def download(
             owner_pins[canonical_fid] = sig_pubkey.hex()
             _save_owner_pins(ctx.obj["key_file"], owner_pins)
         click.echo(f"Saved to {output}")
-    except (StorageError, CryptoError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Download failed: {e}", err=True)
         sys.exit(1)
     except Exception:
@@ -702,7 +702,7 @@ def share(
         )
         client.share_file(file_id, recipient, wrapped)
         click.echo(f"Shared {file_id} with {recipient}")
-    except (StorageError, CryptoError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Share failed: {e}", err=True)
         sys.exit(1)
     finally:
