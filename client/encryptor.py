@@ -116,7 +116,11 @@ class FileEncryptor:
 
         Args:
             input_path: source file on disk
-            filename: original filename (recorded in encrypted metadata)
+            filename: original filename. NOTE: this is server-visible
+                plaintext by design (sent separately at upload_init); it is
+                NOT placed in the encrypted metadata blob and is currently
+                unused inside this method. Retained in the signature for
+                caller clarity and forward compatibility.
             on_chunk: callback invoked for every encrypted chunk
             visibility: file visibility mode
             owner: owner username (recorded in encrypted metadata)

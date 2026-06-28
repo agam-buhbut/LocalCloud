@@ -336,7 +336,9 @@ def test_wrapped_bundle_wrong_file_id_fails(tmp_path: Path):
             file_id=fid_a,
             recipient_pubkey=recipient.x25519_public_key(),
         )
-        with pytest.raises(Exception):
+        # keycore surfaces an AEAD failure (wrong file_id binding) as a
+        # ValueError; pin the specific type rather than a broad Exception.
+        with pytest.raises(ValueError):
             recipient.unwrap_file_keys(
                 wrapped_bundle=wrapped,
                 file_id=fid_b,
@@ -362,7 +364,8 @@ def test_wrapped_bundle_with_trailing_bytes_rejected(tmp_path: Path):
             recipient_pubkey=recipient.x25519_public_key(),
         )
         # Append trailing bytes — must be rejected, not silently ignored.
-        with pytest.raises(Exception):
+        # keycore raises ValueError for a wrong-length bundle.
+        with pytest.raises(ValueError):
             recipient.unwrap_file_keys(
                 wrapped_bundle=wrapped + b"\x00\x00",
                 file_id=fid,

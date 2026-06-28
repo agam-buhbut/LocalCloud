@@ -132,7 +132,10 @@ class CloudClient:
             headers=self._headers(),
         )
         data = self._check_response(resp)
-        return data["upload_id"]
+        upload_id = data.get("upload_id")
+        if not isinstance(upload_id, str) or not upload_id:
+            raise StorageError("Invalid upload_init response")
+        return upload_id
 
     def upload_chunk(self, upload_id: str, chunk_index: int, chunk_data: bytes) -> str:
         """Upload a single encrypted chunk. Returns chunk hash."""
@@ -145,7 +148,10 @@ class CloudClient:
             },
         )
         data = self._check_response(resp)
-        return data["chunk_hash"]
+        chunk_hash = data.get("chunk_hash")
+        if not isinstance(chunk_hash, str) or not chunk_hash:
+            raise StorageError("Invalid upload_chunk response")
+        return chunk_hash
 
     def upload_finalize(
         self,
@@ -174,7 +180,10 @@ class CloudClient:
             headers=self._headers(),
         )
         data = self._check_response(resp)
-        return data["file_id"]
+        out_id = data.get("file_id")
+        if not isinstance(out_id, str) or not out_id:
+            raise StorageError("Invalid upload_finalize response")
+        return out_id
 
     def set_token(self, token: str) -> None:
         """Set the session token (e.g. loaded from file)."""
@@ -246,7 +255,10 @@ class CloudClient:
             headers=self._headers(),
         )
         data = self._check_response(resp)
-        return data["files"]
+        files = data.get("files")
+        if not isinstance(files, list):
+            raise StorageError("Invalid file list response")
+        return files
 
     def delete_file(self, file_id: str) -> None:
         """Delete a file."""
@@ -382,4 +394,7 @@ class CloudClient:
             headers=self._headers(),
         )
         data = self._check_response(resp)
-        return data["users"]
+        users = data.get("users")
+        if not isinstance(users, list):
+            raise StorageError("Invalid enrolled-users response")
+        return users

@@ -34,7 +34,7 @@ from click.testing import CliRunner
 from client.cli import cli
 from client.keystore import KeyStore
 from shared.crypto import blake2b_hash
-from shared.exceptions import StorageError
+from shared.exceptions import AuthError, StorageError
 from shared.usernames import build_enroll_signing_input, canonicalize_username
 
 _KEY_PW = "key-pw-123456"
@@ -97,10 +97,27 @@ class FakeCloudClient:
         self.post_self_keys_raises: Exception | None = None
         self.metadata_return: dict | None = None
         self.unwrap_hook: Callable[[bytes], tuple[bytes, bytes]] | None = None
+        # login / ls / quota / rm / unshare orchestration knobs.
+        self.login_return: str = "session-token-from-server"
+        self.login_raises: Exception | None = None
+        self.list_files_return: list[dict] = []
+        self.list_files_raises: Exception | None = None
+        self.quota_return: dict = {
+            "used_bytes": 1024,
+            "available_bytes": 9216,
+            "quota_bytes": 10240,
+        }
+        self.quota_raises: Exception | None = None
+        self.delete_raises: Exception | None = None
+        self.unshare_raises: Exception | None = None
         # Captured payloads for assertions.
         self.self_keys_calls: list[tuple[str, bytes]] = []
         self.enroll_calls: list[tuple[bytes, bytes]] = []
         self.share_calls: list[tuple[str, str, bytes]] = []
+        self.login_calls: list[tuple[str, str]] = []
+        self.list_files_calls: list[tuple[int, int]] = []
+        self.delete_calls: list[str] = []
+        self.unshare_calls: list[tuple[str, str]] = []
 
     # transport lifecycle
     def set_token(self, token: str) -> None:
@@ -108,6 +125,35 @@ class FakeCloudClient:
 
     def close(self) -> None:
         self.calls.append(("close", ()))
+
+    # auth
+    def login(self, username: str, password: str) -> str:
+        self.login_calls.append((username, password))
+        if self.login_raises is not None:
+            raise self.login_raises
+        return self.login_return
+
+    # file management
+    def list_files(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        self.list_files_calls.append((limit, offset))
+        if self.list_files_raises is not None:
+            raise self.list_files_raises
+        return self.list_files_return
+
+    def delete_file(self, file_id: str) -> None:
+        self.delete_calls.append(file_id)
+        if self.delete_raises is not None:
+            raise self.delete_raises
+
+    def get_quota(self) -> dict:
+        if self.quota_raises is not None:
+            raise self.quota_raises
+        return self.quota_return
+
+    def unshare_file(self, file_id: str, recipient: str) -> None:
+        self.unshare_calls.append((file_id, recipient))
+        if self.unshare_raises is not None:
+            raise self.unshare_raises
 
     # upload path
     def upload_init(self, filename: str, expected_chunks: int) -> str:
@@ -494,3 +540,457 @@ def test_enroll_signs_canonical_username_and_posts(
     assert keycore.verify_signature(  # type: ignore[reportAttributeAccessIssue]
         _shared_keystore.ed25519_public_key(), signing_input, self_sig
     )
+
+
+# ════════════════════ CLI-1 orchestration + UX fixes ════════════════════
+#
+# init / login / ls / rm / quota / unshare driven through CliRunner with the
+# HTTP boundary mocked (FakeCloudClient), plus the cross-cutting UX fixes:
+# RM-1 (--force/confirm), ERR-1 (clean unlock error), STDIO-1 (stdout/stderr
+# split), ORDER-1 (session before password), VAL-1 (bounds), TLS-1 (warn).
+
+
+class FakeKeyStore:
+    """Lightweight KeyStore stand-in for ``init`` (avoids the Argon2 KDF).
+
+    ``init`` orchestrates: has_keys check → password prompts → generate →
+    print public keys → lock. None of that needs a real keypair, so this
+    fake records ``generate`` and returns fixed public keys.
+    """
+
+    def __init__(self, has_keys: bool = False) -> None:
+        self.has_keys = has_keys
+        self.generated_with: str | None = None
+        self.locked = False
+
+    def generate(self, password: str) -> None:
+        self.generated_with = password
+
+    def x25519_public_key(self) -> bytes:
+        return b"\x11" * 32
+
+    def ed25519_public_key(self) -> bytes:
+        return b"\x22" * 32
+
+    def lock(self) -> None:
+        self.locked = True
+
+
+# ──────────────────────────── init ────────────────────────────
+
+
+def test_init_writes_pubkeys_to_stdout_status_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import client.cli as cli_mod
+
+    fake_ks = FakeKeyStore(has_keys=False)
+    monkeypatch.setattr(cli_mod, "_get_keystore", lambda _kf: fake_ks)
+    kf = tmp_path / ".localcloud" / "keys.enc"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--key-file", str(kf), "init"],
+        input="pw-123456\npw-123456\n",
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert fake_ks.generated_with == "pw-123456"
+    # Public keys (data) → stdout.
+    assert (b"\x11" * 32).hex() in result.stdout
+    assert (b"\x22" * 32).hex() in result.stdout
+    # Progress / status → stderr, never stdout.
+    assert "Generating identity keypair" in result.stderr
+    assert "Keys generated and saved" in result.stderr
+    assert "Generating identity keypair" not in result.stdout
+
+
+def test_init_password_mismatch_aborts_before_generate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import client.cli as cli_mod
+
+    fake_ks = FakeKeyStore(has_keys=False)
+    monkeypatch.setattr(cli_mod, "_get_keystore", lambda _kf: fake_ks)
+    kf = tmp_path / ".localcloud" / "keys.enc"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", str(kf), "init"], input="pw-one\npw-two\n"
+    )
+
+    assert result.exit_code == 1
+    assert "Passwords do not match" in result.output
+    assert fake_ks.generated_with is None  # never generated
+
+
+def test_init_refuses_when_keys_exist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import client.cli as cli_mod
+
+    fake_ks = FakeKeyStore(has_keys=True)
+    monkeypatch.setattr(cli_mod, "_get_keystore", lambda _kf: fake_ks)
+    kf = tmp_path / ".localcloud" / "keys.enc"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", str(kf), "init"])
+
+    assert result.exit_code == 1
+    assert "Keys already exist" in result.output
+    assert fake_ks.generated_with is None
+
+
+# ──────────────────────────── login ────────────────────────────
+
+
+def test_login_saves_session_and_status_to_stderr(
+    patched_cli: FakeCloudClient,
+    home: Path,
+    keyfile: str,
+) -> None:
+    patched_cli.login_return = "tok-abc"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "login", "alice"], input="password\n"
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert patched_cli.login_calls == [("alice", "password")]
+    assert (home / ".session").read_text() == "tok-abc"
+    # Status line is not machine data → stderr only.
+    assert "Login successful" in result.stderr
+    assert "Login successful" not in result.stdout
+
+
+def test_login_failure_maps_clean_error(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    patched_cli.login_raises = AuthError("bad credentials")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "login", "alice"], input="password\n"
+    )
+
+    assert result.exit_code == 1
+    assert "Login failed" in result.output
+    assert "Traceback" not in result.output
+
+
+# ──────────────────────────── ls ────────────────────────────
+
+
+def test_ls_lists_rows_on_stdout(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    patched_cli.list_files_return = [
+        {
+            "file_id": _FILE_ID,
+            "filename": "a.txt",
+            "total_bytes": 2048,
+            "visibility": 0,
+        }
+    ]
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "ls"])
+
+    assert result.exit_code == 0, result.stderr
+    assert _FILE_ID in result.stdout
+    assert "a.txt" in result.stdout
+    assert patched_cli.list_files_calls == [(50, 0)]
+
+
+def test_ls_empty_reports_no_files(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    patched_cli.list_files_return = []
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "ls"])
+    assert result.exit_code == 0
+    assert "No files found" in result.output
+
+
+@pytest.mark.parametrize("arg", ["--limit=0", "--limit=201", "--offset=-1"])
+def test_ls_rejects_out_of_range_bounds(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+    arg: str,
+) -> None:
+    """VAL-1: IntRange bounds are enforced by Click before the command runs."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "ls", arg])
+    assert result.exit_code == 2  # Click usage error
+    assert "Invalid value" in result.output
+    assert patched_cli.list_files_calls == []  # never reached the client
+
+
+def test_ls_malformed_response_clean_error(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    """ERR-2: a row missing required keys → clean message, no traceback."""
+    patched_cli.list_files_return = [{"filename": "no-file-id"}]
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "ls"])
+    assert result.exit_code == 1
+    assert "unexpected error" in result.output
+    assert "Traceback" not in result.output
+
+
+# ──────────────────────────── rm (RM-1) ────────────────────────────
+
+
+def test_rm_force_skips_prompt_and_deletes(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "rm", _FILE_ID, "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert patched_cli.delete_calls == [_FILE_ID]
+    assert "Deleted" in result.output
+    assert "cannot be undone" not in result.output  # no prompt was shown
+
+
+def test_rm_declined_aborts_without_api_call(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "rm", _FILE_ID], input="n\n")
+
+    assert result.exit_code != 0  # click.Abort
+    assert patched_cli.delete_calls == []  # destructive call never made
+    assert "cannot be undone" in result.output  # prompt was shown
+
+
+def test_rm_confirmed_deletes(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "rm", _FILE_ID], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert patched_cli.delete_calls == [_FILE_ID]
+    assert "Deleted" in result.output
+
+
+# ──────────────────────────── quota ────────────────────────────
+
+
+def test_quota_numbers_on_stdout(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    patched_cli.quota_return = {
+        "used_bytes": 1024,
+        "available_bytes": 9216,
+        "quota_bytes": 10240,
+    }
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "quota"])
+
+    assert result.exit_code == 0, result.stderr
+    assert "Used:" in result.stdout
+    assert "Available:" in result.stdout
+    assert "Total:" in result.stdout
+
+
+def test_quota_malformed_response_clean_error(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    patched_cli.quota_return = {}  # missing keys → KeyError → broad fallback
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--key-file", keyfile, "quota"])
+    assert result.exit_code == 1
+    assert "unexpected error" in result.output
+    assert "Traceback" not in result.output
+
+
+# ──────────────────────────── unshare (RM-1) ────────────────────────────
+
+
+def test_unshare_force_skips_prompt(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "unshare", _FILE_ID, "bob", "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert patched_cli.unshare_calls == [(_FILE_ID, "bob")]
+    assert "Unshared" in result.output
+
+
+def test_unshare_declined_aborts_without_api_call(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "unshare", _FILE_ID, "bob"], input="n\n"
+    )
+
+    assert result.exit_code != 0
+    assert patched_cli.unshare_calls == []
+
+
+# ──────────────────────── ORDER-1: session before password ────────────────
+
+
+def test_download_no_session_exits_before_password_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_client: FakeCloudClient,
+    tmp_path: Path,
+) -> None:
+    """ORDER-1: with no session, the command exits BEFORE prompting for the
+    key password (so the user never pays the ~1s Argon2 unlock)."""
+    import client.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_get_client", lambda _s: fake_client)
+    kf = tmp_path / ".localcloud" / "keys.enc"
+    kf.parent.mkdir(parents=True)
+    # Deliberately NO .session file next to the key file.
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--key-file", str(kf), "download", _FILE_ID, str(tmp_path / "out.bin")],
+    )
+
+    assert result.exit_code != 0
+    assert "No session" in result.output
+    assert "Key password" not in result.output  # prompt never reached
+
+
+# ──────────────────────── ERR-1: clean unlock failure ────────────────────
+
+
+def test_download_wrong_password_clean_error_no_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_client: FakeCloudClient,
+    _shared_keystore: KeyStore,
+) -> None:
+    """ERR-1: a wrong key password yields a clean stderr error + exit 1,
+    not an uncaught ValueError traceback."""
+    import client.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_get_client", lambda _s: fake_client)
+    # Use the shared keystore's REAL on-disk file so unlock runs the genuine
+    # KDF and fails on a wrong password. _get_keystore is intentionally NOT
+    # patched here, so the CLI builds a real KeyStore over this file.
+    key_file = Path(_shared_keystore.key_file)
+    (key_file.parent / ".session").write_text(_FAKE_TOKEN)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--key-file",
+            str(key_file),
+            "download",
+            _FILE_ID,
+            str(key_file.parent / "out.bin"),
+        ],
+        input="the-wrong-password\n",
+    )
+
+    assert result.exit_code == 1
+    assert "wrong password or unreadable key store" in result.output
+    assert "Traceback" not in result.output
+
+
+# ──────────────────────── STDIO-1: stdout/stderr split ────────────────────
+
+
+def test_upload_progress_to_stderr_file_id_to_stdout(
+    patched_cli: FakeCloudClient,
+    tmp_path: Path,
+    keyfile: str,
+) -> None:
+    src = tmp_path / "payload.txt"
+    src.write_bytes(b"hello world payload for the stdout/stderr split test")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--key-file", keyfile, "upload", str(src), "--visibility", "private"],
+        input=f"{_KEY_PW}\n",
+    )
+
+    assert result.exit_code == 0, result.stderr
+    # Data: the final file_id line is on stdout.
+    assert "Upload complete. File ID:" in result.stdout
+    # Progress is on stderr, NOT stdout.
+    for progress in (
+        "Initializing upload",
+        "uploaded chunk",
+        "Encrypting + uploading",
+        "Finalizing",
+    ):
+        assert progress not in result.stdout
+        assert progress in result.stderr
+
+
+# ──────────────────────── TLS-1: insecure-server warning ──────────────────
+
+
+def test_tls_warns_for_non_loopback_plain_http(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--server", "http://10.0.0.1", "--key-file", keyfile, "ls"]
+    )
+    assert "plain HTTP to a non-loopback host" in result.stderr
+
+
+def test_tls_silent_for_loopback_plain_http(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--server", "http://127.0.0.1", "--key-file", keyfile, "ls"]
+    )
+    assert "plain HTTP to a non-loopback host" not in result.stderr
+
+
+# ──────────────────────── VAL-1: filename-length guard ────────────────────
+
+
+def test_check_filename_len_rejects_overlong() -> None:
+    from client.cli import _check_filename_len
+
+    with pytest.raises(ValueError):
+        _check_filename_len("a" * 256)
+
+
+def test_check_filename_len_rejects_empty() -> None:
+    from client.cli import _check_filename_len
+
+    with pytest.raises(ValueError):
+        _check_filename_len("")
+
+
+def test_check_filename_len_accepts_valid() -> None:
+    from client.cli import _check_filename_len
+
+    _check_filename_len("normal-file.txt")  # no raise
+    _check_filename_len("a" * 255)  # boundary length is accepted

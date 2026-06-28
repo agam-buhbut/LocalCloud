@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import ipaddress
 import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import click
 
@@ -40,6 +42,67 @@ def _get_keystore(key_file: str) -> KeyStore:
 
 def _get_client(server: str) -> CloudClient:
     return CloudClient(server)
+
+
+# Mirror server/storage.py ``_MAX_FILENAME_LEN`` so the client fails fast
+# with a clean message instead of paying a full upload the server rejects.
+_MAX_FILENAME_LEN = 255
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True if ``host`` is a loopback address or the literal ``localhost``."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _warn_insecure_server(server: str) -> None:
+    """Warn (stderr, non-blocking) on plain http:// to a non-loopback host.
+
+    Client analog of pentest M-2. WireGuard is the intended transport, so a
+    non-loopback plain-HTTP target may be perfectly fine (the WG interface);
+    we only surface a heads-up, never block.
+    """
+    try:
+        parts = urlsplit(server)
+    except ValueError:
+        return
+    host = parts.hostname or ""
+    if parts.scheme == "http" and host and not _is_loopback_host(host):
+        click.echo(
+            "WARNING: plain HTTP to a non-loopback host — traffic is "
+            "unencrypted unless this is the WireGuard interface.",
+            err=True,
+        )
+
+
+def _unlock_or_exit(ks: KeyStore, password: str) -> None:
+    """Unlock ``ks``, mapping any unlock failure to a clean CLI error.
+
+    ``KeyStore.unlock`` raises ``ValueError`` on a wrong password / corrupt
+    store and ``FileNotFoundError`` on a missing key file; both would
+    otherwise escape as an uncaught traceback. Normalize to one generic
+    stderr line + exit 1 (no traceback, no password-vs-corrupt distinction).
+    """
+    try:
+        ks.unlock(password)
+    except (ValueError, FileNotFoundError):
+        click.echo("Error: wrong password or unreadable key store", err=True)
+        sys.exit(1)
+
+
+def _check_filename_len(filename: str) -> None:
+    """Reject an empty or over-long upload filename before any network work.
+
+    Raises ``ValueError``; the caller maps it to a clean stderr error.
+    """
+    if not filename or len(filename) > _MAX_FILENAME_LEN:
+        raise ValueError(
+            f"filename must be 1-{_MAX_FILENAME_LEN} characters (got {len(filename)})"
+        )
 
 
 def _atomic_write_secret(path: Path, data: str) -> None:
@@ -150,6 +213,7 @@ def cli(ctx, key_file: str, server: str):
     ctx.ensure_object(dict)
     ctx.obj["key_file"] = key_file
     ctx.obj["server"] = server
+    _warn_insecure_server(server)
 
 
 @cli.command()
@@ -168,11 +232,13 @@ def init(ctx):
         sys.exit(1)
 
     click.echo(
-        "Generating identity keypair (this may take a moment due to Argon2id)..."
+        "Generating identity keypair (this may take a moment due to Argon2id)...",
+        err=True,
     )
     try:
         ks.generate(password)
-        click.echo(f"Keys generated and saved to {ctx.obj['key_file']}")
+        # Status → stderr; the public keys are the machine-usable data → stdout.
+        click.echo(f"Keys generated and saved to {ctx.obj['key_file']}", err=True)
         click.echo(f"X25519 public key: {ks.x25519_public_key().hex()}")
         click.echo(f"Ed25519 public key: {ks.ed25519_public_key().hex()}")
     finally:
@@ -190,7 +256,7 @@ def login(ctx, username: str):
         token = client.login(username, password)
         token_path = Path(ctx.obj["key_file"]).parent / ".session"
         _atomic_write_secret(token_path, token)
-        click.echo("Login successful. Session saved.")
+        click.echo("Login successful. Session saved.", err=True)
     except (AuthError, StorageError) as e:
         click.echo(f"Login failed: {e}", err=True)
         sys.exit(1)
@@ -222,11 +288,14 @@ def enroll(ctx, username: str):
     if not ks.has_keys:
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
         sys.exit(1)
-    key_password = click.prompt("Key password", hide_input=True)
-    ks.unlock(key_password)
 
+    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock so a missing
+    # session fails fast without first prompting for + deriving the key.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
+
+    key_password = click.prompt("Key password", hide_input=True)
+    _unlock_or_exit(ks, key_password)
     try:
         try:
             canonical = canonicalize_username(username)
@@ -328,7 +397,8 @@ def _encrypt_and_upload(
     total_chunks = max(1, math.ceil(size / encryptor.chunk_size))
 
     click.echo(
-        f"Initializing upload: {filename} ({size} bytes, {total_chunks} chunks)..."
+        f"Initializing upload: {filename} ({size} bytes, {total_chunks} chunks)...",
+        err=True,
     )
     upload_id = client.upload_init(filename, total_chunks)
 
@@ -347,9 +417,9 @@ def _encrypt_and_upload(
                 "Server echoed a different chunk hash than the client "
                 "computed — possible MITM or storage corruption"
             )
-        click.echo(f"  uploaded chunk {idx + 1}/{total_chunks}")
+        click.echo(f"  uploaded chunk {idx + 1}/{total_chunks}", err=True)
 
-    click.echo("Encrypting + uploading...")
+    click.echo("Encrypting + uploading...", err=True)
     encrypted = encryptor.encrypt_file(
         src,
         filename,
@@ -364,7 +434,7 @@ def _encrypt_and_upload(
     # (server tampered, disk corruption, network bit-flip) causes finalize
     # to reject.
     client_hashes = [h.hex() for h in encrypted.chunk_hashes]
-    click.echo("Finalizing...")
+    click.echo("Finalizing...", err=True)
     file_id = client.upload_finalize(
         upload_id=upload_id,
         file_id=encrypted.header.file_id.hex(),
@@ -413,16 +483,25 @@ def upload(ctx, filepath: str, visibility: str):
     no plaintext key is written to disk. The owner later acquires the keys
     through the same server path as any recipient.
     """
+    src = Path(filepath)
+    # VAL-1: reject an empty / over-long filename before any prompt or upload.
+    try:
+        _check_filename_len(src.name)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
     ks = _get_keystore(ctx.obj["key_file"])
     if not ks.has_keys:
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
         sys.exit(1)
 
-    key_password = click.prompt("Key password", hide_input=True)
-    ks.unlock(key_password)
-
+    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
+
+    key_password = click.prompt("Key password", hide_input=True)
+    _unlock_or_exit(ks, key_password)
 
     try:
         vis = _VIS_MAP[visibility]
@@ -436,8 +515,9 @@ def upload(ctx, filepath: str, visibility: str):
                 err=True,
             )
         encryptor = FileEncryptor(ks)
-        encrypted, file_id = _encrypt_and_upload(client, encryptor, Path(filepath), vis)
+        encrypted, file_id = _encrypt_and_upload(client, encryptor, src, vis)
         _register_owner_self_keys(client, ks, encrypted, file_id)
+        # Final file_id is machine-usable data → stdout.
         click.echo(f"Upload complete. File ID: {file_id}")
     except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Upload failed: {e}", err=True)
@@ -463,7 +543,7 @@ def _fetch_metadata_and_header(
     compare (URLs are case-insensitive; Python ``str ==`` is not). (Round-3
     H8)
     """
-    click.echo(f"Fetching metadata for {file_id}...")
+    click.echo(f"Fetching metadata for {file_id}...", err=True)
     metadata = client.get_file_metadata(file_id)
     header_bytes = bytes.fromhex(metadata["file_header"])
     enc_meta = bytes.fromhex(metadata["encrypted_metadata"])
@@ -500,12 +580,13 @@ def download(
     """
     from client.keymgmt import acquire_file_keys
 
-    ks = _get_keystore(ctx.obj["key_file"])
-    key_password = click.prompt("Key password", hide_input=True)
-    ks.unlock(key_password)
-
+    # ORDER-1: validate the session BEFORE prompting for + deriving the key.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
+
+    ks = _get_keystore(ctx.obj["key_file"])
+    key_password = click.prompt("Key password", hide_input=True)
+    _unlock_or_exit(ks, key_password)
 
     try:
         header_bytes, enc_meta, total_chunks, _header = _fetch_metadata_and_header(
@@ -521,13 +602,13 @@ def download(
         # any later substitution of the owner key for this file is refused
         # fail-closed. --sender-pubkey supplies an out-of-band key for
         # first-use authentication. One path, fail-closed.
-        click.echo("Acquiring and unwrapping file keys...")
+        click.echo("Acquiring and unwrapping file keys...", err=True)
         file_key, meta_key = acquire_file_keys(client, ks, file_id)
         sig_pubkey, canonical_fid = _resolve_owner_pubkey(
             client, file_id, sender_pubkey, owner_pins
         )
 
-        click.echo("Decrypting and verifying...")
+        click.echo("Decrypting and verifying...", err=True)
         encryptor = FileEncryptor(ks)
         encryptor.decrypt_file(
             input_chunks=client.iter_chunks(file_id, total_chunks),
@@ -557,8 +638,13 @@ def download(
 
 
 @cli.command("ls")
-@click.option("--limit", default=50, type=int, help="Page size (max 200).")
-@click.option("--offset", default=0, type=int)
+@click.option(
+    "--limit",
+    default=50,
+    type=click.IntRange(1, 200),
+    help="Page size (1-200).",
+)
+@click.option("--offset", default=0, type=click.IntRange(min=0))
 @click.pass_context
 def list_files(ctx, limit: int, offset: int):
     """List accessible files."""
@@ -579,8 +665,13 @@ def list_files(ctx, limit: int, offset: int):
             tb = f.get("total_bytes")
             size = _format_size(tb) if tb is not None else "—"
             click.echo(f"{f['file_id']:<40} {f['filename']:<30} {size:>12} {vis:<10}")
-    except (StorageError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Failed: {e}", err=True)
+        sys.exit(1)
+    except Exception:
+        # ERR-2: a hostile/malformed response (e.g. missing/odd fields) must
+        # not escape as a raw traceback.
+        click.echo("Failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         client.close()
@@ -588,17 +679,36 @@ def list_files(ctx, limit: int, offset: int):
 
 @cli.command("rm")
 @click.argument("file_id")
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Skip the confirmation prompt.",
+)
 @click.pass_context
-def remove_file(ctx, file_id: str):
+def remove_file(ctx, file_id: str, force: bool):
     """Delete a file."""
+    # RM-1: irreversible — confirm (prompt → stderr) unless --force. A
+    # declined confirm aborts BEFORE any client/session work, so no API
+    # call is made.
+    if not force:
+        click.confirm(
+            f"Delete {file_id}? This cannot be undone.",
+            abort=True,
+            err=True,
+        )
+
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
 
     try:
         client.delete_file(file_id)
         click.echo(f"Deleted {file_id}")
-    except (StorageError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Delete failed: {e}", err=True)
+        sys.exit(1)
+    except Exception:
+        click.echo("Delete failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         client.close()
@@ -616,8 +726,12 @@ def quota(ctx):
         click.echo(f"Used:      {_format_size(info['used_bytes'])}")
         click.echo(f"Available: {_format_size(info['available_bytes'])}")
         click.echo(f"Total:     {_format_size(info['quota_bytes'])}")
-    except (StorageError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Failed: {e}", err=True)
+        sys.exit(1)
+    except Exception:
+        # ERR-2: malformed quota payload must not surface as a raw traceback.
+        click.echo("Failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         client.close()
@@ -661,11 +775,13 @@ def share(
     if not ks.has_keys:
         click.echo("Error: No keys found.", err=True)
         sys.exit(1)
-    key_password = click.prompt("Key password", hide_input=True)
-    ks.unlock(key_password)
 
+    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
+
+    key_password = click.prompt("Key password", hide_input=True)
+    _unlock_or_exit(ks, key_password)
     try:
         if recipient_pubkey is not None:
             # Explicit out-of-band override: the operator vouches for this
@@ -705,6 +821,10 @@ def share(
     except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Share failed: {e}", err=True)
         sys.exit(1)
+    except Exception:
+        # ERR-2: an unexpected transport/parse error stays a clean message.
+        click.echo("Share failed: unexpected error", err=True)
+        sys.exit(1)
     finally:
         ks.lock()
         client.close()
@@ -713,21 +833,39 @@ def share(
 @cli.command()
 @click.argument("file_id")
 @click.argument("recipient")
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Skip the confirmation prompt.",
+)
 @click.pass_context
-def unshare(ctx, file_id: str, recipient: str):
+def unshare(ctx, file_id: str, recipient: str, force: bool):
     """Revoke a previously-granted share for a recipient.
 
     Server-side revocation only — anyone who already downloaded the
     wrapped keys still has them offline. For true revocation, re-upload
     the file (which generates a new file_key). (Round-3 M9)
     """
+    # RM-1: confirm (prompt → stderr) unless --force. A declined confirm
+    # aborts BEFORE any client/session work, so no API call is made.
+    if not force:
+        click.confirm(
+            f"Revoke {recipient}'s access to {file_id}?",
+            abort=True,
+            err=True,
+        )
+
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
     try:
         client.unshare_file(file_id, recipient)
         click.echo(f"Unshared {file_id} from {recipient}")
-    except (StorageError, AuthError) as e:
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Unshare failed: {e}", err=True)
+        sys.exit(1)
+    except Exception:
+        click.echo("Unshare failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         client.close()
@@ -765,11 +903,13 @@ def migrate_keys(ctx, key_cache: str | None):
     if not ks.has_keys:
         click.echo("Error: No keys found. Run 'localcloud init' first.", err=True)
         sys.exit(1)
-    key_password = click.prompt("Key password", hide_input=True)
-    ks.unlock(key_password)
 
+    # ORDER-1: validate the session BEFORE the ~1s Argon2 unlock.
     client = _get_client(ctx.obj["server"])
     _load_session(ctx, client)
+
+    key_password = click.prompt("Key password", hide_input=True)
+    _unlock_or_exit(ks, key_password)
 
     try:
         own_x25519 = ks.x25519_public_key()
