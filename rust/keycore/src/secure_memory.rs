@@ -52,7 +52,10 @@ pub fn is_zero_32(a: &[u8; 32]) -> bool {
 ///
 /// This prevents key material from appearing in core dump files.
 pub fn disable_core_dumps() -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+    // Android is target_os="android" (NOT "linux") but has bionic prctl, so it
+    // must take the prctl path too — otherwise core-dump suppression silently
+    // no-ops on Android. (feasibility study 2026-06-28)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         const PR_SET_DUMPABLE: libc::c_int = 4;
         let ret = unsafe { libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) };
@@ -64,10 +67,10 @@ pub fn disable_core_dumps() -> Result<(), String> {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // On non-Linux, we can't use prctl but we still continue
-        // The caller should be aware that core dump prevention may not work
+        // On platforms without prctl we can't suppress core dumps; continue.
+        // The caller should be aware that core dump prevention may not work.
     }
 
     Ok(())
