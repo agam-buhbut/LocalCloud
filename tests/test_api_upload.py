@@ -126,6 +126,57 @@ async def test_upload_init_chunk_finalize_happy_path(
     assert enc.file_id_hex in ids
 
 
+async def test_finalize_releases_claim_on_abnormal_exit(
+    app: Quart,
+    make_keyed_client: Callable[..., Awaitable[KeyedClient]],
+    encrypt_file: Callable[..., EncryptedUpload],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abnormal exit after the finalizing-claim must NOT strand finalizing=1.
+
+    The claim commits in its own transaction; a stranded finalizing=1 row is
+    excluded from every per-user staging predicate (get_total_staging_bytes /
+    count_open_uploads / the reclaim sweep), so its on-disk bytes would leak
+    past the quota — a bounded DoS (pentest 2026-06-29 MEDIUM, originally
+    triggered by asyncio.CancelledError on client disconnect, a BaseException
+    that bypasses the commit path's `except Exception`). The post-claim section
+    is now wrapped in try/finally that releases the claim on any non-terminal
+    exit; here we inject a post-claim failure and assert the claim is cleared.
+    """
+    owner = await make_keyed_client()
+    enc = encrypt_file(owner.keystore, _MULTI_CHUNK_DATA)
+    init = await owner.authed.post(
+        "/api/files/upload/init",
+        json={"filename": "file.bin", "expected_chunks": enc.total_chunks},
+    )
+    upload_id = (await init.get_json())["upload_id"]
+    for idx, blob in enumerate(enc.chunk_blobs):
+        chunk = await owner.authed.client.post(
+            f"/api/files/upload/{upload_id}/chunk/{idx}",
+            data=blob,
+            headers={
+                "Authorization": f"Bearer {owner.authed.token}",
+                "Content-Type": "application/octet-stream",
+            },
+            scope_base={"client": (owner.authed.peer_host, TEST_PEER_PORT)},
+        )
+        assert chunk.status_code == 200
+
+    # Blow up the post-claim section AFTER the finalizing claim has committed.
+    def _boom(_uid: str) -> object:
+        raise RuntimeError("injected post-claim failure")
+
+    monkeypatch.setattr(app.db, "get_staging_chunks", _boom)  # type: ignore[attr-defined]
+
+    fin = await _finalize(owner.authed, upload_id, enc)
+    assert fin.status_code == 500  # the injected error propagates
+
+    # The claim MUST have been released by the finally — not stranded at 1.
+    row = app.db.get_staging_upload(upload_id)  # type: ignore[attr-defined]
+    assert row is not None
+    assert not row["finalizing"], "finalizing claim was stranded (cap-invisible leak)"
+
+
 # ──────────────────────────── init validation ────────────────────────────
 
 

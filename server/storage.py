@@ -900,33 +900,57 @@ async def upload_finalize(upload_id: str):
         # earlier expiry sweep that won the race.
         return jsonify({"error": "Upload expired"}), 410
 
-    staged_chunks = await asyncio.to_thread(state.db.get_staging_chunks, upload_id)
-    if not _verify_staged_chunks(staged_chunks, req):
-        await asyncio.to_thread(_cleanup_staging, upload_id)
-        return jsonify({"error": "Invalid request"}), 400
+    # The claim above set finalizing=1 in its own committed transaction. The
+    # rest of this handler MUST release it on every non-terminal exit, or the
+    # row strands at finalizing=1 — which is excluded from every per-user staging
+    # predicate (get_total_staging_bytes / count_open_uploads / the reclaim
+    # sweep), so its on-disk bytes leak past the quota (a second user could
+    # exhaust the box). The gap is asyncio.CancelledError on a client disconnect:
+    # it is a BaseException, so it bypasses _run_finalize_commit's
+    # `except Exception` release. Guard the whole post-claim section.
+    # (pentest 2026-06-29 MEDIUM)
+    resolved = False
+    try:
+        staged_chunks = await asyncio.to_thread(state.db.get_staging_chunks, upload_id)
+        if not _verify_staged_chunks(staged_chunks, req):
+            await asyncio.to_thread(_cleanup_staging, upload_id)
+            resolved = True
+            return jsonify({"error": "Invalid request"}), 400
 
-    # The DB-only check above can pass while a chunk's {idx}.bin is absent: the
-    # staging_chunks row commits before the promote, so a failed promote leaves
-    # a committed row with no file. The finalize dir-rename would then publish a
-    # blob missing a chunk. Confirm every expected file is on disk first; if any
-    # is missing, discard the staging dir and reject so the client re-uploads.
-    if not await asyncio.to_thread(
-        _staged_chunk_files_present, state.staging_dir, upload_id, req.total_chunks
-    ):
-        await asyncio.to_thread(_cleanup_staging, upload_id)
-        return jsonify({"error": "Invalid request"}), 409
+        # The DB-only check above can pass while a chunk's {idx}.bin is absent:
+        # the staging_chunks row commits before the promote, so a failed promote
+        # leaves a committed row with no file. The finalize dir-rename would then
+        # publish a blob missing a chunk. Confirm every expected file is on disk
+        # first; if any is missing, discard the staging dir and reject so the
+        # client re-uploads.
+        if not await asyncio.to_thread(
+            _staged_chunk_files_present, state.staging_dir, upload_id, req.total_chunks
+        ):
+            await asyncio.to_thread(_cleanup_staging, upload_id)
+            resolved = True
+            return jsonify({"error": "Invalid request"}), 409
 
-    total_bytes = sum(c["chunk_size"] for c in staged_chunks)
-    total_bytes += len(req.encrypted_metadata) + len(req.file_header)
+        total_bytes = sum(c["chunk_size"] for c in staged_chunks)
+        total_bytes += len(req.encrypted_metadata) + len(req.file_header)
 
-    return await _run_finalize_commit(
-        state,
-        upload_id=upload_id,
-        owner_id=identity.user_id,
-        filename=upload["filename"],
-        req=req,
-        total_bytes=total_bytes,
-    )
+        result = await _run_finalize_commit(
+            state,
+            upload_id=upload_id,
+            owner_id=identity.user_id,
+            filename=upload["filename"],
+            req=req,
+            total_bytes=total_bytes,
+        )
+        resolved = True
+        return result
+    finally:
+        if not resolved:
+            # Release the claim even while being cancelled: shield the DB write
+            # so it completes despite this coroutine's cancellation (the await
+            # itself re-raises CancelledError, which is the correct outcome).
+            await asyncio.shield(
+                asyncio.to_thread(state.db.clear_finalizing, upload_id)
+            )
 
 
 # ──────────────────────────── Download API ────────────────────────────
