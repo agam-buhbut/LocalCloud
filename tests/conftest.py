@@ -101,6 +101,16 @@ def app(
     from server.app import create_app
 
     application = create_app(_test_server_config(tmp_data_dir, session_secret))
+    # P1: create_app → init_auth calibrates the (process-global) timing budget
+    # from a measured Argon2id op. Under the test runner that measures the REAL
+    # hasher (fast_argon2 swaps it per-test, usually AFTER this fixture), which
+    # would inflate the budget and make every equalized endpoint pad to
+    # ~real-argon2 seconds. Reset to the floor here — after init_auth, before the
+    # test body — so calibration never slows the suite. Tests that need a
+    # specific budget monkeypatch TIMING_BUDGET_S in their own body.
+    import server.timing as _timing_mod
+
+    monkeypatch.setattr(_timing_mod, "TIMING_BUDGET_S", 0.150)
     try:
         yield application
     finally:

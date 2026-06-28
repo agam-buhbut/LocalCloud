@@ -24,6 +24,7 @@ state isolated per test.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 from quart import Quart
@@ -307,6 +308,37 @@ async def test_disabled_user_token_rejected(
     after = await auth_client.get("/api/files")
     assert after.status_code == 401
     assert await after.get_json() == {"error": "Authentication required"}
+
+
+async def test_login_reject_honors_live_timing_budget(
+    client: QuartClient,
+    monkeypatch,
+) -> None:
+    """P1: an early-reject login pads to the LIVE timing budget, not a snapshot.
+
+    Before the fix the reject path slept a fixed import-time copy of the budget,
+    IGNORING a raised ``TIMING_BUDGET_S``; on hardware where Argon2id > 150 ms
+    the rate-limited / early-reject 401s finished sooner than a real verify and
+    leaked rate-limit state by latency (pentest 2026-06-28 P1). Raise the budget
+    above the historical 150 ms snapshot and assert a reject — which runs NO
+    Argon2id — still honors it. Fails before the fix (it would sleep ~150 ms).
+    """
+    import server.timing as timing_mod
+
+    floor = 0.30  # above the historical 0.150 import snapshot
+    monkeypatch.setattr(timing_mod, "TIMING_BUDGET_S", floor)
+
+    t0 = time.monotonic()
+    # Missing "password" → early reject, AFTER the peer check, BEFORE any Argon2id.
+    resp = await client.post(
+        "/api/auth/login",
+        json={"username": "x"},
+        scope_base={"client": ("10.0.0.55", TEST_PEER_PORT)},
+    )
+    dt = time.monotonic() - t0
+
+    assert resp.status_code == 401
+    assert dt >= floor - 0.02  # padded to the live deadline, not the old snapshot
 
 
 async def test_missing_bearer_header_rejected(client: QuartClient) -> None:

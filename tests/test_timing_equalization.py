@@ -269,6 +269,34 @@ async def test_unshare_applies_constant_deadline_floor(
     assert dt_unknown >= floor - 0.01
 
 
+# ──────────────────────── budget calibration (P1) ────────────────────────
+
+
+def test_calibrate_budget_raises_to_measured_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1: calibrate_budget raises the budget to the measured Argon2id cost.
+
+    0.250 s verify * 1.30 margin = 0.325 s, well above the 0.150 floor, so the
+    budget rises to it — closing the latency gap between the Argon2id paths and
+    the early-reject / rate-limit paths.
+    """
+    monkeypatch.setattr(timing_mod, "TIMING_BUDGET_S", 0.150)
+    out = timing_mod.calibrate_budget(0.250)
+    assert out == timing_mod.TIMING_BUDGET_S
+    assert out == pytest.approx(0.325)  # 0.250 * 1.30 margin
+
+
+def test_calibrate_budget_never_lowers_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fast CPU keeps the 150 ms floor; a non-positive measurement is a no-op."""
+    monkeypatch.setattr(timing_mod, "TIMING_BUDGET_S", 0.150)
+    assert timing_mod.calibrate_budget(0.010) == 0.150  # 0.010 * 1.30 < floor
+    assert timing_mod.calibrate_budget(0.0) == 0.150
+    assert timing_mod.calibrate_budget(-1.0) == 0.150
+
+
 # ``storage_mod`` is imported so a future refactor that drops the helpers
 # this test relies on (``_apply_share`` / ``_apply_unshare``) fails loudly
 # here rather than silently weakening the equalization.

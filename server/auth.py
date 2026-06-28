@@ -21,7 +21,7 @@ from quart import Blueprint, g, jsonify, request
 
 from server.database import Database
 from server.state import Identity, app_state
-from server.timing import TIMING_BUDGET_S
+from server.timing import calibrate_budget, sleep_until_deadline
 from shared.crypto import hash_password, verify_password
 from shared.exceptions import AuthError, RateLimitError, SessionExpiredError
 from shared.usernames import canonicalize_username as _canonicalize_username
@@ -36,20 +36,18 @@ _MAX_TOKEN_LEN = 4096
 # tie up Argon2 budget by submitting megabyte-sized "passwords".
 _LOGIN_MAX_CONTENT_LENGTH = 4096
 
-# Constant sleep budget applied to every early-reject path (oversized
-# body, wrong content-type, missing peer, malformed JSON, over-length
-# password, rate-limit trip). Its job is to CAP the timing variance among
-# those early rejects — NOT to match the full Argon2id verify path. A real
-# verify costs ~250 ms (memory-hard Argon2id), which is longer than this
-# ~150 ms budget, so an early reject is deliberately NOT made
-# indistinguishable from a completed auth failure that ran Argon2id. What
-# actually closes the username-enumeration oracle is that BOTH existing and
-# non-existent users run Argon2id (the real stored hash vs. a dummy hash);
-# this constant only bounds residual variance among the pre-verify rejects.
-# Sourced from the shared TIMING_BUDGET_S (~150 ms — the same constant the
-# share/unshare/directory equalized paths use) so all equalized endpoints
-# share one budget value.
-_RATE_LIMIT_SLEEP_SECONDS = TIMING_BUDGET_S
+# Login timing equalization (P1, 2026-06-28). EVERY login return — early
+# reject (oversized body, wrong content-type, missing peer, malformed JSON,
+# over-length password), rate-limit trip, Argon2id failure, AND success — is
+# padded to a single constant deadline via timing.sleep_until_deadline(started),
+# where `started` is snapshotted at the top of login(). The deadline is
+# calibrate_budget()-raised at startup to >= the real Argon2id verify cost, so a
+# path that SKIPS Argon2id (rate-limited / early reject) can no longer finish
+# measurably sooner than one that runs it. The old design used a flat
+# import-time sleep (~150 ms) that, on hardware where Argon2id takes ~250 ms,
+# left the non-Argon2 paths ~100 ms faster and leaked rate-limit state by
+# latency. Username enumeration is additionally closed by running Argon2id on
+# BOTH existing and unknown users (real hash vs. dummy hash).
 
 # Dummy Argon2id hash used to equalize timing on unknown-username
 # logins. Computed lazily on first use so that importing this module is
@@ -450,7 +448,14 @@ def init_auth(
     # event loop and creating a cold-start timing artifact that distinguishes
     # the first unknown-user probe from later ones. Runs once; subsequent
     # calls are a cheap no-op (the hash is cached process-wide).
+    #
+    # P1: time this once-per-process warm-up and calibrate the login timing
+    # budget to this deployment's real Argon2id cost (hash and verify cost the
+    # same for the same params). Reuses the warm-up op — no extra Argon2id work.
+    # On later inits the cached no-op makes dt ~= 0 and calibrate_budget a no-op.
+    _warm_start = time.monotonic()
     _get_dummy_hash()
+    calibrate_budget(time.monotonic() - _warm_start)
 
 
 def _get_peer_identity() -> str:
@@ -632,6 +637,9 @@ async def login():
               attacker cannot probe rate-limit state. (#H12)
     """
     state = app_state()
+    # Snapshot BEFORE any existence-dependent work so EVERY return path can be
+    # padded to the same constant deadline (P1) — see the module comment above.
+    started = time.monotonic()
 
     # Cap pre-parse body size so an oversized "password" can't consume
     # Argon2 budget. (medium)
@@ -639,26 +647,26 @@ async def login():
         request.content_length is not None
         and request.content_length > _LOGIN_MAX_CONTENT_LENGTH
     ):
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # Require explicit JSON content type. Return uniform 401 (not 415)
     # so an attacker can't probe rate-limit state by alternating
     # content-types. (Round-3 H7)
     if not request.is_json:
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # Validate peer identity BEFORE doing any expensive work. If we
     # can't bind a session, we won't mint one. (#H9)
     peer_id = _get_peer_identity()
     if not peer_id:
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     data = await request.get_json(silent=True)
     if not data or "username" not in data or "password" not in data:
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # Canonicalize username BEFORE the DB lookup. Invalid usernames
@@ -667,12 +675,12 @@ async def login():
     try:
         username = _canonicalize_username(str(data["username"]))
     except AuthError:
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     password = str(data["password"])
     if len(password) > 1024:
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # Composite-key rate limit (#H11). Authoritative — runs BEFORE the
@@ -681,7 +689,7 @@ async def login():
     if await _composite_rate_limit_check(
         peer_id, username, state.rate_limit_max, state.rate_limit_window
     ):
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # Legacy DB-level rate limit (#6): kept as defense-in-depth for
@@ -697,7 +705,7 @@ async def login():
             state.rate_limit_window,
         )
     except RateLimitError:
-        await asyncio.sleep(_RATE_LIMIT_SLEEP_SECONDS)
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # Look up user. To prevent a timing side-channel that enumerates
@@ -746,6 +754,7 @@ async def login():
             max_rows_per_window=_login_attempt_row_cap(state.rate_limit_max),
             window_seconds=state.rate_limit_window,
         )
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
     # #6: Successful login — clear previous failed attempts at both layers
@@ -768,8 +777,12 @@ async def login():
     except ValueError:
         # Should never trigger given the peer_id guard above. Fail
         # generically rather than reveal the internal contract.
+        await sleep_until_deadline(started)
         return _auth_failure_response()
 
+    # Pad the SUCCESS path to the same deadline too, so success vs. failure
+    # latency carries no signal beyond the (already-revealing) status code. (P1)
+    await sleep_until_deadline(started)
     return jsonify({"token": token}), 200
 
 

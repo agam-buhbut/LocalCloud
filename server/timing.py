@@ -17,12 +17,22 @@ from __future__ import annotations
 import asyncio
 import time
 
-# Constant timing budget for every equalized endpoint, in seconds. ~150 ms
-# is in the same ballpark as a server-side Argon2id verify on commodity
-# hardware, so a rate-limit / unknown-user reject is indistinguishable from
-# a real verify. The login path historically used this exact value as its
-# flat post-reject sleep; share/unshare/directory use it as a deadline.
+# Timing budget (seconds) for every equalized endpoint: a FLOOR that
+# calibrate_budget() raises at startup to the deployment's real Argon2id cost.
+# 150 ms was the original flat value, assuming "Argon2id verify ~= 150 ms on
+# commodity hardware". The 2026-06-28 hardware pentest (P1) measured ~250 ms on
+# the target CPU, so the non-Argon2 paths (rate-limit / early reject) finished
+# ~100 ms sooner than a real verify and leaked rate-limit state by latency. The
+# server now calibrates this UP from a measured Argon2id op at startup so every
+# equalized path shares one budget >= the real verify cost. share / unshare /
+# directory use it as a deadline; the login path now does too (see auth.login).
 TIMING_BUDGET_S: float = 0.150
+
+# Headroom over the measured Argon2id cost. Covers CPU/scheduler/contention
+# variance so a real verify rarely overruns the budget (an overrun re-opens the
+# gap for that one request). Login is not latency-sensitive, so padding every
+# auth to ~Argon2id*MARGIN is acceptable.
+_BUDGET_MARGIN: float = 1.30
 
 
 async def sleep_until_deadline(started: float, budget: float | None = None) -> None:
@@ -50,3 +60,25 @@ async def sleep_until_deadline(started: float, budget: float | None = None) -> N
     remaining = budget - (time.monotonic() - started)
     if remaining > 0:
         await asyncio.sleep(remaining)
+
+
+def calibrate_budget(measured_argon2_seconds: float) -> float:
+    """Raise the equalization budget to cover the real Argon2id cost. (P1)
+
+    Sets the module-global ``TIMING_BUDGET_S`` to
+    ``max(current, measured * _BUDGET_MARGIN)``. It never LOWERS the floor, so a
+    fast CPU keeps the 150 ms minimum while a slow one is padded up to match its
+    own verify cost — closing the latency gap between the Argon2id paths and the
+    early-reject / rate-limit paths that leaked rate-limit state (pentest P1).
+    Monotonic and idempotent: a later call with a smaller (or non-positive)
+    measurement is a no-op. Returns the resulting budget.
+
+    Args:
+        measured_argon2_seconds: wall-clock of one representative Argon2id op
+            (hash or verify — equivalent cost for the same params), measured
+            once at startup.
+    """
+    global TIMING_BUDGET_S
+    if measured_argon2_seconds > 0:
+        TIMING_BUDGET_S = max(TIMING_BUDGET_S, measured_argon2_seconds * _BUDGET_MARGIN)
+    return TIMING_BUDGET_S
