@@ -110,6 +110,7 @@ class FakeCloudClient:
         self.quota_raises: Exception | None = None
         self.delete_raises: Exception | None = None
         self.unshare_raises: Exception | None = None
+        self.enroll_raises: Exception | None = None
         # Captured payloads for assertions.
         self.self_keys_calls: list[tuple[str, bytes]] = []
         self.enroll_calls: list[tuple[bytes, bytes]] = []
@@ -191,6 +192,8 @@ class FakeCloudClient:
     # directory path
     def enroll_x25519(self, x25519_pubkey: bytes, self_sig: bytes) -> None:
         self.enroll_calls.append((x25519_pubkey, self_sig))
+        if self.enroll_raises is not None:
+            raise self.enroll_raises
 
     # sharing path
     def share_file(self, file_id: str, recipient: str, wrapped: bytes) -> None:
@@ -356,6 +359,35 @@ def test_migrate_keys_skips_corrupt_json_without_deleting(
     assert "SKIP" in result.output
     assert "Migrated 0" in result.output
     assert patched_cli.self_keys_calls == []
+
+
+def test_migrate_keys_transport_error_clean_message(
+    patched_cli: FakeCloudClient,
+    home: Path,
+    keyfile: str,
+    _shared_keystore: KeyStore,
+) -> None:
+    """ERR-2: migrate-keys against an unreachable server → clean exit 1.
+
+    A transport-level error from ``post_self_keys`` is not one of the typed
+    errors the per-cache handler catches, so before the fix it escaped the
+    outer try as a raw traceback. It must now surface a clean 'Migration
+    failed' message + exit 1, and — fail-closed — leave the cache intact since
+    the POST never completed.
+    """
+    cache_path = _write_cache(home, _FILE_ID, _shared_keystore)
+    patched_cli.post_self_keys_raises = ConnectionRefusedError("connection refused")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "migrate-keys"], input=f"{_KEY_PW}\n"
+    )
+
+    assert result.exit_code == 1
+    assert "Migration failed" in result.output
+    assert "Traceback" not in result.output
+    # Fail-closed: the user's only copy of the keys survives the failure.
+    assert cache_path.exists()
 
 
 # ──────────────────────────── upload ────────────────────────────
@@ -540,6 +572,31 @@ def test_enroll_signs_canonical_username_and_posts(
     assert keycore.verify_signature(  # type: ignore[reportAttributeAccessIssue]
         _shared_keystore.ed25519_public_key(), signing_input, self_sig
     )
+
+
+def test_enroll_transport_error_clean_message(
+    patched_cli: FakeCloudClient,
+    keyfile: str,
+) -> None:
+    """ERR-2: enroll against an unreachable server → clean message + exit 1.
+
+    A transport-level failure (connection refused / DNS / timeout) is NOT one
+    of the typed (StorageError/CryptoError/AuthError/ProtocolError) errors, so
+    before the fix it escaped as a raw traceback. It must now surface a clean
+    'Enroll failed' line and exit 1.
+    """
+    patched_cli.enroll_raises = ConnectionRefusedError("connection refused")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--key-file", keyfile, "enroll", "bob"], input=f"{_KEY_PW}\n"
+    )
+
+    assert result.exit_code == 1
+    assert "Enroll failed" in result.output
+    assert "Traceback" not in result.output
+    # The POST was attempted (it raised the transport error).
+    assert len(patched_cli.enroll_calls) == 1
 
 
 # ════════════════════ CLI-1 orchestration + UX fixes ════════════════════
@@ -948,28 +1005,35 @@ def test_upload_progress_to_stderr_file_id_to_stdout(
 
 
 # ──────────────────────── TLS-1: insecure-server warning ──────────────────
+#
+# The warning now fires at connection-open (CloudClient.__init__), at most
+# once per process — not from the CLI group callback. The connection-level
+# "warns exactly once / silent for loopback" behaviour is pinned in
+# tests/test_api_client.py against the REAL client; here we pin the CLI-level
+# property that a purely-local command (``init``) never opens a connection and
+# therefore emits NO warning, even against a non-loopback plain-http server.
 
 
-def test_tls_warns_for_non_loopback_plain_http(
-    patched_cli: FakeCloudClient,
-    keyfile: str,
+def test_init_emits_no_insecure_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    import client.cli as cli_mod
+
+    fake_ks = FakeKeyStore(has_keys=False)
+    monkeypatch.setattr(cli_mod, "_get_keystore", lambda _kf: fake_ks)
+    kf = tmp_path / ".localcloud" / "keys.enc"
+
     runner = CliRunner()
     result = runner.invoke(
-        cli, ["--server", "http://10.0.0.1", "--key-file", keyfile, "ls"]
+        cli,
+        ["--server", "http://10.0.0.1", "--key-file", str(kf), "init"],
+        input="pw-123456\npw-123456\n",
     )
-    assert "plain HTTP to a non-loopback host" in result.stderr
 
-
-def test_tls_silent_for_loopback_plain_http(
-    patched_cli: FakeCloudClient,
-    keyfile: str,
-) -> None:
-    runner = CliRunner()
-    result = runner.invoke(
-        cli, ["--server", "http://127.0.0.1", "--key-file", keyfile, "ls"]
-    )
-    assert "plain HTTP to a non-loopback host" not in result.stderr
+    assert result.exit_code == 0, result.output
+    # init opens no connection → no insecure-server warning at all.
+    assert "plain HTTP to a non-loopback host" not in result.output
 
 
 # ──────────────────────── VAL-1: filename-length guard ────────────────────

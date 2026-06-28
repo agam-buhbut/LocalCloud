@@ -121,9 +121,10 @@ class KeyStore:
             )
 
         with self._lock:
-            # Bound the read size via a single fd-bound syscall —
-            # `stat()` + `read_bytes()` is TOCTOU. Same approach as
-            # shared.io.read_capped used in the CLI. (Round-6 M)
+            # Bound the read size with an fd-bound read loop (tolerates short
+            # reads, rejects over-cap) rather than `stat()` + `read_bytes()`,
+            # which is TOCTOU. Same shared.io.read_capped used in the CLI.
+            # (Round-6 M)
             from shared.io import read_capped
 
             _MAX_STORE_BYTES = 16 * 1024

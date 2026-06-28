@@ -297,3 +297,47 @@ def test_login_missing_token_raises(client: CloudClient) -> None:
     _mock(client, lambda req: httpx.Response(200, json={"not_token": "x"}))
     with pytest.raises(AuthError, match="no session token"):
         client.login("alice", "pw")
+
+
+# ── TLS-1: insecure-transport warning fires at connection-open, at most once ──
+
+
+def test_insecure_warning_fires_once_for_non_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A connecting client to plain http://<non-loopback> warns exactly once.
+
+    The warning fires in CloudClient.__init__ (connection-open) and is latched
+    process-wide, so a SECOND client to the same server in the same process
+    stays silent.
+    """
+    import client.api_client as api_mod
+
+    monkeypatch.setattr(api_mod, "_INSECURE_WARNING_EMITTED", False)
+    c1 = CloudClient("http://10.0.0.1:8443")
+    c2 = CloudClient("http://10.0.0.1:8443")
+    try:
+        err = capsys.readouterr().err
+    finally:
+        c1.close()
+        c2.close()
+    assert err.count("plain HTTP to a non-loopback host") == 1
+
+
+def test_insecure_warning_silent_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A loopback plain-http target never warns and never consumes the latch."""
+    import client.api_client as api_mod
+
+    monkeypatch.setattr(api_mod, "_INSECURE_WARNING_EMITTED", False)
+    c = CloudClient("http://127.0.0.1:8443")
+    try:
+        err = capsys.readouterr().err
+    finally:
+        c.close()
+    assert "plain HTTP to a non-loopback host" not in err
+    # The loopback connection left the one-shot latch unused.
+    assert api_mod._INSECURE_WARNING_EMITTED is False

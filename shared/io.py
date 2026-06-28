@@ -23,11 +23,14 @@ def read_capped(path: Path, cap: int) -> bytes:
     bytes read — the path is never re-resolved, closing the TOCTOU window a
     ``stat()`` + ``read_bytes()`` pair would leave open.
 
-    Refuses anything that is not a regular file (directory, FIFO, device,
-    socket): those have no meaningful byte length and an ``os.read`` on them
-    can block or misbehave. Reads in a loop because a single ``os.read`` may
-    short-read; at most ``cap + 1`` bytes are read so an over-cap file is
-    detected and rejected rather than silently truncated.
+    Refuses anything that is not a regular file (directory, device, socket):
+    those open without blocking but have no meaningful byte length, so the
+    ``S_ISREG`` check rejects them after the open. A FIFO is the special case —
+    in the default blocking mode ``os.open`` itself blocks until a writer
+    appears, so a writer-less FIFO never reaches the ``S_ISREG`` check at all.
+    Reads in a loop because a single ``os.read`` may short-read; at most
+    ``cap + 1`` bytes are read so an over-cap file is detected and rejected
+    rather than silently truncated.
 
     Raises:
         ValueError: if ``path`` is not a regular file, or its content is

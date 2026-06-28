@@ -27,7 +27,7 @@ the (encrypted) metadata and use opaque filenames.
 | Adversary | Outcome | Mechanism |
 |---|---|---|
 | Random internet scanner | sees nothing | only the WG UDP port is open, and only while online; default-deny nftables |
-| Brute-force login | bounded | server-side Argon2id + per-username rate limiting + WG-key prerequisite |
+| Brute-force login | bounded per peer | server-side Argon2id + the authoritative composite (peer, username) in-memory limiter + a per-(peer, username) and a per-peer-IP DB gate + WG-key prerequisite. Rate limits are **peer-scoped** (AUTH-1): one WireGuard peer can no longer lock another peer out of an account (cross-peer lockout DoS), but consequently a brute-force ceiling against a single account scales with the number of *provisioned* WG peers (N peers ⇒ up to N × max_attempts), each peer itself Argon2id- and rate-limit-bounded. Acceptable under the single-tunnel WG model where peers are explicitly enrolled. |
 | **Server compromise (reads data at rest)** | **cannot read contents or non-filename metadata** | E2EE terminates on the client; the server never holds file/meta keys in plaintext (owner keys are wrapped to the owner's own X25519) |
 | Disk theft (powered off) | nothing | LUKS2 + encrypted LVM, console-only unlock, no keyfile/TPM auto-unlock |
 | Metadata inspection at rest | only the plaintext fields above | the rest is ciphertext |

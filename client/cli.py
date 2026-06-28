@@ -7,12 +7,10 @@ from __future__ import annotations
 
 import contextlib
 import hmac
-import ipaddress
 import json
 import os
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import click
 
@@ -47,36 +45,6 @@ def _get_client(server: str) -> CloudClient:
 # Mirror server/storage.py ``_MAX_FILENAME_LEN`` so the client fails fast
 # with a clean message instead of paying a full upload the server rejects.
 _MAX_FILENAME_LEN = 255
-
-
-def _is_loopback_host(host: str) -> bool:
-    """True if ``host`` is a loopback address or the literal ``localhost``."""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _warn_insecure_server(server: str) -> None:
-    """Warn (stderr, non-blocking) on plain http:// to a non-loopback host.
-
-    Client analog of pentest M-2. WireGuard is the intended transport, so a
-    non-loopback plain-HTTP target may be perfectly fine (the WG interface);
-    we only surface a heads-up, never block.
-    """
-    try:
-        parts = urlsplit(server)
-    except ValueError:
-        return
-    host = parts.hostname or ""
-    if parts.scheme == "http" and host and not _is_loopback_host(host):
-        click.echo(
-            "WARNING: plain HTTP to a non-loopback host — traffic is "
-            "unencrypted unless this is the WireGuard interface.",
-            err=True,
-        )
 
 
 def _unlock_or_exit(ks: KeyStore, password: str) -> None:
@@ -213,7 +181,9 @@ def cli(ctx, key_file: str, server: str):
     ctx.ensure_object(dict)
     ctx.obj["key_file"] = key_file
     ctx.obj["server"] = server
-    _warn_insecure_server(server)
+    # TLS-1: the insecure-transport heads-up now fires at connection-open
+    # (CloudClient.__init__), at most once per process — not here, so
+    # purely-local commands like ``init`` stay silent.
 
 
 @cli.command()
@@ -308,6 +278,11 @@ def enroll(ctx, username: str):
         click.echo(f"Enrolled X25519 key for {canonical}.")
     except (StorageError, CryptoError, AuthError, ProtocolError) as e:
         click.echo(f"Enroll failed: {e}", err=True)
+        sys.exit(1)
+    except Exception:
+        # ERR-2: a transport-level failure (connection refused / DNS / timeout)
+        # must not escape as a raw traceback, matching upload/download/share.
+        click.echo("Enroll failed: unexpected error", err=True)
         sys.exit(1)
     finally:
         ks.lock()
@@ -950,6 +925,16 @@ def migrate_keys(ctx, key_cache: str | None):
             click.echo(f"  migrated + removed {cache_path.name}")
 
         click.echo(f"Done. Migrated {migrated}, left {failed} intact.")
+    except (StorageError, CryptoError, AuthError, ProtocolError) as e:
+        click.echo(f"Migration failed: {e}", err=True)
+        sys.exit(1)
+    except Exception:
+        # ERR-2: a transport-level failure (connection refused / DNS / timeout)
+        # raised outside the per-cache handler must surface as a clean message
+        # + exit 1, not a raw traceback. Fail-closed is preserved: any cache
+        # whose /self_keys POST did not complete was never unlinked.
+        click.echo("Migration failed: unexpected error", err=True)
+        sys.exit(1)
     finally:
         ks.lock()
         client.close()
@@ -994,8 +979,9 @@ def _validate_file_id_local(file_id: str) -> str:
 
 
 def _load_owner_key_cache(cache_path: Path) -> dict:
-    """Read an owner key-cache JSON with a single-syscall size cap.
-    Cap = 4 KiB; legitimate cache is < 1 KiB.
+    """Read an owner key-cache JSON with an fd-bound, capped read.
+    Cap = 4 KiB; legitimate cache is < 1 KiB. ``read_capped`` reads in a
+    loop (tolerating short reads) and rejects anything over the cap.
     """
     try:
         data = read_capped(cache_path, 4 * 1024)
@@ -1005,7 +991,7 @@ def _load_owner_key_cache(cache_path: Path) -> dict:
 
 
 def _load_session(ctx, client: CloudClient) -> None:
-    """Load saved session token with a single-syscall size cap."""
+    """Load saved session token with an fd-bound, capped read (read_capped)."""
     token_path = Path(ctx.obj["key_file"]).parent / ".session"
     if not token_path.exists():
         click.echo("No session found. Run 'localcloud login' first.", err=True)

@@ -5,12 +5,59 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import sys
 from collections.abc import Iterator
+from urllib.parse import urlsplit
 
 import httpx
 
 from shared.exceptions import AuthError, StorageError
+
+# Process-wide latch for the insecure-transport heads-up (TLS-1). The warning
+# is a per-process UX nicety, not a security control, so it is surfaced at most
+# once no matter how many CloudClients are created — and only at connection
+# open, never on purely-local CLI commands.
+_INSECURE_WARNING_EMITTED = False
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True if ``host`` is a loopback address or the literal ``localhost``."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _warn_insecure_server_once(server_url: str) -> None:
+    """Warn (stderr) at most once per process on plain http:// to a non-loopback host.
+
+    Client analog of pentest M-2. Fired at CloudClient construction (i.e. when a
+    connection is actually opened) rather than from the CLI group callback, so
+    local-only commands such as ``init`` stay silent and a long-lived process is
+    not spammed once per command. WireGuard is the intended transport, so a
+    non-loopback plain-HTTP target may be perfectly fine (the WG interface); we
+    only surface a heads-up, never block. The latch is set only when a warning
+    is actually emitted, so an earlier loopback connection does not consume it.
+    """
+    global _INSECURE_WARNING_EMITTED
+    if _INSECURE_WARNING_EMITTED:
+        return
+    try:
+        parts = urlsplit(server_url)
+    except ValueError:
+        return
+    host = parts.hostname or ""
+    if parts.scheme == "http" and host and not _is_loopback_host(host):
+        _INSECURE_WARNING_EMITTED = True
+        print(
+            "WARNING: plain HTTP to a non-loopback host — traffic is "
+            "unencrypted unless this is the WireGuard interface.",
+            file=sys.stderr,
+        )
 
 
 class CloudClient:
@@ -24,6 +71,9 @@ class CloudClient:
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
         self._token: str | None = None
+        # TLS-1: surface the plain-HTTP heads-up here (connection-open time)
+        # and at most once per process, instead of on every CLI invocation.
+        _warn_insecure_server_once(self.server_url)
         # Bound the connection pool so chunk uploads share keepalive
         # connections instead of opening a fresh TCP socket per chunk.
         self._client = httpx.Client(
