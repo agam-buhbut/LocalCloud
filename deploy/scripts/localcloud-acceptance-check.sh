@@ -19,8 +19,8 @@
 #   LOCALCLOUD_WG_IFACE=wg0
 #   LOCALCLOUD_WG_PORT=51820
 #   LOCALCLOUD_BIND=10.0.0.1:8443        (where the app listens, for the login probe)
-#   LOCALCLOUD_DATA_DIR=/var/lib/localcloud
-#   LOCALCLOUD_AA_PROFILE=usr.local.bin.localcloud-server
+#   LOCALCLOUD_DATA_DIR=/srv/cloud
+#   LOCALCLOUD_AA_PROFILE=localcloud-server
 #
 # Exit code: 0 if no FAIL, 1 otherwise. SKIP never fails the run.
 set -u
@@ -29,8 +29,11 @@ SERVICE="${LOCALCLOUD_SERVICE:-localcloud.service}"
 WG_IFACE="${LOCALCLOUD_WG_IFACE:-wg0}"
 WG_PORT="${LOCALCLOUD_WG_PORT:-51820}"
 BIND="${LOCALCLOUD_BIND:-10.0.0.1:8443}"
-DATA_DIR="${LOCALCLOUD_DATA_DIR:-/var/lib/localcloud}"
-AA_PROFILE="${LOCALCLOUD_AA_PROFILE:-usr.local.bin.localcloud-server}"
+DATA_DIR="${LOCALCLOUD_DATA_DIR:-/srv/cloud}"
+# The AppArmor profile is explicitly NAMED `localcloud-server` (see
+# deploy/apparmor/usr.local.bin.localcloud-server); aa-status reports it by that
+# name, not by the attachment path or the on-disk filename.
+AA_PROFILE="${LOCALCLOUD_AA_PROFILE:-localcloud-server}"
 NFT_TABLE="inet localcloud"
 NFT_SET="wg_online"
 
@@ -69,12 +72,17 @@ if have wg && wg show "$WG_IFACE" >/dev/null 2>&1; then
     pass "WireGuard interface $WG_IFACE is up"
     peers=$(wg show "$WG_IFACE" peers | wc -l)
     info "configured peers: $peers (each MUST have a /32 AllowedIPs — verify below)"
-    # /32-per-peer is what makes source-IP == identity sound (SEC-M2).
-    if wg show "$WG_IFACE" allowed-ips | grep -vq '/32'; then
-        fail "a peer has a non-/32 AllowedIPs — breaks 1:1 source-IP<->peer identity"
-        wg show "$WG_IFACE" allowed-ips | grep -v '/32' | sed 's/^/      /'
+    # Exactly-one-/32-per-peer is what makes source-IP == identity sound (SEC-M2).
+    # `wg show allowed-ips` prints one line per peer: "<pubkey>\t<cidr> [<cidr> …]".
+    # A peer is GOOD only if it has a single allowed entry and that entry is a
+    # /32. A wider CIDR, multiple entries, or a /32 *plus* a wider range all
+    # break the 1:1 mapping, so flag anything that is not exactly one /32.
+    bad=$(wg show "$WG_IFACE" allowed-ips | awk '!(NF == 2 && $2 ~ /\/32$/)')
+    if [ -n "$bad" ]; then
+        fail "a peer's AllowedIPs is not exactly one /32 — breaks 1:1 source-IP<->peer identity"
+        printf '%s\n' "$bad" | sed 's/^/      /'
     else
-        pass "every peer AllowedIPs is a /32 (1:1 source-IP <-> peer)"
+        pass "every peer AllowedIPs is exactly one /32 (1:1 source-IP <-> peer)"
     fi
 else
     skip "WireGuard interface check" "wg/$WG_IFACE not available (not on the box?)"

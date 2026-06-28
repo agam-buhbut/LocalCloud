@@ -20,8 +20,15 @@ if [ ! -f "$SRC/meta.db" ]; then
 fi
 
 mkdir -p "$DEST/blobs"
+# Clear any stale WAL/SHM sidecars at the destination BEFORE writing the db.
+# The backup meta.db is a self-contained, WAL-free snapshot, but a leftover
+# meta.db-wal / meta.db-shm from a *previous* database at this path would be
+# silently re-applied by SQLite the next time the daemon opens meta.db, mixing
+# old WAL frames into the freshly restored db (corruption / wrong data). Removing
+# them makes the restored db stand alone. `rm -f` is a no-op when absent.
+rm -f "$DEST/meta.db-wal" "$DEST/meta.db-shm"
 # The backup meta.db is a consistent, WAL-free snapshot, so a plain copy
-# restores it faithfully (no -wal/-shm sidecars to worry about).
+# restores it faithfully.
 cp -a "$SRC/meta.db" "$DEST/meta.db"
 # Fail LOUD on a copy error (a swallowed partial restore would silently
 # drop ciphertext). The [ -d ] guard tolerates a legitimately-empty backup.

@@ -1,6 +1,16 @@
 #!/bin/sh
 # Close the WireGuard port: remove it from the nftables wg_online set.
-# Established sessions are left to drain; use the kill-switch to sever them.
+#
+# LIMITATION (by design): this blocks only NEW handshakes. The input chain
+# accepts `ct state established,related`, so a peer that is ALREADY up and keeps
+# its conntrack entry warm (WireGuard PersistentKeepalive / steady traffic)
+# stays connected until that flow goes idle and conntrack expires it — removing
+# the port does not tear down live state. This is intentional for scheduled
+# uptime windows (existing sessions drain gracefully). To sever established
+# peers immediately use the kill-switch, which stops the daemon and the tunnel
+# (see localcloud-killswitch.sh and deploy/README.md "Scheduled uptime vs.
+# kill-switch").
+#
 # Install to /usr/local/sbin/localcloud-offline.sh (root:root 0755).
 set -eu
 

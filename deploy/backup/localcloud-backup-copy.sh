@@ -22,9 +22,11 @@ fi
 
 mkdir -p "$DEST"
 
-# Consistent online snapshot of the live WAL database. A plain file copy of a
-# WAL db can be torn (a checkpoint may be mid-flight); sqlite's backup API
-# copies a transactionally-consistent image while the daemon keeps running.
+# Internally-consistent online snapshot of the live WAL database. A plain file
+# copy of a WAL db can be torn (a checkpoint may be mid-flight); sqlite's backup
+# API copies a transactionally-consistent image while the daemon keeps running.
+# (This consistency is WITHIN meta.db only — the db-vs-blob window is documented
+# below.)
 python3 - "$SRC/meta.db" "$DEST/meta.db" <<'PY'
 import sqlite3, sys
 src, dst = sys.argv[1], sys.argv[2]
@@ -40,7 +42,22 @@ finally:
 PY
 
 # Blobs are content-addressed and immutable once finalized, so a plain
-# recursive copy is safe and consistent. On the real box, swap this line for
+# recursive copy is safe and consistent for any individual blob.
+#
+# CROSS-CONSISTENCY WINDOW (meta.db vs blobs): meta.db is snapshotted FIRST and
+# blobs are copied AFTER, so the two halves are captured a moment apart while the
+# daemon keeps running. The skew is benign by design:
+#   * a blob copied with no referencing db row (an upload finalized after the db
+#     snapshot) is harmless — it is just unreferenced immutable ciphertext;
+#   * a db row with no backed-up blob would be the real hazard (a dangling
+#     reference). It cannot happen here: a finalized blob is written before its
+#     metadata row is committed (staging -> blobs -> db), and finalized blobs are
+#     never rewritten, so every row in the db snapshot refers to a blob that
+#     already existed when the snapshot was taken — and is therefore included by
+#     the later blob copy. (Revisit this ordering if online blob deletion/GC is
+#     ever added, which would reintroduce a row-without-blob risk.)
+#
+# On the real box, swap this line for
 # `rsync -a --delete "$SRC/blobs/" "$DEST/blobs/"` for incremental backups.
 mkdir -p "$DEST/blobs"
 # Fail LOUD on a copy error: a swallowed partial copy would yield a

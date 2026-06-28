@@ -1,7 +1,13 @@
 # AppArmor profile for the LocalCloud daemon (PART II §1).
 # Install to /etc/apparmor.d/usr.local.bin.localcloud-server, then:
 #   apparmor_parser -r /etc/apparmor.d/usr.local.bin.localcloud-server
-#   aa-status   # confirm it is in "enforce" mode
+#   aa-status   # confirm `localcloud-server` is in "enforce" mode
+#
+# The profile is EXPLICITLY NAMED `localcloud-server`. Without a name, AppArmor
+# derives the profile name from the attachment path (/opt/localcloud/venv/bin/
+# python3) and `aa-status` reports *that* — which the acceptance check could
+# never match. The name here MUST stay in sync with LOCALCLOUD_AA_PROFILE in
+# deploy/scripts/localcloud-acceptance-check.sh.
 #
 # UNTESTED TEMPLATE. Confining a Python interpreter is fiddly — the profile
 # must allow the venv + system libraries while denying everything else. Run in
@@ -13,8 +19,8 @@
 abi <abi/3.0>,
 include <tunables/global>
 
-# Attach to the interpreter that hypercorn execs.
-/opt/localcloud/venv/bin/python3 flags=(enforce) {
+# Named profile `localcloud-server`, attached to the interpreter hypercorn execs.
+profile localcloud-server /opt/localcloud/venv/bin/python3 flags=(enforce) {
   include <abstractions/base>
   include <abstractions/python>
   include <abstractions/openssl>

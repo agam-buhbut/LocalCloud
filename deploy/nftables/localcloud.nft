@@ -32,8 +32,15 @@ table inet localcloud {
         # WireGuard handshake/transport from the WAN, per-source rate limited
         # BEFORE it reaches the daemon (pre-daemon rate limiting, PART II §2).
         # Gated by the wg_online set so the uptime control can open/close it.
+        # IPv4 and IPv6 are metered SEPARATELY: a meter's key type is fixed
+        # (ipv4_addr vs ipv6_addr), so `ip saddr` only matches v4 packets. The
+        # ip6 rule gives v6 handshakes the same per-source limit instead of
+        # leaving them to fall through to `policy drop`.
         udp dport @wg_online \
             meter wg_ratelimit { ip saddr limit rate 25/second burst 40 packets } \
+            accept
+        udp dport @wg_online \
+            meter wg6_ratelimit { ip6 saddr limit rate 25/second burst 40 packets } \
             accept
 
         # Traffic that already came up inside the tunnel (the app on

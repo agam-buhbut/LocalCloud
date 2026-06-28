@@ -14,7 +14,17 @@ DATA_DIR="${LC_DATA_DIR:-/srv/cloud}"
 SVC_USER="${LC_SERVICE_USER:-localcloud}"
 MAPPER="lc-backup"
 MNT="/mnt/lc-backup"
-HERE="$(dirname "$0")"
+
+# Resolve this script's own directory robustly so localcloud-restore-copy.sh is
+# found next to us no matter how we were invoked. Bare `dirname "$0"` breaks when
+# the script is run by bare name from PATH ($0 has no directory) or via a symlink
+# ($0 points at the link). Locate on PATH if needed, then canonicalize.
+SELF="$0"
+case "$SELF" in
+    */*) : ;;                            # $0 already contains a path component
+    *) SELF="$(command -v "$SELF")" ;;   # bare name: resolve via PATH
+esac
+HERE="$(cd "$(dirname "$(readlink -f "$SELF")")" && pwd)"
 
 cleanup() {
     umount "$MNT" 2>/dev/null || true

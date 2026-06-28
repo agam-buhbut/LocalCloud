@@ -8,6 +8,11 @@
 Description=LocalCloud E2EE cloud server (hostile-box, WireGuard-only)
 After=network-online.target wg-quick@wg0.service nftables.service
 Wants=network-online.target
+# Soft dep on the firewall: After= only ORDERS us after nftables, it does not
+# pull it in. Wants= ensures nftables is actually started, preserving the
+# default-deny-before-daemon property (the port stays closed until the daemon is
+# up). Soft (not Requires=) so a transient nft hiccup can't wedge the service.
+Wants=nftables.service
 Requires=wg-quick@wg0.service
 
 [Service]
@@ -67,9 +72,12 @@ AmbientCapabilities=
 # Egress limited to the WG subnet + loopback (the daemon only serves WG peers).
 IPAddressDeny=any
 IPAddressAllow=10.0.0.0/24 localhost
-# NOTE (UNTESTED): MemoryDenyWriteExecute=yes is desirable but can break cffi
-# (argon2-cffi) which may allocate executable trampolines. Enable it and verify
-# logins still work; if Argon2 verification fails at runtime, remove this line.
+# MemoryDenyWriteExecute=yes blocks new W+X memory mappings (strong anti-RCE
+# hardening). The open question was whether cffi (argon2-cffi) would need
+# executable trampolines and break every login; pentest V15 HARDWARE-VALIDATED
+# that Argon2 verification runs correctly under this directive, so it is CLEARED
+# and stays ENABLED. (The acceptance check still probes a real login as a
+# regression guard.)
 MemoryDenyWriteExecute=yes
 
 # ── Resilience ──

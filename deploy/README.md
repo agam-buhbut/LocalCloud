@@ -72,6 +72,26 @@ live in `localcloud.service`:
 - Short `LOCALCLOUD_SESSION_LIFETIME` keeps the forgery window small if the
   secret ever leaks.
 
+## Scheduled uptime vs. kill-switch (offline-toggle limitation)
+
+Availability is toggled by adding/removing the WG port from the `wg_online`
+nftables set (`deploy/scripts/localcloud-{online,offline}.sh` and the uptime
+timers). **Going "offline" closes the port to NEW handshakes only.** The input
+chain accepts `ct state established,related`, so a peer that is already up and
+keeps its conntrack flow warm (WireGuard `PersistentKeepalive` or steady
+traffic) **stays connected** until that flow goes idle and conntrack expires
+it — `localcloud-offline.sh` does not tear down live state.
+
+This is intentional: scheduled uptime windows let existing sessions drain
+gracefully rather than dropping mid-transfer. When you need to sever
+established peers *immediately*, use **`deploy/scripts/localcloud-killswitch.sh`**,
+which stops the daemon and tears down the tunnel (`wg-quick@wg0`), dropping all
+live sessions at once (and optionally rotates the session secret). If you want
+the offline toggle alone to also drop established flows, flush the relevant
+conntrack state after closing the port (e.g. `conntrack -D -p udp --dport
+51820`, requires the `conntrack` tool) — but the kill-switch is the supported
+path for an immediate cut-off.
+
 ## Install order (on the box, as root, from the physical console)
 
 1. **OS hardening:** `deploy/os/harden-debian.sh` (minimal packages, no
