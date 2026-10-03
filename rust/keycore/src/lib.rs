@@ -164,7 +164,10 @@ impl KeyPair {
         // cross into Python `bytes` here (non-zeroizable, Python-owned
         // lifetime). Accepted tradeoff — see this method's doc. Only
         // per-file content keys cross; identity private keys never do.
-        Ok((PyBytes::new(py, &file_key), PyBytes::new(py, &meta_key)))
+        Ok((
+            PyBytes::new(py, file_key.as_ref()),
+            PyBytes::new(py, meta_key.as_ref()),
+        ))
     }
 }
 

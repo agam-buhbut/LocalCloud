@@ -60,8 +60,9 @@ const PAYLOAD_LEN: usize = 64;
 /// and the meta_key, each held in a `Zeroizing` wrapper so the recovered
 /// secret bytes are wiped on drop. Aliased to keep the function signature
 /// within clippy's `type_complexity` bound (the tuple-of-Zeroizing is
-/// otherwise flagged) without changing the returned shape.
-type UnwrappedKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+/// otherwise flagged) without changing the returned shape. Public because
+/// `IdentityKeyPair::unwrap_file_keys` returns it too.
+pub type UnwrappedKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
 
 // ──────────────────────────── Key Wrapping ────────────────────────────
 

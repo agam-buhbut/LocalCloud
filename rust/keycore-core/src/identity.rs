@@ -462,7 +462,8 @@ impl IdentityKeyPair {
     /// from the bundle. The recipient private key never leaves this struct.
     ///
     /// The recovered values are per-file CONTENT keys, not identity private
-    /// keys, so they are returned by value.
+    /// keys. They stay in `Zeroizing` wrappers, so they are wiped from memory
+    /// when the caller drops them.
     ///
     /// # Errors
     /// Returns an error string if the bundle is malformed or AEAD
@@ -472,17 +473,13 @@ impl IdentityKeyPair {
         wrapped_bundle: &[u8],
         file_id: &[u8],
         sender_pubkey: &[u8; 32],
-    ) -> Result<([u8; 32], [u8; 32]), String> {
-        let (file_key, meta_key) = crate::wrapping::unwrap_file_keys(
+    ) -> Result<crate::wrapping::UnwrappedKeys, String> {
+        crate::wrapping::unwrap_file_keys(
             wrapped_bundle,
             file_id,
             sender_pubkey,
             self.x25519_private_key(),
-        )?;
-        // `wrapping::unwrap_file_keys` returns the keys in `Zeroizing`
-        // wrappers; copy them out by value for the caller. These are per-file
-        // content keys — never identity private keys.
-        Ok((*file_key, *meta_key))
+        )
     }
 
     // ──────────── Accessors (public keys are not secret) ────────────
@@ -617,6 +614,32 @@ mod tests {
 
         assert_ne!(kp1.x25519_public_key(), kp2.x25519_public_key());
         assert_ne!(kp1.ed25519_public_key(), kp2.ed25519_public_key());
+    }
+
+    #[test]
+    fn test_unwrap_file_keys_returns_zeroizing_keys() {
+        let sender = IdentityKeyPair::generate().unwrap();
+        let recipient = IdentityKeyPair::generate().unwrap();
+        let file_id = [5u8; 16];
+        let bundle = sender
+            .wrap_file_keys(
+                &[0xAA; 32],
+                &[0xBB; 32],
+                &file_id,
+                recipient.x25519_public_key(),
+            )
+            .unwrap();
+
+        let (file_key, meta_key) = recipient
+            .unwrap_file_keys(&bundle, &file_id, sender.ed25519_public_key())
+            .unwrap();
+        // The explicit types are the point of this test: the recovered keys
+        // must stay wiped-on-drop, so this stops compiling if the method
+        // ever goes back to returning plain arrays.
+        let file_key: Zeroizing<[u8; 32]> = file_key;
+        let meta_key: Zeroizing<[u8; 32]> = meta_key;
+        assert_eq!(*file_key, [0xAA; 32]);
+        assert_eq!(*meta_key, [0xBB; 32]);
     }
 
     // ──────────────── Seal-nonce uniqueness ────────────────

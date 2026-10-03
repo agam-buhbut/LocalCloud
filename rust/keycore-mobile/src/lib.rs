@@ -149,6 +149,9 @@ impl KeyPair {
             .inner
             .unwrap_file_keys(&wrapped_bundle, &file_id, &spk)
             .map_err(|_| KeycoreError::Crypto)?;
+        // FFI boundary, same tradeoff as the PyO3 skin: the copies handed to
+        // Kotlin cannot be wiped from Rust. The `Zeroizing` originals are
+        // wiped when they drop at the end of this call.
         Ok(UnwrappedKeys {
             file_key: file_key.to_vec(),
             meta_key: meta_key.to_vec(),
