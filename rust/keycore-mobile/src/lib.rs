@@ -178,3 +178,207 @@ pub fn verify_signature(public_key: Vec<u8>, message: Vec<u8>, signature: Vec<u8
 fn to_array32(bytes: &[u8]) -> Result<[u8; 32], KeycoreError> {
     bytes.try_into().map_err(|_| KeycoreError::Crypto)
 }
+
+// These tests call the same exported API that Kotlin sees. UniFFI exposes
+// `KeycoreError` to Kotlin as `KeycoreException`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE_ID: [u8; 16] = [7u8; 16];
+
+    fn keypair() -> Arc<KeyPair> {
+        KeyPair::generate().expect("key generation should succeed")
+    }
+
+    /// The error from a call that must fail. (`unwrap_err` needs the success
+    /// type to be `Debug`; `KeyPair` and `UnwrappedKeys` are not.)
+    fn err_of<T>(result: Result<T, KeycoreError>) -> KeycoreError {
+        match result {
+            Ok(_) => panic!("expected the call to fail"),
+            Err(err) => err,
+        }
+    }
+
+    /// Every failure must be the one fieldless variant with the fixed,
+    /// cause-free message. The `match` has no catch-all arm, so this stops
+    /// compiling if a second variant is ever added.
+    fn assert_opaque(err: &KeycoreError) {
+        match err {
+            KeycoreError::Crypto => {}
+        }
+        assert_eq!(err.to_string(), "cryptographic operation failed");
+    }
+
+    #[test]
+    fn generate_gives_32_byte_public_keys_and_unique_keypairs() {
+        let a = keypair();
+        let b = keypair();
+        assert_eq!(a.x25519_public_key().len(), 32);
+        assert_eq!(a.ed25519_public_key().len(), 32);
+        assert_ne!(a.x25519_public_key(), [0u8; 32]);
+        assert_ne!(a.ed25519_public_key(), [0u8; 32]);
+        assert_ne!(a.x25519_public_key(), b.x25519_public_key());
+        assert_ne!(a.ed25519_public_key(), b.ed25519_public_key());
+    }
+
+    #[test]
+    fn sign_then_verify_signature() {
+        let kp = keypair();
+        let msg = b"hello from android".to_vec();
+        let sig = kp.sign(msg.clone()).unwrap();
+        assert_eq!(sig.len(), 64);
+        assert!(verify_signature(
+            kp.ed25519_public_key(),
+            msg.clone(),
+            sig.clone()
+        ));
+
+        // A changed message, another signer's key, or a changed signature
+        // must not verify.
+        assert!(!verify_signature(
+            kp.ed25519_public_key(),
+            b"hello from elsewhere".to_vec(),
+            sig.clone()
+        ));
+        assert!(!verify_signature(
+            keypair().ed25519_public_key(),
+            msg.clone(),
+            sig.clone()
+        ));
+        let mut changed_sig = sig;
+        changed_sig[0] ^= 0x01;
+        assert!(!verify_signature(kp.ed25519_public_key(), msg, changed_sig));
+    }
+
+    #[test]
+    fn verify_signature_is_false_for_malformed_input() {
+        let kp = keypair();
+        let msg = b"m".to_vec();
+        let sig = kp.sign(msg.clone()).unwrap();
+        assert!(!verify_signature(vec![0u8; 31], msg.clone(), sig.clone()));
+        assert!(!verify_signature(Vec::new(), msg.clone(), sig.clone()));
+        assert!(!verify_signature(
+            kp.ed25519_public_key(),
+            msg.clone(),
+            sig[..63].to_vec()
+        ));
+        assert!(!verify_signature(kp.ed25519_public_key(), msg, Vec::new()));
+    }
+
+    #[test]
+    fn wrap_unwrap_round_trip() {
+        let sender = keypair();
+        let recipient = keypair();
+        let file_key = vec![0xAA; 32];
+        let meta_key = vec![0xBB; 32];
+        let bundle = sender
+            .wrap_file_keys(
+                file_key.clone(),
+                meta_key.clone(),
+                FILE_ID.to_vec(),
+                recipient.x25519_public_key(),
+            )
+            .unwrap();
+        // Wire format: ephemeral pubkey (32) || nonce (24) || ciphertext (64) + tag (16).
+        assert_eq!(bundle.len(), 32 + 24 + 64 + 16);
+
+        let keys = recipient
+            .unwrap_file_keys(bundle, FILE_ID.to_vec(), sender.ed25519_public_key())
+            .unwrap();
+        assert_eq!(keys.file_key, file_key);
+        assert_eq!(keys.meta_key, meta_key);
+    }
+
+    #[test]
+    fn unwrap_fails_opaquely_for_wrong_keys_file_id_or_tampering() {
+        let sender = keypair();
+        let recipient = keypair();
+        let bundle = sender
+            .wrap_file_keys(
+                vec![1; 32],
+                vec![2; 32],
+                FILE_ID.to_vec(),
+                recipient.x25519_public_key(),
+            )
+            .unwrap();
+        let mut tampered = bundle.clone();
+        *tampered.last_mut().unwrap() ^= 0xFF;
+
+        let failures = [
+            // Someone other than the recipient.
+            err_of(keypair().unwrap_file_keys(
+                bundle.clone(),
+                FILE_ID.to_vec(),
+                sender.ed25519_public_key(),
+            )),
+            // The right recipient, but a different claimed sender.
+            err_of(recipient.unwrap_file_keys(
+                bundle.clone(),
+                FILE_ID.to_vec(),
+                keypair().ed25519_public_key(),
+            )),
+            // A different file id.
+            err_of(recipient.unwrap_file_keys(bundle, vec![8u8; 16], sender.ed25519_public_key())),
+            // One flipped byte.
+            err_of(recipient.unwrap_file_keys(
+                tampered,
+                FILE_ID.to_vec(),
+                sender.ed25519_public_key(),
+            )),
+        ];
+        for err in &failures {
+            assert_opaque(err);
+        }
+    }
+
+    #[test]
+    fn every_failure_is_the_single_opaque_error() {
+        let kp = keypair();
+        let peer = keypair();
+        let key = vec![0x11; 32];
+
+        let failures = [
+            // wrap_file_keys: wrong-length inputs.
+            err_of(kp.wrap_file_keys(
+                vec![0; 31],
+                key.clone(),
+                FILE_ID.to_vec(),
+                peer.x25519_public_key(),
+            )),
+            err_of(kp.wrap_file_keys(
+                key.clone(),
+                vec![0; 33],
+                FILE_ID.to_vec(),
+                peer.x25519_public_key(),
+            )),
+            err_of(kp.wrap_file_keys(
+                key.clone(),
+                key.clone(),
+                vec![0; 15],
+                peer.x25519_public_key(),
+            )),
+            err_of(kp.wrap_file_keys(key.clone(), key.clone(), FILE_ID.to_vec(), vec![0; 31])),
+            // wrap_file_keys: an all-zero (low-order) recipient key is refused.
+            err_of(kp.wrap_file_keys(key.clone(), key, FILE_ID.to_vec(), vec![0; 32])),
+            // unwrap_file_keys: not a bundle, too short, wrong-length sender key.
+            err_of(kp.unwrap_file_keys(vec![0; 136], FILE_ID.to_vec(), peer.ed25519_public_key())),
+            err_of(kp.unwrap_file_keys(vec![0; 10], FILE_ID.to_vec(), peer.ed25519_public_key())),
+            err_of(kp.unwrap_file_keys(vec![0; 136], FILE_ID.to_vec(), vec![0; 31])),
+            // decrypt_from_store: input that is not a key store. These are
+            // refused before the slow Argon2id step, so the test stays fast.
+            err_of(KeyPair::decrypt_from_store(
+                b"not a key store".to_vec(),
+                b"pw".to_vec(),
+            )),
+            err_of(KeyPair::decrypt_from_store(Vec::new(), b"pw".to_vec())),
+            err_of(KeyPair::decrypt_from_store(
+                vec![0; 16 * 1024 + 1],
+                b"pw".to_vec(),
+            )),
+        ];
+        for err in &failures {
+            assert_opaque(err);
+        }
+    }
+}
