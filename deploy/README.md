@@ -118,8 +118,11 @@ path for an immediate cut-off.
    chmod 600 /etc/localcloud/session.secret
    ```
 4. **Install the app** into a venv the `localcloud` user can execute
-   (e.g. `/opt/localcloud/venv`); build `keycore` is client-side only and not
-   needed on the server.
+   (e.g. `/opt/localcloud/venv`), and build `keycore` into that same venv
+   (for example `maturin build --release -m rust/keycore/Cargo.toml`, then
+   `pip install` the wheel it writes). The server needs keycore: its user
+   directory checks enroll signatures with it, so the server will not start
+   without it. The 2026-06-28 deploy built keycore on the box.
 5. **WireGuard:** `deploy/wireguard/` (generate server + peer keys, fill the
    allowlist, `systemctl enable --now wg-quick@wg0`).
 6. **Firewall:** `nft -f deploy/nftables/localcloud.nft`; make it boot-persistent
