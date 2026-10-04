@@ -4,7 +4,8 @@ name: CI
 #   python: lockfile check, keycore build, black, isort, ruff, pylint,
 #           pyright, pytest (with a coverage floor), pip-audit.
 #   rust:   rustfmt, clippy, cargo test, cargo audit, each for the whole
-#           workspace under rust/.
+#           workspace under rust/, and a check that the Kotlin code in
+#           rust/bindings-kotlin/ is what the Rust code generates.
 # A failing step fails its job. The two steps that make an SBOM are the
 # exception: they only make a record, so a failure there is ignored. This
 # file cannot block a merge by itself; that needs a branch protection rule
@@ -143,6 +144,28 @@ jobs:
 
       - name: cargo test
         run: cargo test --manifest-path rust/Cargo.toml --workspace
+
+      # The Kotlin code in rust/bindings-kotlin/ is generated from the
+      # keycore-mobile library. Generate it again and fail if the result is
+      # not the same as what is committed, so the Kotlin side cannot drift
+      # away from the Rust signatures. To fix a failure, run the commands
+      # below inside rust/ and commit the changed file.
+      #   - The old copy is deleted first. The generator writes nothing, and
+      #     still exits 0, if the library's symbols are stripped, so without
+      #     this a broken run could pass.
+      #   - It reads the debug library, because the release profile strips
+      #     the symbols.
+      #   - --no-format gives the same output whether or not ktlint is
+      #     installed.
+      - name: Kotlin bindings match the Rust code
+        working-directory: rust
+        run: |
+          cargo build --locked -p keycore-mobile
+          rm -rf bindings-kotlin
+          cargo run --locked -p keycore-mobile --features cli --bin uniffi-bindgen -- \
+            generate --library "${CARGO_TARGET_DIR:-target}/debug/libkeycore_mobile.so" \
+            --language kotlin --out-dir bindings-kotlin --no-format
+          git diff --exit-code -- bindings-kotlin
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
