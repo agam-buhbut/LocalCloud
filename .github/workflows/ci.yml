@@ -1,8 +1,14 @@
 name: CI
 
-# Runs the full project toolchain. Merges are gated on every job/step
-# passing. The exact commands here mirror what is run locally and were
-# verified green before this workflow was committed.
+# Checks that run on every push and every pull request. Two jobs:
+#   python: lockfile check, keycore build, black, isort, ruff, pylint,
+#           pyright, pytest (with a coverage floor), pip-audit.
+#   rust:   rustfmt, clippy, cargo test, cargo audit, each for the whole
+#           workspace under rust/.
+# A failing step fails its job. The two steps that make an SBOM are the
+# exception: they only make a record, so a failure there is ignored. This
+# file cannot block a merge by itself; that needs a branch protection rule
+# in the GitHub settings.
 on:
   push:
     branches: ["**"]
