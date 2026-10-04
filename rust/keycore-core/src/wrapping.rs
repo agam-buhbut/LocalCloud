@@ -10,10 +10,15 @@
 //   long-term identity key does NOT let an attacker recover past
 //   file keys from stored wrapped bundles.
 // - Per-file domain separation via HKDF info field (WRAP_DOMAIN || file_id).
-// - The sender's long-term Ed25519 verifying key is bound into the
-//   HKDF info and the AEAD AAD, so a bundle is cryptographically
-//   tied to the advertised sender identity and cannot be grafted
-//   across senders.
+// - The sender's long-term Ed25519 public key is mixed into the HKDF
+//   info and the AEAD AAD. This is a label, not proof of who made the
+//   bundle: wrapping needs only the recipient's public key, so anyone
+//   can build a bundle that names any sender. The label only makes a
+//   bundle open under the same sender key it was made with, so a
+//   bundle cannot be moved over to a different sender. Proof of who
+//   wrote a file comes from the owner's Ed25519 signature on the
+//   file's Merkle root, checked against the key the client pinned on
+//   first use (TOFU).
 // - All intermediate secrets are held in Zeroizing<> wrappers.
 // - No group keys — each recipient gets a unique wrapped bundle.
 //

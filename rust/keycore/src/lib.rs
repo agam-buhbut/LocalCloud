@@ -98,9 +98,10 @@ impl KeyPair {
     /// ephemeral-static ECDH for forward secrecy.
     ///
     /// The sender's long-term X25519 key is NOT used; instead the core
-    /// generates a fresh ephemeral pair per call. The sender's Ed25519
-    /// identity public key is bound into the KDF and AEAD AAD by the core
-    /// method so the bundle is cryptographically tied to this keypair.
+    /// generates a fresh ephemeral pair per call. The core method also
+    /// mixes this keypair's Ed25519 public key into the KDF and AEAD AAD
+    /// as a sender label. The label does not prove who made the bundle;
+    /// see keycore-core/src/wrapping.rs.
     ///
     /// Returns: ephemeral_pubkey || nonce || ciphertext+tag.
     fn wrap_file_keys<'py>(
