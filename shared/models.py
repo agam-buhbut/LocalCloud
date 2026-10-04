@@ -79,11 +79,12 @@ MAX_CHUNKS: int = 1 << 20
 # noted in Round-2 LOW-1. (Round-3 fix)
 MAX_CHUNKS_PER_FILE: int = 100_000
 
-# Sentinel chunk_index used in the metadata blob's AAD (the metadata is
-# AEAD-encrypted independently of the data chunks). It is the maximum u32
-# value, deliberately chosen to sit above every legitimate chunk index so
-# it can never alias a real chunk's AAD. See the invariant assertion
-# below the safety bounds.
+# The largest u32 value (0xFFFFFFFF), above every real chunk index. It is not
+# part of the metadata blob's AAD: since protocol v2 only the
+# METADATA_AAD_CONTEXT tag keeps metadata and data chunks apart (see
+# build_metadata_aad). It is only used by the check just above ChunkAAD, which
+# runs when this module loads and fails if MAX_CHUNKS ever reaches it, because
+# ChunkAAD packs chunk indexes as u32.
 METADATA_CHUNK_INDEX: int = 0xFFFFFFFF
 
 # Maximum size for a padded metadata blob (1 MiB). Anything larger is
