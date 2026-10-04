@@ -5,15 +5,17 @@
 **Application layer (verifiable in this repo):**
 - [ ] Full toolchain green: `black --check . && isort --check . && ruff check .
       && pylint client server shared && pyright && pytest -q`.
-- [ ] Rust green: `cargo fmt --check`, `cargo clippy -- -D warnings`,
-      `cargo test` (manifest `rust/keycore/Cargo.toml`).
+- [ ] Rust green for the whole workspace (manifest `rust/Cargo.toml`):
+      `cargo fmt --all --check`,
+      `cargo clippy --workspace --all-targets -- -D warnings`,
+      `cargo test --workspace`.
 - [ ] Supply chain clean: `pip-audit` and `cargo audit` pass in CI; SBOMs
       generated (artifacts).
 - [ ] Property tests pass (nonce uniqueness, key isolation, fail-on-corruption).
 - [ ] Key-rotation tests pass (`tests/test_key_rotation.py`).
 - [ ] Backup/restore core tests pass (`tests/test_backup_restore.py`).
 - [ ] `CHANGELOG.md` updated; version bumped.
-- [ ] Lockfiles committed and current (`rust/keycore/Cargo.lock`, `uv.lock`;
+- [ ] Lockfiles committed and current (`rust/Cargo.lock`, `uv.lock`;
       CI gates `uv lock --check` for drift).
 
 **Deployment layer (verifiable only on the box — UNVALIDATED in CI):**
@@ -45,7 +47,8 @@
 
 ## Python lockfile — RESOLVED
 
-Both lockfiles are committed: `rust/keycore/Cargo.lock` and `uv.lock`. The
+Both lockfiles are committed: `rust/Cargo.lock` (one for the whole Rust
+workspace) and `uv.lock`. The
 Python dependency-lock decision was made in favour of `uv`: `uv.lock` is the
 hash-pinned, reproducible source of truth, regenerated with `uv lock` after any
 `pyproject.toml` change. CI fails the build if it has drifted
