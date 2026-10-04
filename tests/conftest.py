@@ -52,15 +52,19 @@ def session_secret() -> str:
 
 
 @pytest.fixture()
-def db(tmp_path: Path) -> Database:
+def db(tmp_path: Path) -> Iterator[Database]:
     """A connected metadata Database backed by a fresh tmp file.
 
     Canonical version of the fixture that was previously duplicated,
     byte-for-byte, in test_database.py and test_storage_share.py.
+    The connection is closed on teardown.
     """
     d = Database(str(tmp_path / "meta.db"))
     d.connect()
-    return d
+    try:
+        yield d
+    finally:
+        d.close()
 
 
 def _test_server_config(tmp_data_dir: Path, session_secret: str):

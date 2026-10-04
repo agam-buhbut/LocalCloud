@@ -221,29 +221,37 @@ class Database:
         self._lock = threading.RLock()
 
     def connect(self) -> None:
-        """Open connection and initialize schema."""
+        """Open connection and initialize schema.
+
+        If the setup fails, the connection is closed again before the error
+        is raised, so a failed connect() does not leave the file open.
+        """
         self._conn = sqlite3.connect(
             self.db_path,
             isolation_level=None,  # We manage transactions explicitly
             check_same_thread=False,
         )
-        self._conn.row_factory = sqlite3.Row
-        # Enable WAL mode for concurrent reads
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        # Foreign keys
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        # Busy timeout (5 seconds)
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        # PERF (4B-a): under WAL, synchronous=NORMAL is crash-safe — the
-        # database cannot corrupt; the only exposure is losing the *last*
-        # committed transaction on an OS crash / power loss (a checkpoint
-        # still syncs the WAL into the main db). FULL would additionally
-        # fsync on every commit. We keep durability of file *bytes* (the
-        # per-chunk fsync in storage.py is unchanged); this only relaxes the
-        # per-commit fsync of the metadata WAL. See docs/benchmarks.md (4B).
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        # Initialize schema
-        self._init_schema()
+        try:
+            self._conn.row_factory = sqlite3.Row
+            # Enable WAL mode for concurrent reads
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # Foreign keys
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            # Busy timeout (5 seconds)
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            # PERF (4B-a): under WAL, synchronous=NORMAL is crash-safe — the
+            # database cannot corrupt; the only exposure is losing the *last*
+            # committed transaction on an OS crash / power loss (a checkpoint
+            # still syncs the WAL into the main db). FULL would additionally
+            # fsync on every commit. We keep durability of file *bytes* (the
+            # per-chunk fsync in storage.py is unchanged); this only relaxes the
+            # per-commit fsync of the metadata WAL. See docs/benchmarks.md (4B).
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            # Initialize schema
+            self._init_schema()
+        except BaseException:
+            self.close()
+            raise
         # L-1 (pentest 2026-06-22): SQLite creates the DB + -wal/-shm with the
         # process umask (often 0644). The DB holds password hashes and all
         # server-side metadata; tighten to 0600. Defense in depth — the 0700

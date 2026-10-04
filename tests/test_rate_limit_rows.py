@@ -10,6 +10,7 @@ the storage-layer row bound.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -18,10 +19,13 @@ from server.database import Database
 
 
 @pytest.fixture()
-def db(tmp_path: Path) -> Database:
+def db(tmp_path: Path) -> Iterator[Database]:
     d = Database(str(tmp_path / "meta.db"))
     d.connect()
-    return d
+    try:
+        yield d
+    finally:
+        d.close()
 
 
 def _count_rows_for_ip(db: Database, ip: str) -> int:

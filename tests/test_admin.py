@@ -8,6 +8,7 @@ these). See server/admin.py.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,10 +36,13 @@ def env_config(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture()
-def db(env_config: ServerConfig) -> Database:
+def db(env_config: ServerConfig) -> Iterator[Database]:
     d = Database(env_config.db_path)
     d.connect()
-    return d
+    try:
+        yield d
+    finally:
+        d.close()
 
 
 def _run_with_passwords(args, password="correct-horse-battery"):
