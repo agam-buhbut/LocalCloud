@@ -724,8 +724,25 @@ from the repository root after the steps in section 3.
   cargo test   --manifest-path rust/Cargo.toml --workspace
   cargo audit  --file rust/Cargo.lock  # needs cargo-audit installed
 
+  # Kotlin bindings match the Rust code. The Kotlin code in
+  # rust/bindings-kotlin/ is generated from the keycore-mobile crate. These
+  # commands make it again and fail if the result is not what is committed.
+  # Run them inside rust/.
+  cd rust
+  cargo build --locked -p keycore-mobile
+  rm -rf bindings-kotlin
+  lib="${CARGO_TARGET_DIR:-target}/debug/libkeycore_mobile.so"
+  cargo run --locked -p keycore-mobile --features cli --bin uniffi-bindgen -- \
+      generate --library "$lib" --language kotlin --out-dir bindings-kotlin \
+      --no-format
+  git diff --exit-code -- bindings-kotlin   # prints nothing when all is well
+  cd ..
+
 The Rust tests take several minutes in a debug build, because some of them
-run the real Argon2id (512 MiB).
+run the real Argon2id (512 MiB). The Kotlin check also takes a few minutes the
+first time, because it builds the code generator. If it shows a difference,
+the file in your working copy has already been rewritten: read the change and
+commit it.
 
 Notes:
   * pyproject.toml is the single source of truth for dependencies and tool

@@ -45,12 +45,13 @@ jobs:
         with:
           workspaces: rust
 
+      # setup-uv stopped publishing major tags at v8, so this is an exact
+      # release tag (they are immutable), not a major tag like the others.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+
       # The committed uv.lock is the reproducible-env source of truth. Fail the
       # build if it has drifted from pyproject.toml (run `uv lock` to refresh).
-      - name: Install uv
-        # setup-uv stopped publishing major tags at v8, so this is an exact
-        # release tag (they are immutable), not a major tag like the others.
-        uses: astral-sh/setup-uv@v10.2.0
       - name: Verify uv.lock is in sync with pyproject.toml
         run: uv lock --check
 
@@ -89,9 +90,10 @@ jobs:
       - name: pyright (type check)
         run: uv run --no-sync pyright
 
-      # Coverage is measured + gated (COV-1). The floor is a ratchet set just
-      # below the current ~84% TOTAL — raise it as coverage improves, never
-      # lower it. term-missing surfaces the uncovered lines in the log.
+      # Coverage is measured + gated (COV-1). The bar is 82% TOTAL
+      # (--cov-fail-under below). It is a ratchet: raise it as coverage
+      # improves, never lower it. term-missing surfaces the uncovered lines
+      # in the log.
       - name: pytest (with coverage gate)
         run: >-
           uv run --no-sync pytest -q

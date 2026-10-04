@@ -438,17 +438,20 @@ class FileHeader:
 # ChunkAAD.serialize() packs chunk_index and total_chunks as big-endian
 # u32 (">16sIHI"). The controller chose to KEEP the u32 packing (option
 # (b)): widening to u64 is a breaking wire change deferred to a protocol
-# bump. The packing is sound only while BOTH of the following hold, so we
-# bind them here as a hard module-load assertion rather than leaving the
-# relationship implicit and reviewer-checked:
+# bump. We check both of the following here, as a hard module-load
+# assertion, rather than leaving the relationship implicit and
+# reviewer-checked:
 #   1. MAX_CHUNKS < 2**32 — every legitimate chunk index/count produced or
-#      accepted by this build fits in the u32 field with no truncation.
-#   2. METADATA_CHUNK_INDEX (0xFFFFFFFF) > MAX_CHUNKS — the metadata
-#      sentinel index sits strictly above every real chunk index, so the
-#      metadata AAD can never alias a data-chunk AAD.
+#      accepted by this build fits in the u32 field with no truncation. The
+#      packing is sound only while this holds.
+#   2. METADATA_CHUNK_INDEX (0xFFFFFFFF) > MAX_CHUNKS — the largest u32
+#      value stays above every real chunk index. The metadata AAD does not
+#      use this value any more (since protocol v2 only the
+#      METADATA_AAD_CONTEXT tag separates metadata from chunks), so this is
+#      only a safety margin.
 # If a future edit widens MAX_CHUNKS past the u32 ceiling without also
-# widening the packing, this assertion fails at import time instead of
-# silently producing aliasing AADs.
+# widening the packing, this assertion fails at import time, rather than
+# later when a chunk index no longer fits.
 assert MAX_CHUNKS < 2**32, "ChunkAAD packs chunk indices as u32"
 assert (
     METADATA_CHUNK_INDEX > MAX_CHUNKS
