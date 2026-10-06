@@ -172,9 +172,9 @@ def test_chunk_aad_rejects_wrong_file_id_length():
 
 
 def test_chunk_aad_metadata_index_is_outside_max_chunks():
-    # The encryptor uses 0xFFFFFFFF as the metadata sentinel index. This
-    # must NOT collide with any legitimate chunk index, which are
-    # bounded by MAX_CHUNKS in shared.models. (#25)
+    # METADATA_CHUNK_INDEX (0xFFFFFFFF) must stay above every real chunk
+    # index, which MAX_CHUNKS in shared.models bounds. Since protocol v2 the
+    # metadata AAD no longer uses it; it is only a safety margin. (#25)
     from shared.models import MAX_CHUNKS
 
     assert MAX_CHUNKS < 0xFFFFFFFF
@@ -182,10 +182,9 @@ def test_chunk_aad_metadata_index_is_outside_max_chunks():
 
 def test_aad_u32_width_invariant_holds():
     # The ChunkAAD wire format packs chunk_index / total_chunks as u32
-    # (">16sIHI"). The on-wire invariant that makes the metadata sentinel
-    # unambiguous is: every legitimate chunk index/count fits in u32, and
-    # the sentinel METADATA_CHUNK_INDEX is strictly above MAX_CHUNKS so it
-    # can never alias a real chunk index. (CRY-M1 / ARCH-L5)
+    # (">16sIHI"). Every legitimate chunk index/count must fit in u32, and
+    # METADATA_CHUNK_INDEX must stay strictly above MAX_CHUNKS, the same two
+    # checks shared.models runs at import. (CRY-M1 / ARCH-L5)
     from shared.models import MAX_CHUNKS, METADATA_CHUNK_INDEX
 
     assert MAX_CHUNKS < 0xFFFFFFFF
@@ -196,8 +195,9 @@ def test_aad_u32_width_invariant_holds():
 def test_chunk_aad_roundtrip_representative_values_no_aliasing():
     # Round-trip representative (total_chunks, chunk_index) pairs through
     # the packed AAD and confirm each pair maps to a distinct byte string.
-    # Includes values near MAX_CHUNKS and the metadata sentinel, which is
-    # the boundary region where a too-narrow integer width would alias.
+    # Includes values near MAX_CHUNKS and the largest u32 value
+    # (METADATA_CHUNK_INDEX), the region where a too-narrow integer width
+    # would alias.
     from shared.models import MAX_CHUNKS, METADATA_CHUNK_INDEX
 
     fid = os.urandom(FILE_ID_LEN)
@@ -205,7 +205,7 @@ def test_chunk_aad_roundtrip_representative_values_no_aliasing():
         (0, 1),  # first chunk of a 1-chunk file
         (1, 2),  # second chunk of a 2-chunk file
         (MAX_CHUNKS - 1, MAX_CHUNKS),  # last chunk at the operational ceiling
-        (METADATA_CHUNK_INDEX, 0),  # metadata sentinel (chunk_index, total)
+        (METADATA_CHUNK_INDEX, 0),  # largest u32 index (chunk_index, total)
     ]
     serialized: dict[tuple[int, int], bytes] = {}
     for chunk_index, total_chunks in cases:
@@ -226,7 +226,7 @@ def test_chunk_aad_roundtrip_representative_values_no_aliasing():
 
     # No two distinct (chunk_index, total_chunks) pairs collide on the wire.
     assert len(set(serialized.values())) == len(cases)
-    # The metadata sentinel AAD differs from the real-chunk AADs.
+    # The largest-u32-index AAD differs from the real-chunk AADs.
     meta_blob = serialized[(METADATA_CHUNK_INDEX, 0)]
     for key, blob in serialized.items():
         if key != (METADATA_CHUNK_INDEX, 0):

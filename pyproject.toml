@@ -145,3 +145,8 @@ reportOptionalMemberAccess = "warning"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
+# Unclosed files or sqlite connections fail the run, so leaks cannot come back.
+filterwarnings = [
+    "error::ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
